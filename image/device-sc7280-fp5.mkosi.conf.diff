@@ -1,0 +1,18 @@
+# DRAFT (not tested). Proposed change on top of agx/bengalos-recipes branch "otter"
+# (commit 71511f0, mkosi.conf.d/mkosi.profiles/device-sc7280/mkosi.conf)
+ Devicetrees=
+         qcom/qcm6490-shift-otter.dtb
++        qcom/qcm6490-fairphone-fp5.dtb
+ 
+ [Output]
+-# Usually UFS with 4k blocks is used.
+-SectorSize=4096
++# FP5 test target is the microSD card (512-byte sectors). Needs a separate
++# FP5/SD variant or profile; UFS installs keep 4096.
++SectorSize=512
+
+# Plus a new preset, e.g. mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset
+# (or a device-specific drop-in) so the FP5 never runs qbootctl:
+#   disable qbootctl.service
+# and mask it in the image (ln -s /dev/null /etc/systemd/system/qbootctl.service)
+# because the factory image enables it in multi-user.target.wants.

@@ -1,0 +1,15 @@
+# Fairphone 5: never touch A/B slot metadata or bootloader firmware from the OS.
+# (qbootctl itself is purged from the image by mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot)
+disable qbootctl.service
+disable fwupd.service
+disable fwupd-refresh.timer
+disable fwupd-refresh.service
+# Disable until audio is fixed (as for SHIFT8)
+disable 81voltd*
+# Sensors: hexagonrpcd (sensorspd) + root PD, registry copied read-only from persist.
+enable mnt-persist.mount
+enable fp5-sensors-registry.service
+enable hexagonrpcd.service
+enable hexagonrpcd-adsp-rootpd.service
+enable hexagonrpcd-suspend.service
+enable hexagonrpcd-resume.service

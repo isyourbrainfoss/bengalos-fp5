@@ -1,0 +1,40 @@
+# DRAFT (not tested). Upstream droid-juicer fairphone,fp5.toml plus a sensors
+# section so hexagonrpcd's default -R /var/lib/droid-juicer/sensors/ has data.
+# Paths on the Android side are UNVERIFIED (check vendor_a/etc/sensors on the phone, read-only).
+# Deliberately NO "persist" entry: persist holds the fingerprint secure storage and an
+# ext4 "ro" mount can still replay a dirty journal. Take sensors/registry from
+# FairBlobs/FP5-firmware hexagonfs/ (packaged) instead.
+[juicer]
+dynpart = "super"
+firmware = [
+    { partition = "vendor", origin = "firmware", destination = "qcom/qcm6490/fairphone5", files = [
+            { name = "a660_zap.mdt" },
+            { name = "aw882xx_acf.bin", rename = "aw88261_acf.bin" },
+            { name = "vpu20_1v.mdt", rename = "venus.mdt" },
+            { name = "yupik_ipa_fws.mdt", rename = "ipa_fws.mdt" },
+        ] },
+    { partition = "modem", origin = "image", destination = "qcom/qcm6490/fairphone5", files = [
+            { name = "adsp.mdt" },
+            { name = "adspr.jsn" },
+            { name = "adsps.jsn" },
+            { name = "adspua.jsn" },
+            { name = "battmgr.jsn" },
+            { name = "cdsp.mdt" },
+            { name = "cdspr.jsn" },
+            { name = "modem.mdt" },
+            { name = "modemr.jsn" },
+            { name = "wpss.mdt" },
+        ] },
+    { partition = "bluetooth", origin = "image", destination = "qca", files = [
+            { name = "msbtfw11.mbn" },
+            { name = "msnv11.bin" },
+        ] },
+]
+folders = [
+    { partition = "modem", destination = "qcom/qcm6490/fairphone5", folders = [
+        { name = "image/modem_pr" },
+    ] },
+    { partition = "vendor", destination = "/var/lib/droid-juicer/sensors/sensors", folders = [
+        { name = "etc/sensors/config" },
+    ] },
+]

@@ -1,0 +1,27 @@
+# Static checks on u-boot.bin (2026-10-27 21:59:42 CET)
+ufshcd: 0
+qcom,ufshc: 1
+qcom-ufs: 0
+scsi_scan: 0
+scsi : 0
+blkmap: 1
+fastboot: 0
+ums : 0
+efi_capsule: 0
+CapsuleUpdate: 0
+dfu_: 0
+userdata: 0
+saveenv: 0
+gpt write: 0
+--- linker list of drivers containing ufs/scsi:
+--- commands present (u_boot_list cmd):
+base bdinfo blkcache bmp boot bootd bootdev bootefi bootelf bootflow booti bootm bootmenu bootmeth bootp bootstd bootvx button cat clk cls cmp coninfo cp crc32 cyclic dhcp dm echo editenv eeprom eficonfig efidebug env exit ext2load ext2ls ext4load ext4ls ext4size false fatinfo fatload fatls fatmkdir fatrm fatsize fatwrite fdt fstype fstypes go gpio gzwrite help i2c iminfo imxtract itest lbracket lcdputs ln load loadb loads loadx loady log loop ls lzmadec md mdio meminfo mii mkdir mm mmc mmcinfo mv mw net nm panic part pause ping pinmux printenv pxe question_mark random regulator reset rm rng run save setcurs setenv setexpr showvar size sleep smbios source test tftpboot true ufetch unlz4 unzip usb usbboot version wdt 
+--- sdhci msm driver:
+_u_boot_list_2_driver_2_milos_rpmh_clk
+_u_boot_list_2_driver_2_mmc_blk
+_u_boot_list_2_driver_2_mmc_bootdev
+_u_boot_list_2_driver_2_msm_sdc_drv
+_u_boot_list_2_driver_2_qcom_rpmh_rsc
+_u_boot_list_2_driver_2_qcom_rpmhpd_drv
+_u_boot_list_2_driver_2_rpmh_regulator_drm
+_u_boot_list_2_driver_2_rpmh_regulators

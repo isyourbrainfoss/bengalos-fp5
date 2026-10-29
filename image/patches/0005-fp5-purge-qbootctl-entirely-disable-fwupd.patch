@@ -1,0 +1,59 @@
+From fcdc12d3027a92d07ce5800d3ca9fd3cb260a2a2 Mon Sep 17 00:00:00 2001
+From: box <box@localhost>
+Date: Tue, 27 Oct 2026 22:11:05 +0100
+Subject: [PATCH 5/8] fp5: purge qbootctl entirely, disable fwupd
+
+---
+ .../lib/systemd/system-preset/09-bengalos-fp5.preset  |  6 +++++-
+ .../system/qbootctl.service.d/10-fp5-never.conf       |  5 -----
+ .../mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot | 11 +++++++++++
+ 3 files changed, 16 insertions(+), 6 deletions(-)
+ delete mode 100644 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/qbootctl.service.d/10-fp5-never.conf
+ create mode 100755 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot
+
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset
+index 206789e..829421a 100644
+--- a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset
+@@ -1,5 +1,9 @@
+-# Fairphone 5: never touch the A/B slot metadata from the OS.
++# Fairphone 5: never touch A/B slot metadata or bootloader firmware from the OS.
++# (qbootctl itself is purged from the image by mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot)
+ disable qbootctl.service
++disable fwupd.service
++disable fwupd-refresh.timer
++disable fwupd-refresh.service
+ # Disable until audio is fixed (as for SHIFT8)
+ disable 81voltd*
+ # Disable until sensors data is available (droid-juicer FP5 config has none)
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/qbootctl.service.d/10-fp5-never.conf b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/qbootctl.service.d/10-fp5-never.conf
+deleted file mode 100644
+index c5b953c..0000000
+--- a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/qbootctl.service.d/10-fp5-never.conf
++++ /dev/null
+@@ -1,5 +0,0 @@
+-# Fairphone 5: qbootctl writes GPT slot attributes on UFS. Never run it from BengalOS.
+-# Slot B is expected to be marked successful already (Nura's qbootctl -m did that);
+-# check with `fastboot getvar slot-successful:b` before flashing (see flash-runbook.md).
+-[Unit]
+-ConditionPathExists=/nonexistent/bengalos-fp5-qbootctl-is-disabled
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot
+new file mode 100755
+index 0000000..035bb3c
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot
+@@ -0,0 +1,11 @@
++#!/bin/sh
++# Fairphone 5: qbootctl can brick the FP5 (linux-msm/qbootctl#4; recovery needs EDL).
++# Remove it completely from the image, including any enablement symlinks.
++set -e
++if dpkg-query -W -f='${Status}' qbootctl 2>/dev/null | grep -q installed; then
++    dpkg --purge --force-depends qbootctl
++fi
++rm -f /usr/bin/qbootctl /usr/sbin/qbootctl /usr/lib/systemd/system/qbootctl.service
++rm -f /etc/systemd/system/*.wants/qbootctl.service /etc/systemd/system/qbootctl.service
++# Mask in case a package ships the unit again later.
++ln -sf /dev/null /etc/systemd/system/qbootctl.service
+-- 
+2.47.3
+

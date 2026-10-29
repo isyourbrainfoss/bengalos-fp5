@@ -1,0 +1,35 @@
+#!/bin/sh
+# Fairphone 5: qbootctl can brick the FP5 (linux-msm/qbootctl#4; recovery needs EDL).
+# Remove it completely from the image, including any enablement symlinks.
+# qcom-phone-utils Depends on qbootctl, so replace it with an EMPTY stub package
+# (no files, no binary, no unit) that Provides qbootctl, to keep dpkg/apt consistent.
+set -e
+if dpkg-query -W -f='${Status}' qbootctl 2>/dev/null | grep -q "ok installed"; then
+    dpkg --purge --force-depends qbootctl
+fi
+stub=$(mktemp -d)
+mkdir -p "$stub/DEBIAN"
+cat > "$stub/DEBIAN/control" <<'CTRL'
+Package: bengalos-fp5-no-qbootctl
+Version: 1.0
+Architecture: all
+Maintainer: local build <root@localhost>
+Provides: qbootctl (= 0.2.2-99)
+Conflicts: qbootctl
+Replaces: qbootctl
+Description: Fairphone 5 stub: qbootctl must never be installed (it can brick the FP5)
+ Empty package. It only satisfies dependencies on qbootctl.
+CTRL
+dpkg-deb --root-owner-group -b "$stub" /tmp/bengalos-fp5-no-qbootctl.deb >/dev/null
+dpkg -i /tmp/bengalos-fp5-no-qbootctl.deb
+rm -rf "$stub" /tmp/bengalos-fp5-no-qbootctl.deb
+rm -f /usr/bin/qbootctl /usr/sbin/qbootctl /usr/lib/systemd/system/qbootctl.service
+rm -f /etc/systemd/system/*.wants/qbootctl.service /etc/systemd/system/qbootctl.service
+# Mask in case a package ships the unit again later.
+ln -sf /dev/null /etc/systemd/system/qbootctl.service
+# The qcom boot.img kernel hook dd's a new boot.img into boot$(qbootctl -x) (the ACTIVE slot's
+# boot partition). BengalOS on FP5 boots via U-Boot + UKI from the SD, so it must never run.
+rm -f /etc/kernel/postinst.d/zz-qcom-bootimg
+# Fail the build if anything qbootctl-like is still there.
+if [ -e /usr/bin/qbootctl ] || [ -e /usr/sbin/qbootctl ] || [ -e /etc/kernel/postinst.d/zz-qcom-bootimg ]; then echo "qbootctl or zz-qcom-bootimg still present" >&2; exit 1; fi
+dpkg --audit

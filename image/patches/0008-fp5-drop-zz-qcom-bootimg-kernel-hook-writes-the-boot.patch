@@ -1,0 +1,28 @@
+From b1fb0808de74eca008eb95c7f64e68918a2e996a Mon Sep 17 00:00:00 2001
+From: box <box@localhost>
+Date: Tue, 27 Oct 2026 22:30:33 +0100
+Subject: [PATCH 8/8] fp5: drop zz-qcom-bootimg kernel hook (writes the boot
+ partition)
+
+---
+ .../mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot        | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot
+index a899371..b5b8974 100755
+--- a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot
+@@ -27,6 +27,9 @@ rm -f /usr/bin/qbootctl /usr/sbin/qbootctl /usr/lib/systemd/system/qbootctl.serv
+ rm -f /etc/systemd/system/*.wants/qbootctl.service /etc/systemd/system/qbootctl.service
+ # Mask in case a package ships the unit again later.
+ ln -sf /dev/null /etc/systemd/system/qbootctl.service
++# The qcom boot.img kernel hook dd's a new boot.img into boot$(qbootctl -x) (the ACTIVE slot's
++# boot partition). BengalOS on FP5 boots via U-Boot + UKI from the SD, so it must never run.
++rm -f /etc/kernel/postinst.d/zz-qcom-bootimg
+ # Fail the build if anything qbootctl-like is still there.
+-if [ -e /usr/bin/qbootctl ] || [ -e /usr/sbin/qbootctl ]; then echo "qbootctl still present" >&2; exit 1; fi
++if [ -e /usr/bin/qbootctl ] || [ -e /usr/sbin/qbootctl ] || [ -e /etc/kernel/postinst.d/zz-qcom-bootimg ]; then echo "qbootctl or zz-qcom-bootimg still present" >&2; exit 1; fi
+ dpkg --audit
+-- 
+2.47.3
+

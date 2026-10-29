@@ -1,0 +1,114 @@
+From 95200cfa185822e76cfd6c008f64420fcbeb29eb Mon Sep 17 00:00:00 2001
+From: box <box@localhost>
+Date: Tue, 27 Oct 2026 22:03:19 +0100
+Subject: [PATCH 1/8] DRAFT: device-fp5 profile (SD boot, qbootctl disabled,
+ UFS read-only)
+
+---
+ Makefile                                      |  3 +++
+ .../mkosi.profiles/device-fp5/mkosi.conf      | 23 +++++++++++++++++++
+ .../system-preset/09-bengalos-fp5.preset      |  6 +++++
+ .../10-fp5-readonly.conf                      |  4 ++++
+ .../qbootctl.service.d/10-fp5-never.conf      |  5 ++++
+ .../60-bengalos-fp5-ufs-readonly.rules        |  9 ++++++++
+ 6 files changed, 50 insertions(+)
+ create mode 100644 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.conf
+ create mode 100644 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset
+ create mode 100644 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/make-dynpart-mappings@.service.d/10-fp5-readonly.conf
+ create mode 100644 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/qbootctl.service.d/10-fp5-never.conf
+ create mode 100644 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/60-bengalos-fp5-ufs-readonly.rules
+
+diff --git a/Makefile b/Makefile
+index 23d7659..767d361 100644
+--- a/Makefile
++++ b/Makefile
+@@ -14,6 +14,9 @@ bengalos-amd64-immutable:
+ bengalos-sc7280-immutable:
+ 	$(MAKE) DEVICE=sc7280 FLAVOR=immutable bengalos
+ 
++bengalos-fp5-immutable:
++	$(MAKE) DEVICE=fp5 FLAVOR=immutable bengalos
++
+ bengalos-sdm670-immutable:
+ 	$(MAKE) DEVICE=sdm670 FLAVOR=immutable bengalos
+ 
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.conf b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.conf
+new file mode 100644
+index 0000000..5149289
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.conf
+@@ -0,0 +1,23 @@
++# Fairphone 5 (fairphone,fp5), booted via U-Boot Tauchgang from microSD.
++# DRAFT for local testing (BengalOS FP5 prep, 2026-10-27). Based on agx/otter device-sc7280.
++[Build]
++Environment=
++        BOS_DEVICE=sc7280
++
++[Include]
++Include=../device-qcom
++
++[Content]
++Packages=
++        bengalos-kernel-sc7280
++
++Devicetrees=
++        qcom/qcm6490-fairphone-fp5.dtb
++
++KernelCommandLine=
++        # Camera buffers (same as Nura FP5)
++        cma=128M
++
++[Output]
++# Target is a microSD card: 512-byte logical sectors.
++SectorSize=512
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset
+new file mode 100644
+index 0000000..206789e
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset
+@@ -0,0 +1,6 @@
++# Fairphone 5: never touch the A/B slot metadata from the OS.
++disable qbootctl.service
++# Disable until audio is fixed (as for SHIFT8)
++disable 81voltd*
++# Disable until sensors data is available (droid-juicer FP5 config has none)
++disable hexagon*
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/make-dynpart-mappings@.service.d/10-fp5-readonly.conf b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/make-dynpart-mappings@.service.d/10-fp5-readonly.conf
+new file mode 100644
+index 0000000..0bd5bbe
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/make-dynpart-mappings@.service.d/10-fp5-readonly.conf
+@@ -0,0 +1,4 @@
++# Fairphone 5: make the device-mapper views of Android dynamic partitions read-only
++# (make-dynpart-mappings opens super O_RDONLY but creates writable dm targets).
++[Service]
++ExecStartPost=/bin/sh -c 'for d in /dev/mapper/*; do [ "$d" = /dev/mapper/control ] && continue; [ -b "$d" ] && /usr/sbin/blockdev --setro "$d"; done; true'
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/qbootctl.service.d/10-fp5-never.conf b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/qbootctl.service.d/10-fp5-never.conf
+new file mode 100644
+index 0000000..c5b953c
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/qbootctl.service.d/10-fp5-never.conf
+@@ -0,0 +1,5 @@
++# Fairphone 5: qbootctl writes GPT slot attributes on UFS. Never run it from BengalOS.
++# Slot B is expected to be marked successful already (Nura's qbootctl -m did that);
++# check with `fastboot getvar slot-successful:b` before flashing (see flash-runbook.md).
++[Unit]
++ConditionPathExists=/nonexistent/bengalos-fp5-qbootctl-is-disabled
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/60-bengalos-fp5-ufs-readonly.rules b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/60-bengalos-fp5-ufs-readonly.rules
+new file mode 100644
+index 0000000..98f5e61
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/60-bengalos-fp5-ufs-readonly.rules
+@@ -0,0 +1,9 @@
++# Fairphone 5 safety: make internal UFS storage read-only for the whole BengalOS session.
++# BengalOS runs from the microSD and only needs to READ slot-A firmware (droid-juicer)
++# and modem EFS (rmtfs runs with -r = read-only on qcom here).
++#
++# Whole LUNs sdb..sdf (xbl, cdt/ddr, A/B firmware incl. boot/abl/vbmeta + their GPT, modemst/fsg):
++ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="sd[b-f]", RUN+="/usr/sbin/blockdev --setro $devnode"
++# LUN sda partitions (userdata, persist, fpconfig_persist, super, ...). The sda whole disk
++# itself is left as is so device-mapper can map "super"; every sda partition is read-only.
++ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", KERNEL=="sd[a-f][0-9]*", RUN+="/usr/sbin/blockdev --setro $devnode"
+-- 
+2.47.3
+

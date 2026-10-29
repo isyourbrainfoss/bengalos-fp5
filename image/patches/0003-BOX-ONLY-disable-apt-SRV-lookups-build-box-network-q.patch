@@ -1,0 +1,21 @@
+From 85fe824be5f3166637df4be69926aea994912385 Mon Sep 17 00:00:00 2001
+From: box <box@localhost>
+Date: Tue, 27 Oct 2026 22:03:45 +0100
+Subject: [PATCH 3/8] BOX-ONLY: disable apt SRV lookups (build-box network
+ quirk)
+
+---
+ mkosi.conf.d/mkosi.sandbox/etc/apt/apt.conf.d/99-box-no-srv | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 mkosi.conf.d/mkosi.sandbox/etc/apt/apt.conf.d/99-box-no-srv
+
+diff --git a/mkosi.conf.d/mkosi.sandbox/etc/apt/apt.conf.d/99-box-no-srv b/mkosi.conf.d/mkosi.sandbox/etc/apt/apt.conf.d/99-box-no-srv
+new file mode 100644
+index 0000000..ac133f5
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.sandbox/etc/apt/apt.conf.d/99-box-no-srv
+@@ -0,0 +1 @@
++Acquire::EnableSrvRecords "false";
+-- 
+2.47.3
+

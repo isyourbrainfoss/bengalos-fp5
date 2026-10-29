@@ -1,0 +1,17 @@
+# Fairphone 5: Android "persist" (sensors registry, fingerprint secure storage).
+# READ-ONLY, always. "noload" skips ext4 journal replay, so mounting can never write to it.
+# The block device is also set read-only by 61-bengalos-fp5-ufs-readonly.rules.
+# NEVER change this to rw in this image. A rw persist for fingerprint templates is a later phase.
+[Unit]
+Description=Android persist partition (read-only)
+ConditionPathExists=/dev/disk/by-partlabel/persist
+DefaultDependencies=no
+Conflicts=umount.target
+Before=umount.target
+
+[Mount]
+What=/dev/disk/by-partlabel/persist
+Where=/mnt/persist
+Type=ext4
+Options=ro,noload,nosuid,nodev,noexec,noatime
+DirectoryMode=0755

@@ -1,0 +1,50 @@
+From 74db2d9fae596fdbdf83c5362224ec63d8a994b1 Mon Sep 17 00:00:00 2001
+From: box <box@localhost>
+Date: Tue, 27 Oct 2026 22:26:22 +0100
+Subject: [PATCH 7/8] fp5: keep dpkg consistent with an empty qbootctl stub
+
+---
+ .../50-fp5-remove-qbootctl.sh.chroot          | 23 ++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot
+index 035bb3c..a899371 100755
+--- a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot
+@@ -1,11 +1,32 @@
+ #!/bin/sh
+ # Fairphone 5: qbootctl can brick the FP5 (linux-msm/qbootctl#4; recovery needs EDL).
+ # Remove it completely from the image, including any enablement symlinks.
++# qcom-phone-utils Depends on qbootctl, so replace it with an EMPTY stub package
++# (no files, no binary, no unit) that Provides qbootctl, to keep dpkg/apt consistent.
+ set -e
+-if dpkg-query -W -f='${Status}' qbootctl 2>/dev/null | grep -q installed; then
++if dpkg-query -W -f='${Status}' qbootctl 2>/dev/null | grep -q "ok installed"; then
+     dpkg --purge --force-depends qbootctl
+ fi
++stub=$(mktemp -d)
++mkdir -p "$stub/DEBIAN"
++cat > "$stub/DEBIAN/control" <<'CTRL'
++Package: bengalos-fp5-no-qbootctl
++Version: 1.0
++Architecture: all
++Maintainer: local build <root@localhost>
++Provides: qbootctl (= 0.2.2-99)
++Conflicts: qbootctl
++Replaces: qbootctl
++Description: Fairphone 5 stub: qbootctl must never be installed (it can brick the FP5)
++ Empty package. It only satisfies dependencies on qbootctl.
++CTRL
++dpkg-deb --root-owner-group -b "$stub" /tmp/bengalos-fp5-no-qbootctl.deb >/dev/null
++dpkg -i /tmp/bengalos-fp5-no-qbootctl.deb
++rm -rf "$stub" /tmp/bengalos-fp5-no-qbootctl.deb
+ rm -f /usr/bin/qbootctl /usr/sbin/qbootctl /usr/lib/systemd/system/qbootctl.service
+ rm -f /etc/systemd/system/*.wants/qbootctl.service /etc/systemd/system/qbootctl.service
+ # Mask in case a package ships the unit again later.
+ ln -sf /dev/null /etc/systemd/system/qbootctl.service
++# Fail the build if anything qbootctl-like is still there.
++if [ -e /usr/bin/qbootctl ] || [ -e /usr/sbin/qbootctl ]; then echo "qbootctl still present" >&2; exit 1; fi
++dpkg --audit
+-- 
+2.47.3
+

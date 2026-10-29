@@ -1,0 +1,32 @@
+From 201f2127918b7e431b446703f162359191c78a35 Mon Sep 17 00:00:00 2001
+From: isyourbrainfoss <isyourbrainfoss@proton.me>
+Date: Tue, 27 Oct 2026 22:03:30 +0100
+Subject: [PATCH 2/8] fp5: keep super mappable
+
+---
+ ...-readonly.rules => 61-bengalos-fp5-ufs-readonly.rules} | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+ rename mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/{60-bengalos-fp5-ufs-readonly.rules => 61-bengalos-fp5-ufs-readonly.rules} (56%)
+
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/60-bengalos-fp5-ufs-readonly.rules b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/61-bengalos-fp5-ufs-readonly.rules
+similarity index 56%
+rename from mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/60-bengalos-fp5-ufs-readonly.rules
+rename to mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/61-bengalos-fp5-ufs-readonly.rules
+index 98f5e61..b564109 100644
+--- a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/60-bengalos-fp5-ufs-readonly.rules
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/61-bengalos-fp5-ufs-readonly.rules
+@@ -4,6 +4,8 @@
+ #
+ # Whole LUNs sdb..sdf (xbl, cdt/ddr, A/B firmware incl. boot/abl/vbmeta + their GPT, modemst/fsg):
+ ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="sd[b-f]", RUN+="/usr/sbin/blockdev --setro $devnode"
+-# LUN sda partitions (userdata, persist, fpconfig_persist, super, ...). The sda whole disk
+-# itself is left as is so device-mapper can map "super"; every sda partition is read-only.
+-ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", KERNEL=="sd[a-f][0-9]*", RUN+="/usr/sbin/blockdev --setro $devnode"
++# All UFS partitions (userdata, persist, fpconfig_persist, ...) read-only, except "super":
++# device-mapper must be able to stack on it; its dm views are set read-only by the
++# make-dynpart-mappings@ drop-in right after mapping. (Runs after 60-persistent-storage
++# so ID_PART_ENTRY_NAME is known.)
++ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", KERNEL=="sd[a-f][0-9]*", ENV{ID_PART_ENTRY_NAME}!="super", RUN+="/usr/sbin/blockdev --setro $devnode"
+-- 
+2.47.3
+

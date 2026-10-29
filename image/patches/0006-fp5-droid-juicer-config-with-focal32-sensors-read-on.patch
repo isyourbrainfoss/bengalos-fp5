@@ -1,0 +1,190 @@
+From 09ba1748fc270463f71a48763d8a1040d0378a18 Mon Sep 17 00:00:00 2001
+From: box <box@localhost>
+Date: Tue, 27 Oct 2026 22:20:35 +0100
+Subject: [PATCH 6/8] fp5: droid-juicer config with focal32 + sensors,
+ read-only persist mount, hexagonrpcd
+
+---
+ .../system-preset/09-bengalos-fp5.preset      |  9 +++-
+ .../system/fp5-sensors-registry.service       | 18 +++++++
+ .../system/hexagonrpcd-adsp-rootpd.service    | 22 +++++++++
+ .../system/hexagonrpcd.service.d/10-fp5.conf  |  3 ++
+ .../usr/lib/systemd/system/mnt-persist.mount  | 17 +++++++
+ .../rules.d/81-libssc-fairphone-fp5.rules     |  3 ++
+ .../droid-juicer/configs/fairphone,fp5.toml   | 49 +++++++++++++++++++
+ 7 files changed, 119 insertions(+), 2 deletions(-)
+ create mode 100644 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/fp5-sensors-registry.service
+ create mode 100644 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd-adsp-rootpd.service
+ create mode 100644 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd.service.d/10-fp5.conf
+ create mode 100644 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/mnt-persist.mount
+ create mode 100644 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/81-libssc-fairphone-fp5.rules
+ create mode 100644 mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/share/droid-juicer/configs/fairphone,fp5.toml
+
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset
+index 829421a..2004eac 100644
+--- a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset
+@@ -6,5 +6,10 @@ disable fwupd-refresh.timer
+ disable fwupd-refresh.service
+ # Disable until audio is fixed (as for SHIFT8)
+ disable 81voltd*
+-# Disable until sensors data is available (droid-juicer FP5 config has none)
+-disable hexagon*
++# Sensors: hexagonrpcd (sensorspd) + root PD, registry copied read-only from persist.
++enable mnt-persist.mount
++enable fp5-sensors-registry.service
++enable hexagonrpcd.service
++enable hexagonrpcd-adsp-rootpd.service
++enable hexagonrpcd-suspend.service
++enable hexagonrpcd-resume.service
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/fp5-sensors-registry.service b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/fp5-sensors-registry.service
+new file mode 100644
+index 0000000..641126b
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/fp5-sensors-registry.service
+@@ -0,0 +1,18 @@
++# Fairphone 5: copy the Android sensors registry (read-only source) into hexagonrpcd's root.
++# UNVERIFIED source path: Android keeps it in /mnt/vendor/persist/sensors/registry/.
++[Unit]
++Description=Copy FP5 sensors registry from persist (read-only)
++Requires=mnt-persist.mount
++After=mnt-persist.mount droid-juicer.service
++Before=hexagonrpcd.service hexagonrpcd-adsp-rootpd.service
++ConditionPathExists=/mnt/persist/sensors/registry
++ConditionPathExists=!/var/lib/droid-juicer/sensors/sensors/registry
++
++[Service]
++Type=oneshot
++ExecStart=/usr/bin/mkdir -p /var/lib/droid-juicer/sensors/sensors
++ExecStart=/usr/bin/cp -a --no-preserve=ownership /mnt/persist/sensors/registry /var/lib/droid-juicer/sensors/sensors/registry
++ExecStart=/usr/bin/sh -c 'f=/mnt/persist/sensors/sns_reg.conf; [ -f "$f" ] && cp "$f" /var/lib/droid-juicer/sensors/sensors/ || true'
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd-adsp-rootpd.service b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd-adsp-rootpd.service
+new file mode 100644
+index 0000000..15ce974
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd-adsp-rootpd.service
+@@ -0,0 +1,22 @@
++# Fairphone 5: ADSP root PD instance (Nura runs rootpd + sensorspd; the Debian unit is sensorspd only).
++[Unit]
++Description=Hexagon DSP root PD daemon (ADSP, FP5)
++ConditionPathExists=/var/lib/droid-juicer/sensors/sensors/config
++Conflicts=shutdown.target
++After=multi-user.target
++Before=shutdown.target
++
++[Service]
++Type=simple
++DevicePolicy=closed
++DeviceAllow=/dev/fastrpc-adsp
++ProtectSystem=strict
++ProtectHome=read-only
++PrivateNetwork=yes
++NoNewPrivileges=yes
++ExecStart=/usr/libexec/hexagonrpc/hexagonrpcd -f /dev/fastrpc-adsp -d adsp -R /var/lib/droid-juicer/sensors/
++User=fastrpc
++Group=fastrpc
++
++[Install]
++WantedBy=default.target
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd.service.d/10-fp5.conf b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd.service.d/10-fp5.conf
+new file mode 100644
+index 0000000..89d9f4e
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd.service.d/10-fp5.conf
+@@ -0,0 +1,3 @@
++# Fairphone 5: only start once droid-juicer has extracted the sensors config.
++[Unit]
++ConditionPathExists=/var/lib/droid-juicer/sensors/sensors/config
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/mnt-persist.mount b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/mnt-persist.mount
+new file mode 100644
+index 0000000..d51afef
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/systemd/system/mnt-persist.mount
+@@ -0,0 +1,17 @@
++# Fairphone 5: Android "persist" (sensors registry, fingerprint secure storage).
++# READ-ONLY, always. "noload" skips ext4 journal replay, so mounting can never write to it.
++# The block device is also set read-only by 61-bengalos-fp5-ufs-readonly.rules.
++# NEVER change this to rw in this image. A rw persist for fingerprint templates is a later phase.
++[Unit]
++Description=Android persist partition (read-only)
++ConditionPathExists=/dev/disk/by-partlabel/persist
++DefaultDependencies=no
++Conflicts=umount.target
++Before=umount.target
++
++[Mount]
++What=/dev/disk/by-partlabel/persist
++Where=/mnt/persist
++Type=ext4
++Options=ro,noload,nosuid,nodev,noexec,noatime
++DirectoryMode=0755
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/81-libssc-fairphone-fp5.rules b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/81-libssc-fairphone-fp5.rules
+new file mode 100644
+index 0000000..2bad473
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/lib/udev/rules.d/81-libssc-fairphone-fp5.rules
+@@ -0,0 +1,3 @@
++# iio-sensor-proxy with libssc: accelerometer mount matrix
++
++SUBSYSTEM=="misc", KERNEL=="fastrpc-*", ENV{ACCEL_MOUNT_MATRIX}+="-1, 0, 0; 0, -1, 0; 0, 0, -1"
+diff --git a/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/share/droid-juicer/configs/fairphone,fp5.toml b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/share/droid-juicer/configs/fairphone,fp5.toml
+new file mode 100644
+index 0000000..cd35446
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-fp5/mkosi.extra/usr/share/droid-juicer/configs/fairphone,fp5.toml
+@@ -0,0 +1,49 @@
++# Fairphone 5 droid-juicer config. DRAFT for local testing (BengalOS FP5 prep, 2026-10-27).
++# = upstream droid-juicer configs/fairphone,fp5.toml + QSEE fingerprint trustlet + sensors config.
++# droid-juicer mounts every partition with MS_RDONLY and tries <name>, <name>_a, then <name>_b,
++# so it reads slot A (stock Android). The FP5 udev rule also makes the UFS block devices read-only.
++# Deliberately NO "persist" entry: a failed persist mount would abort the whole extraction.
++# The sensors registry comes from fp5-sensors-registry.service (read-only persist mount) instead.
++[juicer]
++dynpart = "super"
++firmware = [
++    { partition = "vendor", origin = "firmware", destination = "qcom/qcm6490/fairphone5", files = [
++            { name = "a660_zap.mdt" },
++            { name = "aw882xx_acf.bin", rename = "aw88261_acf.bin" },
++            { name = "vpu20_1v.mdt", rename = "venus.mdt" },
++            { name = "yupik_ipa_fws.mdt", rename = "ipa_fws.mdt" },
++        ] },
++    { partition = "modem", origin = "image", destination = "qcom/qcm6490/fairphone5", files = [
++            { name = "adsp.mdt" },
++            { name = "adspr.jsn" },
++            { name = "adsps.jsn" },
++            { name = "adspua.jsn" },
++            { name = "battmgr.jsn" },
++            { name = "cdsp.mdt" },
++            { name = "cdspr.jsn" },
++            { name = "modem.mdt" },
++            { name = "modemr.jsn" },
++            { name = "wpss.mdt" },
++        ] },
++    # Fingerprint trustlet for the QTEE session (fp5-qtee). Android: /vendor/firmware_mnt/image/
++    # = modem_a "image/". Squashed by droid-juicer to /var/lib/firmware/qsee/focal32.mbn.
++    # fingerpr is optional and must NOT be loaded next to focal32 (fp5 TODO F.2); kept out for now.
++    { partition = "modem", origin = "image", destination = "qsee", files = [
++            { name = "focal32.mdt" },
++            # { name = "fingerpr.mdt" },
++        ] },
++    { partition = "bluetooth", origin = "image", destination = "qca", files = [
++            { name = "msbtfw11.mbn" },
++            { name = "msnv11.bin" },
++        ] },
++]
++folders = [
++    { partition = "modem", destination = "qcom/qcm6490/fairphone5", folders = [
++        { name = "image/modem_pr" },
++    ] },
++    # Sensors JSON config for hexagonrpcd's hexagonfs (default root /var/lib/droid-juicer/sensors/).
++    # UNVERIFIED path on the Android side: check `ls /vendor/etc/sensors/config` read-only first.
++    { partition = "vendor", destination = "/var/lib/droid-juicer/sensors/sensors", folders = [
++        { name = "etc/sensors/config" },
++    ] },
++]
+-- 
+2.47.3
+

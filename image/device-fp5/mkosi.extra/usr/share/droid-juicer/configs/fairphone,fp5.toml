@@ -1,0 +1,49 @@
+# Fairphone 5 droid-juicer config. DRAFT for local testing (BengalOS FP5 prep, 2026-10-27).
+# = upstream droid-juicer configs/fairphone,fp5.toml + QSEE fingerprint trustlet + sensors config.
+# droid-juicer mounts every partition with MS_RDONLY and tries <name>, <name>_a, then <name>_b,
+# so it reads slot A (stock Android). The FP5 udev rule also makes the UFS block devices read-only.
+# Deliberately NO "persist" entry: a failed persist mount would abort the whole extraction.
+# The sensors registry comes from fp5-sensors-registry.service (read-only persist mount) instead.
+[juicer]
+dynpart = "super"
+firmware = [
+    { partition = "vendor", origin = "firmware", destination = "qcom/qcm6490/fairphone5", files = [
+            { name = "a660_zap.mdt" },
+            { name = "aw882xx_acf.bin", rename = "aw88261_acf.bin" },
+            { name = "vpu20_1v.mdt", rename = "venus.mdt" },
+            { name = "yupik_ipa_fws.mdt", rename = "ipa_fws.mdt" },
+        ] },
+    { partition = "modem", origin = "image", destination = "qcom/qcm6490/fairphone5", files = [
+            { name = "adsp.mdt" },
+            { name = "adspr.jsn" },
+            { name = "adsps.jsn" },
+            { name = "adspua.jsn" },
+            { name = "battmgr.jsn" },
+            { name = "cdsp.mdt" },
+            { name = "cdspr.jsn" },
+            { name = "modem.mdt" },
+            { name = "modemr.jsn" },
+            { name = "wpss.mdt" },
+        ] },
+    # Fingerprint trustlet for the QTEE session (fp5-qtee). Android: /vendor/firmware_mnt/image/
+    # = modem_a "image/". Squashed by droid-juicer to /var/lib/firmware/qsee/focal32.mbn.
+    # fingerpr is optional and must NOT be loaded next to focal32 (fp5 TODO F.2); kept out for now.
+    { partition = "modem", origin = "image", destination = "qsee", files = [
+            { name = "focal32.mdt" },
+            # { name = "fingerpr.mdt" },
+        ] },
+    { partition = "bluetooth", origin = "image", destination = "qca", files = [
+            { name = "msbtfw11.mbn" },
+            { name = "msnv11.bin" },
+        ] },
+]
+folders = [
+    { partition = "modem", destination = "qcom/qcm6490/fairphone5", folders = [
+        { name = "image/modem_pr" },
+    ] },
+    # Sensors JSON config for hexagonrpcd's hexagonfs (default root /var/lib/droid-juicer/sensors/).
+    # UNVERIFIED path on the Android side: check `ls /vendor/etc/sensors/config` read-only first.
+    { partition = "vendor", destination = "/var/lib/droid-juicer/sensors/sensors", folders = [
+        { name = "etc/sensors/config" },
+    ] },
+]
