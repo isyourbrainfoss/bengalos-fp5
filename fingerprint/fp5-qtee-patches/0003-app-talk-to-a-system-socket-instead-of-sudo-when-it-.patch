@@ -1,0 +1,442 @@
+From 52e34bde9a710b9cfec4c4a5e3771f7f5aba1f6e Mon Sep 17 00:00:00 2001
+From: box <box@localhost>
+Date: Thu, 29 Oct 2026 08:44:19 +0100
+Subject: [PATCH 3/4] app: talk to a system socket instead of sudo when it
+ exists
+
+fp5_qtee_transport picks the socket (/run/fp5-qtee/session.sock) or the
+old sudo -n path (FP5_QTEE_TRANSPORT forces one). SocketSession mimics the
+Popen subset the watcher and Finger app use; stopping it sends quit and
+closes the connection instead of killpg. /usr/libexec and /usr/share
+paths are tried first; firmware dir defaults to /var/lib/firmware/qsee.
+---
+ app/fp5-qtee-app.py            |  43 ++++------
+ app/fp5_qtee_transport.py      | 145 +++++++++++++++++++++++++++++++++
+ app/fp5_qtee_unlock.py         |  57 ++++---------
+ app/test_fp5_qtee_transport.py |  58 +++++++++++++
+ 4 files changed, 234 insertions(+), 69 deletions(-)
+ create mode 100644 app/fp5_qtee_transport.py
+ create mode 100644 app/test_fp5_qtee_transport.py
+
+diff --git a/app/fp5-qtee-app.py b/app/fp5-qtee-app.py
+index 0862d2f..5505218 100644
+--- a/app/fp5-qtee-app.py
++++ b/app/fp5-qtee-app.py
+@@ -18,11 +18,13 @@ from pathlib import Path
+ 
+ for p in (
+     os.path.dirname(os.path.abspath(__file__)),
++    "/usr/share/fp5-qtee",
+     "/home/user/.local/share/fp5-qtee",
+ ):
+     if p not in sys.path:
+         sys.path.insert(0, p)
+ 
++import fp5_qtee_transport  # noqa: E402
+ from fp5_qtee_coach import Coach  # noqa: E402
+ from fp5_qtee_haptic import Haptic, enroll_accept  # noqa: E402
+ 
+@@ -35,12 +37,17 @@ from gi.repository import Adw, GLib, Gtk, Gdk  # noqa: E402
+ APP_ID = "org.fp5.qtee"
+ APP_TITLE = "Finger"
+ SESSION_CANDIDATES = (
++    Path("/usr/libexec/fp5-qtee/fp5-qtee-session"),  # package / sysext
+     Path("/home/user/fp5-qtee-keep/session/fp5-qtee-session"),
+     Path("/tmp/fp5-qtee/fp5-qtee-session"),
+ )
+ LOAD_SCRIPT = Path("/home/user/fp5-qtee-keep/load-qcomtee.sh")
+-FIRMWARE = "/lib/firmware/qsee"
+-LOG_DIR = Path("/home/user/fp5-qtee-keep/logs")
++FIRMWARE = os.environ.get("FP5_QTEE_FW_DIR", "/var/lib/firmware/qsee")
++LOG_DIR = Path(
++    os.environ.get("FP5_QTEE_LOG_DIR")
++    or ("/home/user/fp5-qtee-keep/logs" if Path("/home/user/fp5-qtee-keep").is_dir()
++        else str(Path.home() / ".local/state/fp5-qtee/logs"))
++)
+ OLD_DRIVER = Path("/sys/module/qsee_fingerpr")
+ 
+ CSS = """
+@@ -200,17 +207,11 @@ class FingerWindow(Adw.ApplicationWindow):
+             proc = self._proc
+         if proc is None or proc.poll() is not None:
+             return
+-        try:
+-            os.killpg(proc.pid, signal.SIGTERM)
+-        except OSError:
+-            return
++        fp5_qtee_transport.signal_group(proc, signal.SIGTERM)
+ 
+         def later() -> bool:
+             if proc.poll() is None:
+-                try:
+-                    os.killpg(proc.pid, signal.SIGKILL)
+-                except OSError:
+-                    pass
++                fp5_qtee_transport.signal_group(proc, signal.SIGKILL)
+             return False
+ 
+         GLib.timeout_add(2000, later)
+@@ -252,7 +253,7 @@ class FingerWindow(Adw.ApplicationWindow):
+         binary = session_bin()
+         if binary is None:
+             raise RuntimeError("The reader program is not on this phone.")
+-        if not LOAD_SCRIPT.is_file():
++        if not LOAD_SCRIPT.is_file() or fp5_qtee_transport.transport() == "socket":
+             return
+         try:
+             proc = subprocess.run(
+@@ -287,23 +288,9 @@ class FingerWindow(Adw.ApplicationWindow):
+         self._log_path = path
+         self._ui(self._paint_only)
+         with path.open("w", encoding="utf-8") as log:
+-            proc = subprocess.Popen(
+-                [
+-                    "sudo",
+-                    "-n",
+-                    "timeout",
+-                    "-k",
+-                    "15",
+-                    limit,
+-                    str(binary),
+-                    mode,
+-                    FIRMWARE,
+-                ],
+-                stdout=subprocess.PIPE,
+-                stderr=subprocess.STDOUT,
+-                text=True,
+-                bufsize=1,
+-                start_new_session=True,
++            # BengalOS: system service over a socket (polkit). Nura: sudo -n.
++            proc = fp5_qtee_transport.spawn(
++                binary, mode, FIRMWARE, stdin=False, hold_s=int(limit)
+             )
+             with self._lock:
+                 self._proc = proc
+diff --git a/app/fp5_qtee_transport.py b/app/fp5_qtee_transport.py
+new file mode 100644
+index 0000000..cd8d960
+--- /dev/null
++++ b/app/fp5_qtee_transport.py
+@@ -0,0 +1,145 @@
++"""How the user-side watcher/app reaches fp5-qtee-session.
++
++Two ways, chosen by what the system offers (no distro checks):
++
++- "socket" (BengalOS, no sudo): connect to the socket-activated system
++  service at FP5_QTEE_SOCKET (default /run/fp5-qtee/session.sock). The
++  first line says which mode to run ("MODE serve"); the system side checks
++  polkit for this caller and then runs the session with the socket as its
++  stdin/stdout. After that it is the same line protocol as before.
++- "sudo" (Nura, the old way): sudo -n the session binary directly.
++
++FP5_QTEE_TRANSPORT=socket|sudo forces one. Default: socket when the socket
++exists, else sudo.
++"""
++
++from __future__ import annotations
++
++import io
++import os
++import socket
++import subprocess
++import time
++from pathlib import Path
++
++SOCKET_PATH = Path(os.environ.get("FP5_QTEE_SOCKET", "/run/fp5-qtee/session.sock"))
++
++
++def transport() -> str:
++    forced = os.environ.get("FP5_QTEE_TRANSPORT", "")
++    if forced in ("socket", "sudo"):
++        return forced
++    return "socket" if SOCKET_PATH.exists() else "sudo"
++
++
++class SocketSession:
++    """The subset of subprocess.Popen the watcher uses, over a socket.
++
++    pid is None: there is no local process group to signal. stop() ends
++    the remote session by sending quit and closing the connection, which
++    the session sees as EOF on stdin (it exits on EOF).
++    """
++
++    is_socket = True
++
++    def __init__(self, mode: str, args: list[str] | None = None,
++                 path: Path = SOCKET_PATH, timeout: float = 5.0) -> None:
++        self.pid = None
++        self.returncode: int | None = None
++        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        self._sock.settimeout(timeout)
++        self._sock.connect(str(path))
++        self._sock.settimeout(None)
++        line = " ".join(["MODE", mode, *(args or [])]) + "\n"
++        self._sock.sendall(line.encode())
++        raw_in = self._sock.makefile("wb", buffering=0)
++        raw_out = self._sock.makefile("rb", buffering=0)
++        self.stdin = io.TextIOWrapper(io.BufferedWriter(raw_in), encoding="utf-8",
++                                      line_buffering=True)
++        self.stdout = io.TextIOWrapper(io.BufferedReader(raw_out), encoding="utf-8")
++        self._eof = False
++
++    def _mark_eof(self) -> None:
++        self._eof = True
++        if self.returncode is None:
++            self.returncode = 0
++
++    def poll(self) -> int | None:
++        if self._eof:
++            return self.returncode
++        try:
++            data = self._sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
++        except BlockingIOError:
++            return None
++        except OSError:
++            self._mark_eof()
++            return self.returncode
++        if data == b"":
++            self._mark_eof()
++            return self.returncode
++        return None
++
++    def wait(self, timeout: float | None = None) -> int:
++        end = None if timeout is None else time.monotonic() + timeout
++        while self.poll() is None:
++            if end is not None and time.monotonic() > end:
++                raise subprocess.TimeoutExpired("fp5-qtee socket", timeout or 0)
++            time.sleep(0.05)
++        return self.returncode or 0
++
++    def terminate(self) -> None:
++        try:
++            self.stdin.write("quit\n")
++            self.stdin.flush()
++        except (OSError, ValueError):
++            pass
++        try:
++            self._sock.shutdown(socket.SHUT_WR)
++        except OSError:
++            pass
++
++    def kill(self) -> None:
++        try:
++            self._sock.close()
++        except OSError:
++            pass
++        self._mark_eof()
++
++
++def spawn(binary: Path, mode: str, firmware: str, *, stdin: bool,
++          hold_s: int | None = None, args: list[str] | None = None):
++    """Start one session. Returns a Popen or a SocketSession."""
++    if transport() == "socket":
++        return SocketSession(mode, args)
++    cmd = ["sudo", "-n"]
++    if hold_s is not None:
++        cmd += ["timeout", "-k", "10", str(hold_s)]
++    cmd += [str(binary), mode, firmware, *(args or [])]
++    return subprocess.Popen(
++        cmd,
++        stdin=subprocess.PIPE if stdin else None,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        text=True,
++        bufsize=1,
++        start_new_session=True,
++    )
++
++
++def signal_group(proc, sig: int) -> None:
++    """os.killpg for a local session; a socket session is asked to quit."""
++    import signal as _signal
++
++    if getattr(proc, "is_socket", False):
++        if sig == _signal.SIGKILL:
++            proc.kill()
++        else:
++            proc.terminate()
++        return
++    try:
++        os.killpg(proc.pid, sig)
++    except OSError:
++        if sig == _signal.SIGKILL:
++            proc.kill()
++        else:
++            proc.terminate()
+diff --git a/app/fp5_qtee_unlock.py b/app/fp5_qtee_unlock.py
+index 7c01dac..4904d8e 100755
+--- a/app/fp5_qtee_unlock.py
++++ b/app/fp5_qtee_unlock.py
+@@ -26,15 +26,21 @@ import time
+ from pathlib import Path
+ from typing import Callable, Iterable
+ 
++import fp5_qtee_transport
+ from fp5_qtee_haptic import Haptic
+ 
+ SESSION_CANDIDATES = (
++    Path("/usr/libexec/fp5-qtee/fp5-qtee-session"),  # package / sysext
+     Path("/home/user/fp5-qtee-keep/session/fp5-qtee-session"),
+     Path("/tmp/fp5-qtee/fp5-qtee-session"),
+ )
+ LOAD_SCRIPT = Path("/home/user/fp5-qtee-keep/load-qcomtee.sh")
+-FIRMWARE = "/lib/firmware/qsee"
+-LOG_DIR = Path("/home/user/fp5-qtee-keep/logs")
++FIRMWARE = os.environ.get("FP5_QTEE_FW_DIR", "/var/lib/firmware/qsee")
++LOG_DIR = Path(
++    os.environ.get("FP5_QTEE_LOG_DIR")
++    or ("/home/user/fp5-qtee-keep/logs" if Path("/home/user/fp5-qtee-keep").is_dir()
++        else str(Path.home() / ".local/state/fp5-qtee/logs"))
++)
+ OLD_DRIVER = Path("/sys/module/qsee_fingerpr")
+ DSI_DPMS = Path("/sys/class/drm")
+ BACKLIGHT = Path("/sys/class/backlight/ae94000.dsi.0/bl_power")
+@@ -1149,28 +1155,14 @@ class UnlockWatcher:
+         return True
+ 
+     def spawn(self, binary: Path) -> subprocess.Popen[str]:
+-        return subprocess.Popen(
+-            [
+-                "sudo",
+-                "-n",
+-                "timeout",
+-                "-k",
+-                "10",
+-                str(UNLOCK_HOLD_S),
+-                str(binary),
+-                "unlock",
+-                FIRMWARE,
+-            ],
+-            stdout=subprocess.PIPE,
+-            stderr=subprocess.STDOUT,
+-            text=True,
+-            bufsize=1,
+-            start_new_session=True,
++        # BengalOS: socket-activated system service (no sudo). Nura: sudo -n.
++        return fp5_qtee_transport.spawn(
++            binary, "unlock", FIRMWARE, stdin=False, hold_s=UNLOCK_HOLD_S
+         )
+ 
+     def prepare(self) -> str | None:
+         """Load qcomtee if needed. Returns an outcome to stop with, or None."""
+-        if LOAD_SCRIPT.is_file():
++        if LOAD_SCRIPT.is_file() and fp5_qtee_transport.transport() == "sudo":
+             loaded = subprocess.run(
+                 ["sudo", "-n", str(LOAD_SCRIPT)],
+                 check=False,
+@@ -1369,17 +1361,11 @@ class UnlockWatcher:
+     def _stop(self, proc: subprocess.Popen[str]) -> None:
+         if proc.poll() is not None:
+             return
+-        try:
+-            os.killpg(proc.pid, signal.SIGTERM)
+-        except OSError:
+-            proc.terminate()
++        fp5_qtee_transport.signal_group(proc, signal.SIGTERM)
+         try:
+             proc.wait(timeout=5)
+         except subprocess.TimeoutExpired:
+-            try:
+-                os.killpg(proc.pid, signal.SIGKILL)
+-            except OSError:
+-                proc.kill()
++            fp5_qtee_transport.signal_group(proc, signal.SIGKILL)
+             proc.wait(timeout=5)
+ 
+     def start_warm(self) -> WarmSession | None:
+@@ -1513,15 +1499,7 @@ class WarmSession:
+ 
+     @classmethod
+     def spawn(cls, binary: Path, log_path: Path | None) -> "WarmSession":
+-        proc = subprocess.Popen(
+-            ["sudo", "-n", str(binary), "serve", FIRMWARE],
+-            stdin=subprocess.PIPE,
+-            stdout=subprocess.PIPE,
+-            stderr=subprocess.STDOUT,
+-            text=True,
+-            bufsize=1,
+-            start_new_session=True,
+-        )
++        proc = fp5_qtee_transport.spawn(binary, "serve", FIRMWARE, stdin=True)
+         return cls(proc, log_path)
+ 
+     def send(self, cmd: str) -> None:
+@@ -1565,10 +1543,7 @@ class WarmSession:
+             self.proc.wait(timeout=5)
+         except subprocess.TimeoutExpired:
+             for sig in (signal.SIGTERM, signal.SIGKILL):
+-                try:
+-                    os.killpg(self.proc.pid, sig)
+-                except OSError:
+-                    self.proc.kill()
++                fp5_qtee_transport.signal_group(self.proc, sig)
+                 try:
+                     self.proc.wait(timeout=5)
+                     break
+diff --git a/app/test_fp5_qtee_transport.py b/app/test_fp5_qtee_transport.py
+new file mode 100644
+index 0000000..318e0de
+--- /dev/null
++++ b/app/test_fp5_qtee_transport.py
+@@ -0,0 +1,58 @@
++import os
++import socket
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++
++import fp5_qtee_transport as t
++
++
++class SocketSessionTest(unittest.TestCase):
++    def test_mode_line_then_line_protocol(self):
++        with tempfile.TemporaryDirectory() as d:
++            path = Path(d) / "s.sock"
++            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++            srv.bind(str(path))
++            srv.listen(1)
++            got = []
++
++            def serve():
++                c, _ = srv.accept()
++                f = c.makefile("rwb", buffering=0)
++                got.append(f.readline())
++                f.write(b"SERVE idle\n")
++                got.append(f.readline())
++                f.write(b"AUTH HIT 1\n")
++                c.shutdown(socket.SHUT_RDWR)
++                c.close()
++
++            th = threading.Thread(target=serve)
++            th.start()
++            s = t.SocketSession("serve", path=path)
++            self.assertIsNone(s.pid)
++            self.assertEqual(s.stdout.readline(), "SERVE idle\n")
++            s.stdin.write("auth\n")
++            self.assertEqual(s.stdout.readline(), "AUTH HIT 1\n")
++            th.join(2)
++            self.assertEqual(s.wait(timeout=2), 0)
++            self.assertEqual(got, [b"MODE serve\n", b"auth\n"])
++            s.kill()
++            srv.close()
++
++    def test_transport_choice(self):
++        old = os.environ.get("FP5_QTEE_TRANSPORT")
++        try:
++            os.environ["FP5_QTEE_TRANSPORT"] = "sudo"
++            self.assertEqual(t.transport(), "sudo")
++            os.environ["FP5_QTEE_TRANSPORT"] = "socket"
++            self.assertEqual(t.transport(), "socket")
++        finally:
++            if old is None:
++                os.environ.pop("FP5_QTEE_TRANSPORT", None)
++            else:
++                os.environ["FP5_QTEE_TRANSPORT"] = old
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.47.3
+

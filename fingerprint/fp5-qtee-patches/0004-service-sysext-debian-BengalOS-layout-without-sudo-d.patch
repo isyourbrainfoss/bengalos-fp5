@@ -1,0 +1,534 @@
+From b2f48da0b45d6c15d52f6e9bafc30f43bf0fe6b8 Mon Sep 17 00:00:00 2001
+From: box <box@localhost>
+Date: Thu, 29 Oct 2026 08:44:19 +0100
+Subject: [PATCH 4/4] service, sysext, debian: BengalOS layout without sudo
+ (draft)
+
+fp5-qtee.socket (Accept=yes, MaxConnections=1) starts
+fp5-qtee-session@.service, whose broker reads one MODE line, checks the
+peer with SO_PEERCRED + pkcheck (org.fp5.qtee.{unlock,list,manage}) and
+execs the session on the socket. User unit for the watcher, polkit
+policy, presets, sysext build script (erofs), debian/ skeleton, and
+docs/bengalos-mbn.md. Not tested on the phone.
+---
+ debian/changelog                  |   6 ++
+ debian/control                    |  18 +++++
+ debian/copyright                  |   8 ++
+ debian/rules                      |  14 ++++
+ debian/source/format              |   1 +
+ docs/bengalos-mbn.md              |  52 +++++++++++++
+ service/99-fp5-qtee-user.preset   |   1 +
+ service/99-fp5-qtee.preset        |   1 +
+ service/Makefile                  |  26 +++++++
+ service/fp5-qtee-broker           | 117 ++++++++++++++++++++++++++++++
+ service/fp5-qtee-session@.service |  32 ++++++++
+ service/fp5-qtee-unlock.service   |  18 +++++
+ service/fp5-qtee.socket           |  17 +++++
+ service/org.fp5.qtee.desktop      |  10 +++
+ service/org.fp5.qtee.policy       |  37 ++++++++++
+ sysext/build-sysext.sh            |  30 ++++++++
+ 16 files changed, 388 insertions(+)
+ create mode 100644 debian/changelog
+ create mode 100644 debian/control
+ create mode 100644 debian/copyright
+ create mode 100755 debian/rules
+ create mode 100644 debian/source/format
+ create mode 100644 docs/bengalos-mbn.md
+ create mode 100644 service/99-fp5-qtee-user.preset
+ create mode 100644 service/99-fp5-qtee.preset
+ create mode 100644 service/Makefile
+ create mode 100755 service/fp5-qtee-broker
+ create mode 100644 service/fp5-qtee-session@.service
+ create mode 100644 service/fp5-qtee-unlock.service
+ create mode 100644 service/fp5-qtee.socket
+ create mode 100644 service/org.fp5.qtee.desktop
+ create mode 100644 service/org.fp5.qtee.policy
+ create mode 100755 sysext/build-sysext.sh
+
+diff --git a/debian/changelog b/debian/changelog
+new file mode 100644
+index 0000000..e22b5e0
+--- /dev/null
++++ b/debian/changelog
+@@ -0,0 +1,6 @@
++fp5-qtee (0.0~git20261029-1) UNRELEASED; urgency=medium
++
++  * Skeleton: BengalOS layout (system socket + polkit, /usr/libexec,
++    focal32.mbn from /var/lib/firmware/qsee). Not tested on the phone.
++
++ -- Isyour Brainfoss <isyourbrainfoss@users.noreply.github.com>  Thu, 29 Oct 2026 12:00:00 +0100
+diff --git a/debian/control b/debian/control
+new file mode 100644
+index 0000000..6ef783d
+--- /dev/null
++++ b/debian/control
+@@ -0,0 +1,18 @@
++Source: fp5-qtee
++Section: misc
++Priority: optional
++Maintainer: Isyour Brainfoss <isyourbrainfoss@users.noreply.github.com>
++Build-Depends: debhelper-compat (= 13)
++Standards-Version: 4.7.0
++Homepage: https://github.com/isyourbrainfoss/fp5-qtee
++Rules-Requires-Root: no
++
++Package: fp5-qtee
++Architecture: arm64
++Depends: ${shlibs:Depends}, ${misc:Depends}, python3, python3-gi, gir1.2-gtk-4.0, polkitd, systemd
++Recommends: droid-juicer
++Description: Fairphone 5 fingerprint unlock through the Qualcomm TEE
++ Loads the FocalTech trustlet through the upstream qcomtee driver and
++ matches fingerprints for the Phosh lock screen. A socket-activated system
++ service runs the session; polkit decides who may use it (no sudo).
++ Needs a kernel with CONFIG_QCOMTEE and the focaltech-fp driver.
+diff --git a/debian/copyright b/debian/copyright
+new file mode 100644
+index 0000000..48bc883
+--- /dev/null
++++ b/debian/copyright
+@@ -0,0 +1,8 @@
++Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
++Upstream-Name: fp5-qtee
++Source: https://github.com/isyourbrainfoss/fp5-qtee
++
++Files: *
++Copyright: 2026 fp5-qtee contributors
++License: GPL-2.0-only
++ On Debian systems the full text is in /usr/share/common-licenses/GPL-2.
+diff --git a/debian/rules b/debian/rules
+new file mode 100755
+index 0000000..e1e64c2
+--- /dev/null
++++ b/debian/rules
+@@ -0,0 +1,14 @@
++#!/usr/bin/make -f
++export DEB_BUILD_MAINT_OPTIONS = hardening=+all
++
++%:
++	dh $@
++
++override_dh_auto_build:
++	$(MAKE) -C session all CC=$(DEB_HOST_GNU_TYPE)-gcc CFLAGS="$(CFLAGS) $(CPPFLAGS)"
++
++override_dh_auto_test:
++	-cd app && python3 -m unittest test_fp5_qtee_transport test_fp5_qtee_boot
++
++override_dh_auto_install:
++	$(MAKE) -C service install DESTDIR=$(CURDIR)/debian/fp5-qtee
+diff --git a/debian/source/format b/debian/source/format
+new file mode 100644
+index 0000000..89ae9db
+--- /dev/null
++++ b/debian/source/format
+@@ -0,0 +1 @@
++3.0 (native)
+diff --git a/docs/bengalos-mbn.md b/docs/bengalos-mbn.md
+new file mode 100644
+index 0000000..5a09e29
+--- /dev/null
++++ b/docs/bengalos-mbn.md
+@@ -0,0 +1,52 @@
++# Firmware path: prebuilt focal32.mbn (BengalOS)
++
++**Status:** not tested on the phone yet.
++
++## What changed
++
++The session used to read the split trustlet from `/lib/firmware/qsee`,
++which means `focal32.mdt` plus `focal32.b00` … `focal32.bNN`, and then build the
++image in memory. BengalOS's `droid-juicer` already squashes the split files
++into a single ELF, `/var/lib/firmware/qsee/focal32.mbn`, and `/usr` (and so
++`/lib/firmware`) is read-only there.
++
++`session/fp5_fw.c` now picks the firmware directory in this order:
++
++1. `$FP5_QTEE_FW_DIR`, if it is set.
++2. The directory given on the command line (`fp5-qtee-session <mode> DIR`).
++3. The default, `/var/lib/firmware/qsee`.
++
++In that directory it tries:
++
++1. `focal32.mbn`, used only if it starts with the ELF magic.
++2. If that fails, `focal32.mdt` plus `focal32.b00`, `focal32.b01` and so on (up to 16). It stops at the first missing `.bNN`.
++3. Only when the default directory is in use: the same two steps in the old `/lib/firmware/qsee`. Nura keeps working without any change.
++
++## Checking that both paths give the same bytes (on the phone)
++
++```
++/usr/libexec/fp5-qtee/fp5-qtee-load --assemble /lib/firmware/qsee /tmp/focal32.from-split
++sha256sum /var/lib/firmware/qsee/focal32.mbn /tmp/focal32.from-split
++cmp /var/lib/firmware/qsee/focal32.mbn /tmp/focal32.from-split && echo SAME
++```
++
++`--assemble` uses only the split files and refuses to overwrite an existing
++output file. If the bytes differ, do not load either image. Compare the
++ELF headers first (`readelf -lW`). droid-juicer may pad segments in a
++different way.
++
++## Other BengalOS changes in the same branch
++
++- There are no `uname -r` checks. The session and `load-qcomtee.sh` look at what the
++  kernel has (`/dev/tee0`, the qcomtee driver, `/sys/class/misc/focaltech_fp`).
++- Sensor: the in-tree `focaltech-fp` misc driver (`/dev/focaltech_fp`) is used when
++  `/sys/class/misc/focaltech_fp/device/firmware_name` exists. Otherwise the session
++  uses the old `fp_life` class driver.
++- No sudo: the `fp5-qtee.socket` system socket, together with `fp5-qtee-broker`, checks
++  polkit for each connection and then runs the session as root. The user
++  watcher and the Finger app talk to it through `fp5_qtee_transport.py`. Set
++  `FP5_QTEE_TRANSPORT=sudo` to get the old behaviour.
++- The service sets `FP5_QTEE_MOUNT_PERSIST=0`, because BengalOS mounts persist itself
++  (`mnt-persist.mount`, read-only for now). While persist is read-only,
++  enroll and remove cannot save templates. That is the owner's call: see
++  `fingerprint-prep.md`, persist plan.
+diff --git a/service/99-fp5-qtee-user.preset b/service/99-fp5-qtee-user.preset
+new file mode 100644
+index 0000000..364fd35
+--- /dev/null
++++ b/service/99-fp5-qtee-user.preset
+@@ -0,0 +1 @@
++enable fp5-qtee-unlock.service
+diff --git a/service/99-fp5-qtee.preset b/service/99-fp5-qtee.preset
+new file mode 100644
+index 0000000..8e13dbc
+--- /dev/null
++++ b/service/99-fp5-qtee.preset
+@@ -0,0 +1 @@
++enable fp5-qtee.socket
+diff --git a/service/Makefile b/service/Makefile
+new file mode 100644
+index 0000000..716c516
+--- /dev/null
++++ b/service/Makefile
+@@ -0,0 +1,26 @@
++# Install the system-service layout (BengalOS: no sudo, read-only /usr).
++# make -C session && make -C service install DESTDIR=...
++PREFIX ?= /usr
++LIBEXECDIR ?= $(PREFIX)/libexec/fp5-qtee
++DATADIR ?= $(PREFIX)/share/fp5-qtee
++UNITDIR ?= $(PREFIX)/lib/systemd/system
++USERUNITDIR ?= $(PREFIX)/lib/systemd/user
++POLKITDIR ?= $(PREFIX)/share/polkit-1/actions
++DOCDIR ?= $(PREFIX)/share/doc/fp5-qtee
++APP = ../app
++PY = fp5_qtee_unlock.py fp5_qtee_transport.py fp5_qtee_haptic.py fp5_qtee_coach.py fp5-qtee-app.py
++
++.PHONY: install
++install:
++	$(MAKE) -C ../session install DESTDIR=$(DESTDIR) PREFIX=$(PREFIX) LIBEXECDIR=$(LIBEXECDIR)
++	install -Dm755 fp5-qtee-broker $(DESTDIR)$(LIBEXECDIR)/fp5-qtee-broker
++	install -Dm644 fp5-qtee.socket $(DESTDIR)$(UNITDIR)/fp5-qtee.socket
++	install -Dm644 fp5-qtee-session@.service $(DESTDIR)$(UNITDIR)/fp5-qtee-session@.service
++	install -Dm644 fp5-qtee-unlock.service $(DESTDIR)$(USERUNITDIR)/fp5-qtee-unlock.service
++	install -Dm644 org.fp5.qtee.policy $(DESTDIR)$(POLKITDIR)/org.fp5.qtee.policy
++	install -Dm644 org.fp5.qtee.desktop $(DESTDIR)$(PREFIX)/share/applications/org.fp5.qtee.desktop
++	install -Dm644 $(APP)/fp5-qtee-feedback.json $(DESTDIR)$(DATADIR)/fp5-qtee-feedback.json
++	for f in $(PY); do install -Dm644 $(APP)/$$f $(DESTDIR)$(DATADIR)/$$f; done
++	install -Dm644 ../docs/bengalos-mbn.md $(DESTDIR)$(DOCDIR)/bengalos-mbn.md
++	install -Dm644 99-fp5-qtee.preset $(DESTDIR)$(PREFIX)/lib/systemd/system-preset/99-fp5-qtee.preset
++	install -Dm644 99-fp5-qtee-user.preset $(DESTDIR)$(PREFIX)/lib/systemd/user-preset/99-fp5-qtee.preset
+diff --git a/service/fp5-qtee-broker b/service/fp5-qtee-broker
+new file mode 100755
+index 0000000..51f67ef
+--- /dev/null
++++ b/service/fp5-qtee-broker
+@@ -0,0 +1,117 @@
++#!/usr/bin/python3
++"""fp5-qtee-broker: the system side of the fp5-qtee socket (no sudo).
++
++Started by fp5-qtee-session@.service, one instance per connection, with
++the accepted socket as stdin/stdout. It:
++
++1. reads exactly one line "MODE <mode> [args...]" (byte by byte, so no
++   later protocol bytes are swallowed);
++2. finds the caller with SO_PEERCRED;
++3. asks polkit (pkcheck) whether that process may run the mode;
++4. execs the session binary with the socket still on stdin/stdout.
++
++Modes and polkit actions:
++  serve, unlock          org.fp5.qtee.unlock   (active session: yes)
++  list                   org.fp5.qtee.list     (active session: yes)
++  enroll, remove         org.fp5.qtee.manage   (auth_admin_keep)
++Anything else (probe, bench, ...) is refused: those are developer modes
++and stay a root-shell thing.
++"""
++
++import os
++import re
++import socket
++import struct
++import subprocess
++import sys
++
++SESSION = os.environ.get("FP5_QTEE_SESSION", "/usr/libexec/fp5-qtee/fp5-qtee-session")
++FW_DIR = os.environ.get("FP5_QTEE_FW_DIR", "/var/lib/firmware/qsee")
++ACTIONS = {
++    "serve": "org.fp5.qtee.unlock",
++    "unlock": "org.fp5.qtee.unlock",
++    "list": "org.fp5.qtee.list",
++    "enroll": "org.fp5.qtee.manage",
++    "remove": "org.fp5.qtee.manage",
++}
++ARG_RE = re.compile(r"^[0-9A-Za-z_.-]{1,32}$")
++MAX_ARGS = {"remove": 4}
++MAX_LINE = 256
++
++
++def say(msg: str) -> None:
++    try:
++        os.write(1, (msg + "\n").encode())
++    except OSError:
++        pass
++    print(msg, file=sys.stderr, flush=True)
++
++
++def read_line(fd: int) -> str:
++    buf = bytearray()
++    while len(buf) < MAX_LINE:
++        b = os.read(fd, 1)
++        if not b:
++            break
++        if b == b"\n":
++            return buf.decode("ascii", "strict")
++        buf += b
++    raise ValueError("no MODE line")
++
++
++def peer(sock: socket.socket) -> tuple[int, int, int]:
++    data = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
++    return struct.unpack("3i", data)
++
++
++def start_time(pid: int) -> str:
++    with open(f"/proc/{pid}/stat") as f:
++        stat = f.read()
++    # Field 22, counted after the ")" that ends the comm field.
++    return stat.rsplit(")", 1)[1].split()[19]
++
++
++def allowed(action: str, pid: int, uid: int) -> bool:
++    if uid == 0:
++        return True
++    subject = f"{pid},{start_time(pid)},{uid}"
++    res = subprocess.run(
++        ["pkcheck", "--action-id", action, "--process", subject,
++         "--allow-user-interaction"],
++        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL, timeout=120,
++    )
++    return res.returncode == 0
++
++
++def main() -> int:
++    sock = socket.socket(fileno=os.dup(0))
++    try:
++        pid, uid, _gid = peer(sock)
++        words = read_line(0).split()
++    except (OSError, ValueError, UnicodeDecodeError) as exc:
++        say(f"BROKER refused: {exc}")
++        return 2
++    if len(words) < 2 or words[0] != "MODE" or words[1] not in ACTIONS:
++        say("BROKER refused: unknown mode")
++        return 2
++    mode, args = words[1], words[2:]
++    if len(args) > MAX_ARGS.get(mode, 0) or not all(ARG_RE.match(a) for a in args):
++        say("BROKER refused: bad arguments")
++        return 2
++    try:
++        ok = allowed(ACTIONS[mode], pid, uid)
++    except (OSError, subprocess.SubprocessError) as exc:
++        say(f"BROKER refused: polkit check failed: {exc}")
++        return 3
++    if not ok:
++        say(f"BROKER refused: not authorized for {ACTIONS[mode]}")
++        return 3
++    print(f"fp5-qtee: uid {uid} pid {pid} mode {mode}", file=sys.stderr, flush=True)
++    sock.close()
++    os.execv(SESSION, [SESSION, mode, FW_DIR, *args])
++    return 127
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/service/fp5-qtee-session@.service b/service/fp5-qtee-session@.service
+new file mode 100644
+index 0000000..0bd2a66
+--- /dev/null
++++ b/service/fp5-qtee-session@.service
+@@ -0,0 +1,32 @@
++[Unit]
++Description=FP5 fingerprint (QTEE) session for one client
++Documentation=file:///usr/share/doc/fp5-qtee/bengalos-mbn.md
++After=mnt-persist.mount
++Wants=mnt-persist.mount
++
++[Service]
++Type=simple
++ExecStart=/usr/libexec/fp5-qtee/fp5-qtee-broker
++StandardInput=socket
++StandardOutput=socket
++StandardError=journal
++Environment=FP5_QTEE_FW_DIR=/var/lib/firmware/qsee
++# BengalOS mounts persist itself (mnt-persist.mount, read-only for now).
++Environment=FP5_QTEE_MOUNT_PERSIST=0
++# Root is needed for /dev/tee0, the RPMB SG_IO path and the GP files on
++# /mnt/persist. Keep the rest small.
++User=root
++NoNewPrivileges=yes
++ProtectHome=yes
++PrivateTmp=yes
++ProtectSystem=strict
++ReadWritePaths=-/mnt/persist
++ProtectKernelTunables=yes
++ProtectControlGroups=yes
++RestrictAddressFamilies=AF_UNIX AF_NETLINK
++RestrictRealtime=no
++LockPersonality=yes
++MemoryDenyWriteExecute=yes
++SystemCallArchitectures=native
++# Hard cap; enroll is the longest mode (about 25 min with coaching).
++RuntimeMaxSec=1800
+diff --git a/service/fp5-qtee-unlock.service b/service/fp5-qtee-unlock.service
+new file mode 100644
+index 0000000..cef9525
+--- /dev/null
++++ b/service/fp5-qtee-unlock.service
+@@ -0,0 +1,18 @@
++# User unit: the lock-screen watcher. It talks to the system socket, so it
++# needs no sudo and no root.
++[Unit]
++Description=FP5 fingerprint unlock watcher
++PartOf=graphical-session.target
++After=graphical-session.target
++ConditionPathExists=/run/fp5-qtee/session.sock
++
++[Service]
++Type=simple
++Environment=FP5_QTEE_TRANSPORT=socket
++Environment=PYTHONPATH=/usr/share/fp5-qtee
++ExecStart=/usr/bin/python3 /usr/share/fp5-qtee/fp5_qtee_unlock.py
++Restart=on-failure
++RestartSec=5
++
++[Install]
++WantedBy=graphical-session.target
+diff --git a/service/fp5-qtee.socket b/service/fp5-qtee.socket
+new file mode 100644
+index 0000000..cf5a67f
+--- /dev/null
++++ b/service/fp5-qtee.socket
+@@ -0,0 +1,17 @@
++[Unit]
++Description=FP5 fingerprint (QTEE) session socket
++Documentation=file:///usr/share/doc/fp5-qtee/bengalos-mbn.md
++# Only when the kernel has the TEE and the sensor driver.
++ConditionPathExists=/dev/tee0
++
++[Socket]
++ListenStream=/run/fp5-qtee/session.sock
++SocketMode=0666
++DirectoryMode=0755
++Accept=yes
++# One trustlet session at a time: the sensor and the TA are single-user.
++MaxConnections=1
++RemoveOnStop=yes
++
++[Install]
++WantedBy=sockets.target
+diff --git a/service/org.fp5.qtee.desktop b/service/org.fp5.qtee.desktop
+new file mode 100644
+index 0000000..95f77ff
+--- /dev/null
++++ b/service/org.fp5.qtee.desktop
+@@ -0,0 +1,10 @@
++[Desktop Entry]
++Type=Application
++Name=Finger
++Comment=Enroll or match a finger on the power button. New reader. Does not unlock the phone.
++Exec=/usr/bin/python3 /usr/share/fp5-qtee/fp5-qtee-app.py
++Icon=fingerprint-symbolic
++Terminal=false
++Categories=Utility;
++Keywords=fingerprint;finger;qtee;
++StartupNotify=true
+diff --git a/service/org.fp5.qtee.policy b/service/org.fp5.qtee.policy
+new file mode 100644
+index 0000000..15bc482
+--- /dev/null
++++ b/service/org.fp5.qtee.policy
+@@ -0,0 +1,37 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE policyconfig PUBLIC
++ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
++ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
++<policyconfig>
++  <vendor>fp5-qtee</vendor>
++
++  <action id="org.fp5.qtee.unlock">
++    <description>Check a fingerprint to unlock the phone</description>
++    <message>A fingerprint check needs your permission</message>
++    <defaults>
++      <allow_any>no</allow_any>
++      <allow_inactive>no</allow_inactive>
++      <allow_active>yes</allow_active>
++    </defaults>
++  </action>
++
++  <action id="org.fp5.qtee.list">
++    <description>List the saved fingerprints</description>
++    <message>Listing fingerprints needs your permission</message>
++    <defaults>
++      <allow_any>no</allow_any>
++      <allow_inactive>no</allow_inactive>
++      <allow_active>yes</allow_active>
++    </defaults>
++  </action>
++
++  <action id="org.fp5.qtee.manage">
++    <description>Add or remove a fingerprint</description>
++    <message>Adding or removing a fingerprint needs your password</message>
++    <defaults>
++      <allow_any>no</allow_any>
++      <allow_inactive>no</allow_inactive>
++      <allow_active>auth_admin_keep</allow_active>
++    </defaults>
++  </action>
++</policyconfig>
+diff --git a/sysext/build-sysext.sh b/sysext/build-sysext.sh
+new file mode 100755
+index 0000000..3adbde3
+--- /dev/null
++++ b/sysext/build-sysext.sh
+@@ -0,0 +1,30 @@
++#!/bin/sh
++# Build a systemd-sysext image of fp5-qtee for BengalOS (aarch64).
++#   sysext/build-sysext.sh VERSION_ID OUT.raw
++# VERSION_ID must match /etc/os-release on the phone (e.g. 0.26.1027.1),
++# or pass _any to skip the version check (then also needs ID=_any or
++# matching ID; we keep ID=bengalos).
++# Install on the phone (owner step):
++#   cp OUT.raw /var/lib/extensions/fp5-qtee.raw && systemd-sysext refresh
++#   systemctl daemon-reload && systemctl enable --now fp5-qtee.socket
++set -eu
++ver=${1:?VERSION_ID}
++out=${2:?OUT.raw}
++here=$(cd "$(dirname "$0")/.." && pwd)
++stage=$(mktemp -d)
++trap 'rm -rf "$stage"' EXIT
++make -C "$here/session" clean >/dev/null
++make -C "$here/session" all CC=${CC:-aarch64-linux-gnu-gcc} CFLAGS="${CFLAGS:--O2 -Wall -D_FORTIFY_SOURCE=2 -fstack-protector-strong}" >/dev/null
++make -C "$here/service" install DESTDIR="$stage" >/dev/null
++rel="$stage/usr/lib/extension-release.d/extension-release.fp5-qtee"
++mkdir -p "$(dirname "$rel")"
++if [ "$ver" = _any ]; then
++	printf 'ID=_any\nARCHITECTURE=arm64\nEXTENSION_RELOAD_MANAGER=1\n' > "$rel"
++else
++	printf 'ID=bengalos\nVERSION_ID=%s\nARCHITECTURE=arm64\nEXTENSION_RELOAD_MANAGER=1\n' "$ver" > "$rel"
++fi
++# The image must hold only /usr (and /opt). No /etc: config stays in confext.
++[ -z "$(ls -A "$stage" | grep -v '^usr$')" ]
++rm -f "$out"
++mkfs.erofs -zlz4hc -T0 --all-root "$out" "$stage" >/dev/null
++echo "$out"
+-- 
+2.47.3
+
