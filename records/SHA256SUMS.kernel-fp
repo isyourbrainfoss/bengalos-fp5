@@ -1,0 +1,11 @@
+1b0e220d0afaf7e80301fb1b5596bf08a1f6cb67af0d415f72f55a49a1d49b15  linux-image-7.2.8-sc7280-fp5fp+_7.2.8-1~fp5fp1_arm64.deb
+5a723173641cd95cd8c5a804a776119f2a0b2e3fa3747b0c47b0e30d3ef4a4e2  linux-libc-dev_7.2.8-1~fp5fp1_arm64.deb
+126298acfb2df0f3982cec6f1d8708b9beeaa0dc37500a0f0fc29ed2888331a7  config-7.2.8-sc7280-fp5fp+
+aca365e793885f5b10089766426d71944880acab7d78e3002e3f51b767dff7c8  qcm6490-fairphone-fp5.dtb
+73bb0cfc46d7a88b0706d8f3669bf72b6da7d051d91ae8d1ce299c81bb854eb0  patches/0001-tee-qcomtee-do-not-select-QCOM_TZMEM_MODE_SHMBRIDGE.patch
+195b50a7e18c9462ce27bb6120087b35f8a95390b3a8e3ca6600961e96d67bb0  patches/0002-firmware-qcom-serve-the-legacy-QSEE-RPMB-listener-fo.patch
+fdd7b17db64f41bb7d4685b33c4adcd59334bc244c4f59a5277a37f460443d9a  patches/0003-phy-qcom-snps-femto-v2-clear-charger-detection-state.patch
+5b20988569db444ff53a4bcda432f05e745e3cc82208767644a2549486742612  patches/0004-DRAFT-arm64-dts-qcom-fp5-add-ST21NFCD-NFC-node-untes.patch
+58ff8f74560c10bc91e96932a350501749b08f00b0ab36d48f7bcbe2c3a03cca  patches/0005-misc-focaltech-fp-add-FT9362-fingerprint-GPIO-IRQ-dr.patch
+771de379baf202ef5748572445906530edbcce204b8be6d626da0ad4430a29a8  patches/0006-arm64-dts-qcom-qcm6490-fairphone-fp5-add-the-fingerp.patch
+dcc6c8a7eee1d86b92234cc8e6024b9d3c0a1c5d3fea06ea746e0cf852b5a4d1  patches/0007-misc-focaltech-fp-wake-the-system-on-a-sensor-touch.patch
