@@ -1,0 +1,26 @@
+From f55208cec25d5aaae2896c9cc0ee85264669357d Mon Sep 17 00:00:00 2001
+From: isyourbrainfoss <isyourbrainfoss@proton.me>
+Date: Tue, 20 Oct 2026 23:38:21 +0200
+Subject: [PATCH 1/7] tee: qcomtee: do not select QCOM_TZMEM_MODE_SHMBRIDGE
+
+The FP5 build uses CONFIG_QCOM_TZMEM_MODE_GENERIC. This is the change
+the running 7.2.9 kernel was built with.
+---
+ drivers/tee/qcomtee/Kconfig | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/drivers/tee/qcomtee/Kconfig b/drivers/tee/qcomtee/Kconfig
+index 9f19dee08..00e07ed80 100644
+--- a/drivers/tee/qcomtee/Kconfig
++++ b/drivers/tee/qcomtee/Kconfig
+@@ -5,7 +5,6 @@ config QCOMTEE
+ 	depends on ARCH_QCOM || COMPILE_TEST
+ 	depends on !CPU_BIG_ENDIAN
+ 	select QCOM_SCM
+-	select QCOM_TZMEM_MODE_SHMBRIDGE
+ 	help
+ 	  This option enables the Qualcomm Trusted Execution Environment (QTEE)
+ 	  driver. It provides an API to access services offered by QTEE and
+-- 
+2.47.3
+

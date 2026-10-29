@@ -1,0 +1,117 @@
+From 291db55b43a5c59fc46a5f8778e8a7109e0895fc Mon Sep 17 00:00:00 2001
+From: box <box@localhost>
+Date: Thu, 29 Oct 2026 08:35:04 +0100
+Subject: [PATCH 7/7] misc: focaltech-fp: wake the system on a sensor touch
+
+Honour the generic wakeup-source DT property: call device_init_wakeup()
+at probe and, while userspace has the interrupt armed, enable_irq_wake()
+across system suspend (disable_irq_wake() on resume). On the Fairphone 5
+the line is TLMM gpio34, which sc7280 routes to PDC pin 77, so it can wake
+the SoC. Mark the FP5 node with wakeup-source.
+
+DRAFT for the BengalOS FP5 test kernel. Untested on hardware.
+Needs a human Signed-off-by and an Assisted-by line before any posting.
+---
+ .../boot/dts/qcom/qcm6490-fairphone-fp5.dts   |  1 +
+ drivers/misc/focaltech-fp.c                   | 39 +++++++++++++++++++
+ 2 files changed, 40 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/qcm6490-fairphone-fp5.dts b/arch/arm64/boot/dts/qcom/qcm6490-fairphone-fp5.dts
+index 9a3526416..dc00a7dab 100644
+--- a/arch/arm64/boot/dts/qcom/qcm6490-fairphone-fp5.dts
++++ b/arch/arm64/boot/dts/qcom/qcm6490-fairphone-fp5.dts
+@@ -262,6 +262,7 @@ fingerprint {
+ 		 * to open a session.
+ 		 */
+ 		firmware-name = "focal32";
++		wakeup-source;
+ 		pinctrl-names = "fpsensor_finger_rst_low",
+ 				"fpsensor_finger_rst_high",
+ 				"fpsensor_eint_as_int",
+diff --git a/drivers/misc/focaltech-fp.c b/drivers/misc/focaltech-fp.c
+index 8271e2d60..1d98485ea 100644
+--- a/drivers/misc/focaltech-fp.c
++++ b/drivers/misc/focaltech-fp.c
+@@ -21,6 +21,7 @@
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_wakeup.h>
++#include <linux/property.h>
+ #include <linux/compat.h>
+ #include <linux/irq.h>
+ #include <linux/poll.h>
+@@ -46,6 +47,7 @@ struct focalfp_dev {
+ 	u32 pending;
+ 	u32 seq;
+ 	bool awake;
++	bool irq_wake;
+ 	wait_queue_head_t irq_wq;
+ 	struct wakeup_source *ws;
+ 	spinlock_t irq_lock;
+@@ -368,6 +370,13 @@ static int focalfp_probe(struct platform_device *pdev)
+ 	/* Armed on demand; focalfp_arm() clears whatever reset latched. */
+ 	fp->irq_enabled = false;
+ 
++	/*
++	 * Touch-to-wake: the sensor IRQ (TLMM gpio34, PDC pin 77 on sc7280) can
++	 * wake the SoC from suspend. Only boards that say so in DT get it.
++	 */
++	if (device_property_read_bool(&pdev->dev, "wakeup-source"))
++		device_init_wakeup(&pdev->dev, true);
++
+ 	/* Before misc_register(), so the attribute is readable as soon as the
+ 	 * node appears. */
+ 	platform_set_drvdata(pdev, fp);
+@@ -399,12 +408,41 @@ static void focalfp_remove(struct platform_device *pdev)
+ 	int ret;
+ 
+ 	misc_deregister(&fp->miscdev);
++	device_init_wakeup(&pdev->dev, false);
+ 	wakeup_source_unregister(fp->ws);
+ 	ret = pinctrl_select_state(fp->pinctrl, fp->st_pwr_low);
+ 	if (ret)
+ 		dev_warn(&pdev->dev, "VDD power-down failed: %d\n", ret);
+ }
+ 
++/*
++ * Keep the line as a wake source across suspend, but only while userspace has
++ * it armed: a disarmed sensor must not wake the phone.
++ */
++static int focalfp_suspend(struct device *dev)
++{
++	struct focalfp_dev *fp = dev_get_drvdata(dev);
++
++	if (device_may_wakeup(dev) && READ_ONCE(fp->irq_enabled))
++		fp->irq_wake = !enable_irq_wake(fp->irq);
++
++	return 0;
++}
++
++static int focalfp_resume(struct device *dev)
++{
++	struct focalfp_dev *fp = dev_get_drvdata(dev);
++
++	if (fp->irq_wake) {
++		disable_irq_wake(fp->irq);
++		fp->irq_wake = false;
++	}
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(focalfp_pm_ops, focalfp_suspend, focalfp_resume);
++
+ static const struct of_device_id focalfp_of_match[] = {
+ 	{ .compatible = "focaltech,ft9362" },
+ 	{}
+@@ -418,6 +456,7 @@ static struct platform_driver focalfp_driver = {
+ 		.name           = "focaltech-fp",
+ 		.of_match_table = focalfp_of_match,
+ 		.dev_groups     = focalfp_groups,
++		.pm             = pm_sleep_ptr(&focalfp_pm_ops),
+ 	},
+ };
+ module_platform_driver(focalfp_driver);
+-- 
+2.47.3
+

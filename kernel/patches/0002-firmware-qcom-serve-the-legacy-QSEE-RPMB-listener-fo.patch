@@ -1,0 +1,873 @@
+From 7bb64fbeb5bc2e6335160122357fec7e4ec8c453 Mon Sep 17 00:00:00 2001
+From: isyourbrainfoss <isyourbrainfoss@proton.me>
+Date: Tue, 20 Oct 2026 23:38:21 +0200
+Subject: [PATCH 2/7] firmware: qcom: serve the legacy QSEE RPMB listener for
+ QTEE
+
+The Fairphone 5 fingerprint trustlet keeps its storage key behind the
+legacy QSEE RPMB listener (id 0x2000). While an smcinvoke call runs,
+QTEE can return "blocked on listener" (result 1 or 2, 0xee02, listener
+id). Mainline qcomtee has no handler for that, so the trustlet never
+loads its saved templates.
+
+This does what the out-of-tree qcomtee-bridge module did on 7.2.0:
+
+- qcom_scm: add SMCs to register a QSEE listener (owner 50, service 2,
+  command 1 or 6) and the QSEE log buffer (service 1, command 6). In
+  both smcinvoke paths, when QTEE blocks on a listener, call the
+  registered handler, then resume with the listener response (service
+  2, command 3, args listener id and 0). Stop after 32 rounds.
+- qcom_qsee_rpmb: at late init, take a buffer (0x6400, then 0x10000
+  bytes) from its own tzmem pool and register listener 0x2000. Serve
+  requests over the UFS RPMB well-known LU:
+  0x104 reports device info and the write counter, 0x102 reads, and
+  0x103 forwards the write frames the trustlet supplied (at most 8),
+  then reads the result. 0x101 key provisioning is refused with -1,
+  and key-program frames are never sent. Other commands get -5. The
+  kernel never sends a write on its own.
+- Register the QSEE log buffer (best effort) and expose it as
+  /dev/qsee_log.
+
+Built only with CONFIG_QCOMTEE. Needs SCSI to be reachable from it,
+which it is in this config (both built in).
+---
+ drivers/firmware/qcom/Makefile         |   1 +
+ drivers/firmware/qcom/qcom_qsee_rpmb.c | 612 +++++++++++++++++++++++++
+ drivers/firmware/qcom/qcom_scm.c       | 164 +++++++
+ include/linux/firmware/qcom/qcom_scm.h |   5 +
+ 4 files changed, 782 insertions(+)
+ create mode 100644 drivers/firmware/qcom/qcom_qsee_rpmb.c
+
+diff --git a/drivers/firmware/qcom/Makefile b/drivers/firmware/qcom/Makefile
+index b679d3fc2..eeb6f186b 100644
+--- a/drivers/firmware/qcom/Makefile
++++ b/drivers/firmware/qcom/Makefile
+@@ -9,3 +9,4 @@ CFLAGS_qcom_scm-smc.o := -I$(src)
+ obj-$(CONFIG_QCOM_TZMEM)	+= qcom_tzmem.o
+ obj-$(CONFIG_QCOM_QSEECOM)	+= qcom_qseecom.o
+ obj-$(CONFIG_QCOM_QSEECOM_UEFISECAPP) += qcom_qseecom_uefisecapp.o
++obj-$(CONFIG_QCOMTEE)		+= qcom_qsee_rpmb.o
+diff --git a/drivers/firmware/qcom/qcom_qsee_rpmb.c b/drivers/firmware/qcom/qcom_qsee_rpmb.c
+new file mode 100644
+index 000000000..e2f8556bc
+--- /dev/null
++++ b/drivers/firmware/qcom/qcom_qsee_rpmb.c
+@@ -0,0 +1,612 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Legacy QSEE RPMB listener for the QTEE smcinvoke transport.
++ *
++ * Some trustlets (e.g. the Fairphone 5 fingerprint TA) still use the
++ * legacy QSEE RPMB listener (id 0x2000) for secure storage.  While
++ * servicing an smcinvoke call, QTEE may return "blocked on listener"
++ * (result[0] in {1,2}, result[1] == 0xee02, result[2] == listener id).
++ * The kernel has to serve the listener request found in the shared
++ * listener buffer and resume QTEE with the listener-response SMC.
++ *
++ * The resume/registration/log SMCs live in qcom_scm.c; this file owns
++ * the tzmem listener buffer, the RPMB request handling over the UFS
++ * RPMB well-known LU, and the /dev/qsee_log misc device.  It reproduces
++ * the behaviour of the out-of-tree qcomtee-bridge module used with the
++ * 7.2.0 kernel:
++ *  - registers listener 0x2000 (cmd 1, fallback cmd 6), buffer 0x6400
++ *    then 0x10000 bytes from a dedicated tzmem pool;
++ *  - serves RPMB requests 0x102/0x103/0x104 over the UFS RPMB LU only
++ *    as the trustlet asks;
++ *  - refuses key provisioning (0x101) and key-program frames (type 1);
++ *  - at most 8 frames per authenticated write;
++ *  - never programs the RPMB key and never writes on its own initiative.
++ */
++
++#define pr_fmt(fmt) "qcomtee: " fmt
++
++#include <linux/firmware/qcom/qcom_scm.h>
++#include <linux/firmware/qcom/qcom_tzmem.h>
++#include <linux/fs.h>
++#include <linux/gfp.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/uaccess.h>
++#include <asm/barrier.h>
++
++#include <scsi/scsi_device.h>
++#include <scsi/scsi_host.h>
++#include <scsi/scsi_proto.h>
++
++#include "qcom_scm.h"
++
++#define QSEE_RPMB_LISTENER_ID		0x2000
++
++#define RPMB_FRAME			512
++#define RPMB_MAX_FRAMES			8
++#define UFS_RPMB_WLUN			0xc144
++
++/* RPMB frame field offsets (big-endian on the wire). */
++#define RPMB_WC				0x1f4
++#define RPMB_ADDR			0x1f8
++#define RPMB_BCNT			0x1fa
++#define RPMB_RESULT			0x1fc
++#define RPMB_REQ			0x1fe
++
++/*
++ * Raw (little-endian loaded) 16-bit values as stored at frame[0x1fe].
++ * On the wire the request type is big-endian, so e.g. request 0x0002
++ * (read write counter) is stored in memory as 0x0200.
++ */
++#define RPMB_RAW_PROGRAM_KEY		0x0100	/* wire 0x0001 */
++#define RPMB_RAW_READ_WC		0x0200	/* wire 0x0002 */
++#define RPMB_RAW_AUTH_WRITE		0x0300	/* wire 0x0003 */
++#define RPMB_RAW_RESULT_READ		0x0500	/* wire 0x0005 */
++
++/* Listener request header (little-endian). */
++#define REQ_OPCODE			0x00
++#define REQ_STATUS			0x04	/* out */
++#define REQ_NFRAMES			0x04	/* in  */
++#define REQ_BLKSZ			0x08	/* in  */
++#define REQ_FRAME_OFF			0x0c	/* in  */
++#define REQ_INFO_REL			0x10	/* out */
++#define REQ_INFO_BLKSZ			0x14	/* out */
++#define REQ_INFO_BLKCNT			0x18	/* out */
++#define REQ_INFO_WC			0x1c	/* out */
++
++/* Command opcodes in the listener request. */
++#define QSEE_RPMB_PROVISION_KEY		0x101
++#define QSEE_RPMB_READ			0x102
++#define QSEE_RPMB_WRITE			0x103
++#define QSEE_RPMB_GET_INFO		0x104
++
++/* tzmem pool sizing, matching the 7.2.0 module. */
++#define QSEE_RPMB_POOL_INIT		0x120000
++#define QSEE_RPMB_POOL_GROW		0x100000
++#define QSEE_RPMB_POOL_MAX		0x440000
++
++/* Listener buffer sizes tried, in order. */
++static const size_t qsee_rpmb_buf_sizes[] = { 0x6400, 0x10000 };
++
++static unsigned int log_bytes = 0x8000;
++module_param(log_bytes, uint, 0444);
++MODULE_PARM_DESC(log_bytes, "QSEE log buffer size (power of two, 4K..128K)");
++
++/* RPMB listener state. */
++static struct qcom_tzmem_pool *qsee_rpmb_pool;
++static void *qsee_rpmb_va;
++static size_t qsee_rpmb_len;
++static bool qsee_rpmb_registered;
++static u8 *qsee_rpmb_scratch;		/* 512-byte DMA-friendly scratch */
++static DEFINE_MUTEX(qsee_rpmb_lock);
++
++/* QSEE log buffer / misc device state. */
++static void *qsee_log_va;
++static size_t qsee_log_len;
++static int qsee_log_reg_ret = -ENODATA;
++static bool qsee_log_misc_registered;
++
++/* ---------------------------------------------------------------- */
++/* Small helpers                                                     */
++/* ---------------------------------------------------------------- */
++
++static inline u32 rd32(const u8 *p, size_t off) { return *(const u32 *)(p + off); }
++static inline void wr32(u8 *p, size_t off, u32 v) { *(u32 *)(p + off) = v; }
++static inline u16 rd16(const u8 *p, size_t off) { return *(const u16 *)(p + off); }
++static inline void wr16(u8 *p, size_t off, u16 v) { *(u16 *)(p + off) = v; }
++
++static void qsee_rpmb_set_status(u8 *req, int status)
++{
++	wr32(req, REQ_STATUS, (u32)status);
++	dsb(st);
++}
++
++/* ---------------------------------------------------------------- */
++/* UFS RPMB transport                                                */
++/* ---------------------------------------------------------------- */
++
++static struct scsi_device *qsee_find_rpmb_sdev(void)
++{
++	struct scsi_device *sdev = NULL;
++	struct Scsi_Host *shost;
++	unsigned int h;
++
++	for (h = 0; h < 8 && !sdev; h++) {
++		shost = scsi_host_lookup(h);
++		if (!shost)
++			continue;
++		sdev = scsi_device_lookup(shost, 0, 0, UFS_RPMB_WLUN);
++		scsi_host_put(shost);
++	}
++
++	return sdev;
++}
++
++static int qsee_ufs_rpmb_xfer(void *buf, size_t len, bool send)
++{
++	struct scsi_device *sdev;
++	u8 cdb[12] = { 0 };
++	int ret;
++
++	if (len < RPMB_FRAME || len > 0x1000)
++		return -EINVAL;
++
++	sdev = qsee_find_rpmb_sdev();
++	if (!sdev)
++		return -ENODEV;
++
++	cdb[0] = send ? SECURITY_PROTOCOL_OUT : SECURITY_PROTOCOL_IN;
++	cdb[1] = 0xec;			/* UFS RPMB security protocol */
++	cdb[3] = 0x01;
++	cdb[6] = (len >> 24) & 0xff;
++	cdb[7] = (len >> 16) & 0xff;
++	cdb[8] = (len >> 8) & 0xff;
++	cdb[9] = len & 0xff;
++
++	ret = scsi_execute_cmd(sdev, cdb,
++			       send ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
++			       buf, len, 30 * HZ, 0, NULL);
++	scsi_device_put(sdev);
++
++	return ret;
++}
++
++/* ---------------------------------------------------------------- */
++/* RPMB request handling                                             */
++/* ---------------------------------------------------------------- */
++
++/* 0x104: read the write counter and report device geometry. */
++static void qsee_rpmb_get_info(u8 *req)
++{
++	u8 *f = qsee_rpmb_scratch;
++	u32 result, wc_raw;
++	int ret;
++
++	memset(f, 0, RPMB_FRAME);
++	wr16(f, RPMB_REQ, RPMB_RAW_READ_WC);
++
++	ret = qsee_ufs_rpmb_xfer(f, RPMB_FRAME, true);
++	if (!ret)
++		ret = qsee_ufs_rpmb_xfer(f, RPMB_FRAME, false);
++
++	result = be16_to_cpu((__force __be16)rd16(f, RPMB_RESULT));
++	wc_raw = rd32(f, RPMB_WC);
++	pr_info("qsee rpmb get-info ret=%d result=0x%x wc=%u\n",
++		ret, result, be32_to_cpu((__force __be32)wc_raw));
++
++	if (ret) {
++		qsee_rpmb_set_status(req, ret);
++		return;
++	}
++
++	/* Static geometry, matching the 7.2.0 module. */
++	wr32(req, REQ_INFO_REL, 0x40);
++	wr32(req, REQ_INFO_BLKSZ, 0x200);
++	wr32(req, REQ_INFO_BLKCNT, 0x8000);
++	wr32(req, REQ_INFO_WC, swab32(wc_raw));
++	qsee_rpmb_set_status(req, 0);
++}
++
++static bool qsee_rpmb_fits(size_t off, size_t len)
++{
++	return off <= qsee_rpmb_len && len <= qsee_rpmb_len - off;
++}
++
++/* Wire request types the kernel may forward on behalf of the trustlet. */
++static bool qsee_rpmb_type_allowed(u32 opcode, u16 wire)
++{
++	switch (wire) {
++	case 0x0002:	/* read write counter */
++	case 0x0004:	/* authenticated read */
++	case 0x0005:	/* result read */
++		return true;
++	case 0x0003:	/* authenticated write: only when the TA asks to write */
++		return opcode == QSEE_RPMB_WRITE;
++	default:	/* 0x0001 program key, or garbage */
++		return false;
++	}
++}
++
++/*
++ * 0x103 with an authenticated-write frame and nfr >= 2: forward the
++ * trustlet-signed write frames (at most 8) in one transfer, then fetch
++ * the result frame with a result-read request.  The result frame is
++ * returned at req+0x14, as the 7.2.0 module did.
++ */
++static int qsee_rpmb_auth_write(u8 *req, u8 *f, size_t off, u32 nfr)
++{
++	u32 cnt = rd32(req, 0x14);
++	u8 *res = qsee_rpmb_scratch;
++	u8 *rr;
++	int ret;
++
++	if (cnt - 1 >= 16)
++		cnt = nfr;
++	if (cnt > RPMB_MAX_FRAMES ||
++	    !qsee_rpmb_fits(off, (size_t)cnt * RPMB_FRAME))
++		return -EINVAL;
++
++	rr = kzalloc(RPMB_FRAME, GFP_KERNEL);
++	if (!rr)
++		return -ENOMEM;
++
++	ret = qsee_ufs_rpmb_xfer(f, (size_t)cnt * RPMB_FRAME, true);
++	if (!ret) {
++		wr16(rr, RPMB_REQ, RPMB_RAW_RESULT_READ);
++		ret = qsee_ufs_rpmb_xfer(rr, RPMB_FRAME, true);
++	}
++	if (!ret) {
++		memset(res, 0, RPMB_FRAME);
++		ret = qsee_ufs_rpmb_xfer(res, RPMB_FRAME, false);
++	}
++	kfree(rr);
++	if (ret)
++		return ret;
++
++	pr_info("qsee rpmb write result=0x%x wc=%u\n",
++		be16_to_cpu((__force __be16)rd16(res, RPMB_RESULT)),
++		be32_to_cpu((__force __be32)rd32(res, RPMB_WC)));
++
++	if (!qsee_rpmb_fits(0x14, RPMB_FRAME))
++		return -EINVAL;
++	memcpy(req + 0x14, res, RPMB_FRAME);
++	wr32(req, 0x08, RPMB_FRAME);
++	wr32(req, 0x0c, 0x14);
++	qsee_rpmb_set_status(req, 0);
++	return 0;
++}
++
++/*
++ * Forward one request frame and read the response back into place.
++ * For a multi-frame read the frames are read through a bounce buffer.
++ */
++static int qsee_rpmb_xfer_frame(u8 *req, u8 *f, size_t off, u32 opcode,
++				u32 nfr)
++{
++	size_t total = (size_t)nfr * RPMB_FRAME;
++	bool multi = opcode == QSEE_RPMB_READ && nfr > 1;
++	int ret;
++
++	ret = qsee_ufs_rpmb_xfer(f, RPMB_FRAME, true);
++	if (ret)
++		return ret;
++
++	if (multi && qsee_rpmb_fits(off, total)) {
++		u8 *tmp = kmalloc(total, GFP_KERNEL);
++
++		if (!tmp)
++			return -ENOMEM;
++		ret = qsee_ufs_rpmb_xfer(tmp, total, false);
++		if (!ret) {
++			pr_info("qsee rpmb read off=0x%zx res0=0x%x wc=%u n=%zu\n",
++				off,
++				be16_to_cpu((__force __be16)rd16(tmp, RPMB_RESULT)),
++				be32_to_cpu((__force __be32)rd32(tmp, RPMB_WC)),
++				total);
++			memcpy(f, tmp, total);
++		}
++		kfree(tmp);
++		if (ret)
++			return ret;
++		wr32(req, 0x08, total);
++		qsee_rpmb_set_status(req, 0);
++		return 0;
++	}
++
++	if (multi || !qsee_rpmb_fits(off, total))
++		total = RPMB_FRAME;
++
++	ret = qsee_ufs_rpmb_xfer(f, total, false);
++	if (ret)
++		return ret;
++
++	pr_info("qsee rpmb xfer result=0x%x wc=%u rr=0x%x\n",
++		be16_to_cpu((__force __be16)rd16(f, RPMB_RESULT)),
++		be32_to_cpu((__force __be32)rd32(f, RPMB_WC)),
++		be16_to_cpu((__force __be16)rd16(f, RPMB_REQ)));
++	qsee_rpmb_set_status(req, 0);
++	return 0;
++}
++
++/*
++ * 0x102 read / 0x103 write.  Like the 7.2.0 module, look for the request
++ * frame at the offset the trustlet gave, then at a few fixed fallback
++ * offsets, and act on the first usable one.  Only frames the trustlet
++ * supplied are sent, except that an all-zero frame in a read request is
++ * turned into a read-write-counter request.  Key-program frames are
++ * refused.  Nothing usable: status -5.
++ */
++static void qsee_rpmb_rw(u8 *req, u32 opcode)
++{
++	u32 nfr = rd32(req, REQ_NFRAMES);
++	u32 blksz = rd32(req, REQ_BLKSZ);
++	u32 roff = rd32(req, REQ_FRAME_OFF);
++	u32 cand[6];
++	unsigned int n = 0, i;
++
++	if (nfr - 1 >= 16)
++		nfr = 1;
++	if (nfr > RPMB_MAX_FRAMES)
++		nfr = RPMB_MAX_FRAMES;
++
++	if (blksz >= RPMB_FRAME && qsee_rpmb_fits(roff, RPMB_FRAME))
++		cand[n++] = roff;
++	cand[n++] = 0x18;
++	cand[n++] = 0x10;
++	cand[n++] = 0x14;
++	cand[n++] = 0x20;
++	cand[n++] = 0x08;
++
++	for (i = 0; i < n; i++) {
++		size_t off = cand[i];
++		u8 *f;
++		u16 wire;
++
++		if (!qsee_rpmb_fits(off, RPMB_FRAME))
++			continue;
++		f = req + off;
++		wire = be16_to_cpu((__force __be16)rd16(f, RPMB_REQ));
++
++		if (opcode == QSEE_RPMB_READ && wire == 0) {
++			memset(f, 0, RPMB_REQ);
++			wr16(f, RPMB_REQ, RPMB_RAW_READ_WC);
++			wire = 0x0002;
++		} else if (wire < 1 || wire > 5) {
++			continue;
++		}
++
++		if (wire == 0x0001) {
++			pr_warn("qsee rpmb refuse key-program off=0x%zx\n", off);
++			continue;
++		}
++		if (!qsee_rpmb_type_allowed(opcode, wire)) {
++			pr_warn("qsee rpmb refuse type 0x%x for cmd 0x%x off=0x%zx\n",
++				wire, opcode, off);
++			continue;
++		}
++
++		pr_info("qsee rpmb try off=0x%zx rr=0x%x nfr=%u addr=%u bcnt=%u\n",
++			off, wire, nfr,
++			be16_to_cpu((__force __be16)rd16(f, RPMB_ADDR)),
++			be16_to_cpu((__force __be16)rd16(f, RPMB_BCNT)));
++
++		if (opcode == QSEE_RPMB_WRITE && wire == 0x0003 && nfr >= 2) {
++			if (!qsee_rpmb_auth_write(req, f, off, nfr))
++				return;
++			continue;
++		}
++
++		if (!qsee_rpmb_xfer_frame(req, f, off, opcode, nfr))
++			return;
++	}
++
++	qsee_rpmb_set_status(req, -5);
++}
++
++static void qsee_rpmb_handle(u8 *req)
++{
++	u32 opcode = rd32(req, REQ_OPCODE);
++
++	pr_info("qsee rpmb cmd=0x%x first16=%16ph\n", opcode, req);
++
++	switch (opcode) {
++	case QSEE_RPMB_GET_INFO:
++		qsee_rpmb_get_info(req);
++		break;
++	case QSEE_RPMB_PROVISION_KEY:
++		pr_warn("qsee rpmb refuse provision\n");
++		qsee_rpmb_set_status(req, -1);
++		break;
++	case QSEE_RPMB_READ:
++	case QSEE_RPMB_WRITE:
++		qsee_rpmb_rw(req, opcode);
++		break;
++	default:
++		pr_warn("qsee rpmb unknown cmd=0x%x\n", opcode);
++		qsee_rpmb_set_status(req, -5);
++		break;
++	}
++}
++
++/*
++ * Listener serve callback, invoked by qcom_scm.c when QTEE blocks on a
++ * legacy listener.  Returns true if this listener is ours (and served).
++ */
++static bool qsee_rpmb_serve(u32 lid)
++{
++	if (lid != QSEE_RPMB_LISTENER_ID || !qsee_rpmb_registered ||
++	    !qsee_rpmb_va)
++		return false;
++
++	mutex_lock(&qsee_rpmb_lock);
++	qsee_rpmb_handle(qsee_rpmb_va);
++	mutex_unlock(&qsee_rpmb_lock);
++	return true;
++}
++
++/* ---------------------------------------------------------------- */
++/* /dev/qsee_log                                                     */
++/* ---------------------------------------------------------------- */
++
++static ssize_t qsee_log_read(struct file *file, char __user *ubuf,
++			     size_t count, loff_t *ppos)
++{
++	if (!qsee_log_va || !qsee_log_len)
++		return 0;
++	return simple_read_from_buffer(ubuf, count, ppos, qsee_log_va,
++				       qsee_log_len);
++}
++
++static const struct file_operations qsee_log_fops = {
++	.owner	= THIS_MODULE,
++	.read	= qsee_log_read,
++	.llseek	= default_llseek,
++};
++
++static struct miscdevice qsee_log_misc = {
++	.minor	= MISC_DYNAMIC_MINOR,
++	.name	= "qsee_log",
++	.fops	= &qsee_log_fops,
++};
++
++static void qsee_log_setup(void)
++{
++	phys_addr_t pa;
++
++	if (log_bytes < 0x1000 || log_bytes > 0x20000 ||
++	    (log_bytes & (log_bytes - 1))) {
++		pr_warn("qsee log size %u rejected\n", log_bytes);
++		return;
++	}
++
++	/*
++	 * Allocate the log buffer from the dedicated tzmem pool so QTEE can
++	 * access it directly without an SHM bridge (the kernel is built with
++	 * CONFIG_QCOM_TZMEM_MODE_GENERIC).  Registration is best effort.
++	 */
++	qsee_log_va = qcom_tzmem_alloc(qsee_rpmb_pool, log_bytes, GFP_KERNEL);
++	if (!qsee_log_va) {
++		pr_warn("qsee log alloc %u failed\n", log_bytes);
++		return;
++	}
++	qsee_log_len = log_bytes;
++	memset(qsee_log_va, 0, qsee_log_len);
++	pa = qcom_tzmem_to_phys(qsee_log_va);
++
++	qsee_log_reg_ret = qcom_scm_qsee_log_register(pa, qsee_log_len);
++	pr_info("qsee log register pa=%pa sz=%zu ret=%d\n", &pa, qsee_log_len,
++		qsee_log_reg_ret);
++
++	if (misc_register(&qsee_log_misc)) {
++		pr_warn("qsee log misc register failed\n");
++		return;
++	}
++	qsee_log_misc_registered = true;
++}
++
++/* ---------------------------------------------------------------- */
++/* Listener registration                                             */
++/* ---------------------------------------------------------------- */
++
++static int qsee_rpmb_register(void)
++{
++	static const u32 cmds[] = { 1, 6 };
++	unsigned int ci, si;
++
++	for (si = 0; si < ARRAY_SIZE(qsee_rpmb_buf_sizes); si++) {
++		size_t len = qsee_rpmb_buf_sizes[si];
++		phys_addr_t pa;
++		void *buf;
++		int ret = -ENODEV;
++
++		buf = qcom_tzmem_alloc(qsee_rpmb_pool, len, GFP_KERNEL);
++		if (!buf) {
++			pr_warn("qsee rpmb alloc len=0x%zx failed\n", len);
++			break;
++		}
++		memset(buf, 0, len);
++		pa = qcom_tzmem_to_phys(buf);
++
++		for (ci = 0; ci < ARRAY_SIZE(cmds); ci++) {
++			ret = qcom_scm_qsee_listener_register(QSEE_RPMB_LISTENER_ID,
++							      pa, len, cmds[ci]);
++			if (!ret) {
++				qsee_rpmb_va = buf;
++				qsee_rpmb_len = len;
++				qsee_rpmb_registered = true;
++				pr_info("qsee rpmb listener id=0x%x ok len=0x%zx cmd=%u\n",
++					QSEE_RPMB_LISTENER_ID, len, cmds[ci]);
++				return 0;
++			}
++		}
++
++		pr_info("qsee rpmb len=0x%zx failed ret=%d\n", len, ret);
++		qcom_tzmem_free(buf);
++	}
++
++	pr_warn("qsee rpmb listener not registered\n");
++	return -ENODEV;
++}
++
++/* ---------------------------------------------------------------- */
++/* Init                                                              */
++/* ---------------------------------------------------------------- */
++
++static int __init qcom_qsee_rpmb_init(void)
++{
++	static const struct qcom_tzmem_pool_config cfg = {
++		.initial_size	= QSEE_RPMB_POOL_INIT,
++		.policy		= QCOM_TZMEM_POLICY_ON_DEMAND,
++		.increment	= QSEE_RPMB_POOL_GROW,
++		.max_size	= QSEE_RPMB_POOL_MAX,
++	};
++	int ret;
++
++	if (!qcom_scm_is_available()) {
++		pr_info("qsee rpmb: scm not available, skipping\n");
++		return 0;
++	}
++
++	qsee_rpmb_pool = qcom_tzmem_pool_new(&cfg);
++	if (IS_ERR(qsee_rpmb_pool)) {
++		ret = PTR_ERR(qsee_rpmb_pool);
++		qsee_rpmb_pool = NULL;
++		pr_err("qsee rpmb pool err=%d\n", ret);
++		return 0;
++	}
++
++	qsee_rpmb_scratch = kzalloc(RPMB_FRAME, GFP_KERNEL);
++	if (!qsee_rpmb_scratch) {
++		qcom_tzmem_pool_free(qsee_rpmb_pool);
++		qsee_rpmb_pool = NULL;
++		return 0;
++	}
++
++	ret = qsee_rpmb_register();
++	if (ret) {
++		kfree(qsee_rpmb_scratch);
++		qsee_rpmb_scratch = NULL;
++		qcom_tzmem_pool_free(qsee_rpmb_pool);
++		qsee_rpmb_pool = NULL;
++		return 0;
++	}
++
++	/* Hook the smcinvoke listener path only once we are ready to serve. */
++	qcom_scm_qtee_set_rpmb_handler(qsee_rpmb_serve);
++
++	/* Best effort: /dev/qsee_log. */
++	qsee_log_setup();
++
++	return 0;
++}
++late_initcall(qcom_qsee_rpmb_init);
++
++MODULE_DESCRIPTION("Qualcomm QSEE RPMB listener for QTEE smcinvoke");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/firmware/qcom/qcom_scm.c b/drivers/firmware/qcom/qcom_scm.c
+index 9fde28f19..dec2f3c96 100644
+--- a/drivers/firmware/qcom/qcom_scm.c
++++ b/drivers/firmware/qcom/qcom_scm.c
+@@ -2388,6 +2388,162 @@ static int qcom_scm_qseecom_init(struct qcom_scm *scm)
+ 
+ #endif /* CONFIG_QCOM_QSEECOM */
+ 
++/*
++ * Legacy QSEE listener support for the smcinvoke transport.
++ *
++ * While serving an smcinvoke call QTEE may block on a legacy QSEE
++ * listener (e.g. the RPMB listener 0x2000).  It then returns
++ * result[0] in {1, 2}, result[1] == 0xee02 and result[2] == listener id.
++ * The listener request is served by the handler registered with
++ * qcom_scm_qtee_set_rpmb_handler() and QTEE is resumed with the
++ * listener-response SMC.
++ */
++#define QCOM_SCM_QSEE_SVC_OS			0x01
++#define QCOM_SCM_QSEE_OS_REGISTER_LOG_BUF	0x06
++#define QCOM_SCM_QSEE_SVC_LISTENER		0x02
++#define QCOM_SCM_QSEE_LISTENER_RESPONSE		0x03
++#define QCOM_SCM_QSEE_MAX_LISTENER_ROUNDS	32
++
++static bool (*qcom_scm_qsee_listener_serve)(u32 lid);
++
++/**
++ * qcom_scm_qtee_set_rpmb_handler() - Set the legacy QSEE listener handler.
++ * @fn: called with the listener id when QTEE blocks on a listener; returns
++ *      true if the request was served.
++ */
++void qcom_scm_qtee_set_rpmb_handler(bool (*fn)(u32 lid))
++{
++	WRITE_ONCE(qcom_scm_qsee_listener_serve, fn);
++}
++EXPORT_SYMBOL_GPL(qcom_scm_qtee_set_rpmb_handler);
++
++/**
++ * qcom_scm_qsee_listener_register() - Register a legacy QSEE listener.
++ * @lid: listener id.
++ * @pa:  physical address of the shared listener buffer.
++ * @len: size of the listener buffer.
++ * @cmd: register command (1, or 6 for the smcinvoke variant).
++ *
++ * Return: 0 on success, the SCM error or -EIO if QSEE rejected it.
++ */
++int qcom_scm_qsee_listener_register(u32 lid, phys_addr_t pa, size_t len,
++				    u32 cmd)
++{
++	struct qcom_scm_desc desc = {
++		.owner = ARM_SMCCC_OWNER_TRUSTED_OS,
++		.svc = QCOM_SCM_QSEE_SVC_LISTENER,
++		.cmd = cmd,
++		.arginfo = QCOM_SCM_ARGS(3, QCOM_SCM_VAL, QCOM_SCM_RW,
++					 QCOM_SCM_VAL),
++		.args[0] = lid,
++		.args[1] = pa,
++		.args[2] = len,
++	};
++	struct qcom_scm_res res = {};
++	int ret;
++
++	if (!__scm)
++		return -ENODEV;
++
++	ret = qcom_scm_call(__scm->dev, &desc, &res);
++	dev_info(__scm->dev,
++		 "qsee listener 0x%x register cmd=%u len=0x%zx ret=%d res0=0x%llx\n",
++		 lid, cmd, len, ret, res.result[0]);
++	if (ret)
++		return ret;
++
++	return res.result[0] ? -EIO : 0;
++}
++EXPORT_SYMBOL_GPL(qcom_scm_qsee_listener_register);
++
++/**
++ * qcom_scm_qsee_log_register() - Register the QSEE log buffer.
++ * @pa:   physical address of the log buffer.
++ * @size: size of the log buffer.
++ *
++ * Return: 0 on success, the SCM error or -EIO if QSEE rejected it.
++ */
++int qcom_scm_qsee_log_register(phys_addr_t pa, size_t size)
++{
++	struct qcom_scm_desc desc = {
++		.owner = ARM_SMCCC_OWNER_TRUSTED_OS,
++		.svc = QCOM_SCM_QSEE_SVC_OS,
++		.cmd = QCOM_SCM_QSEE_OS_REGISTER_LOG_BUF,
++		.arginfo = QCOM_SCM_ARGS(2, QCOM_SCM_RW, QCOM_SCM_VAL),
++		.args[0] = pa,
++		.args[1] = size,
++	};
++	struct qcom_scm_res res = {};
++	int ret;
++
++	if (!__scm)
++		return -ENODEV;
++
++	ret = qcom_scm_call(__scm->dev, &desc, &res);
++	if (ret)
++		return ret;
++
++	return res.result[0] ? -EIO : 0;
++}
++EXPORT_SYMBOL_GPL(qcom_scm_qsee_log_register);
++
++static bool qcom_scm_qsee_blocked_on_listener(const struct qcom_scm_res *res)
++{
++	return (res->result[0] == QSEECOM_RESULT_INCOMPLETE ||
++		res->result[0] == QSEECOM_RESULT_BLOCKED_ON_LISTENER) &&
++	       res->result[1] == QSEECOM_SCM_RES_QSEOS_LISTENER_ID;
++}
++
++/*
++ * Serve legacy listener requests until QTEE returns something else.
++ * @res holds the result of the smcinvoke call on entry and the final
++ * result on return.
++ */
++static int qcom_scm_qtee_drain_listeners(struct qcom_scm_res *res)
++{
++	bool (*serve)(u32 lid);
++	unsigned int round;
++	int ret;
++
++	for (round = 0; round < QCOM_SCM_QSEE_MAX_LISTENER_ROUNDS; round++) {
++		struct qcom_scm_desc desc = {
++			.owner = ARM_SMCCC_OWNER_TRUSTED_OS,
++			.svc = QCOM_SCM_QSEE_SVC_LISTENER,
++			.cmd = QCOM_SCM_QSEE_LISTENER_RESPONSE,
++			.arginfo = QCOM_SCM_ARGS(2, QCOM_SCM_VAL, QCOM_SCM_VAL),
++		};
++		u32 lid;
++
++		if (!qcom_scm_qsee_blocked_on_listener(res))
++			return 0;
++
++		lid = res->result[2];
++		serve = READ_ONCE(qcom_scm_qsee_listener_serve);
++		if (!serve || !serve(lid))
++			dev_warn_ratelimited(__scm->dev,
++					     "qsee listener 0x%x not served\n",
++					     lid);
++
++		desc.args[0] = lid;
++		desc.args[1] = 0;
++		memset(res, 0, sizeof(*res));
++		ret = qcom_scm_call(__scm->dev, &desc, res);
++		if (ret) {
++			dev_err(__scm->dev,
++				"qsee listener 0x%x response failed: %d\n",
++				lid, ret);
++			return ret;
++		}
++	}
++
++	if (!qcom_scm_qsee_blocked_on_listener(res))
++		return 0;
++
++	dev_err(__scm->dev, "qsee listener drain stopped after %u rounds\n",
++		QCOM_SCM_QSEE_MAX_LISTENER_ROUNDS);
++	return -EBUSY;
++}
++
+ /**
+  * qcom_scm_qtee_invoke_smc() - Invoke a QTEE object.
+  * @inbuf: start address of memory area used for inbound buffer.
+@@ -2424,6 +2580,10 @@ int qcom_scm_qtee_invoke_smc(phys_addr_t inbuf, size_t inbuf_size,
+ 	if (ret)
+ 		return ret;
+ 
++	ret = qcom_scm_qtee_drain_listeners(&res);
++	if (ret)
++		return ret;
++
+ 	if (response_type)
+ 		*response_type = res.result[0];
+ 
+@@ -2463,6 +2623,10 @@ int qcom_scm_qtee_callback_response(phys_addr_t buf, size_t buf_size,
+ 	if (ret)
+ 		return ret;
+ 
++	ret = qcom_scm_qtee_drain_listeners(&res);
++	if (ret)
++		return ret;
++
+ 	if (response_type)
+ 		*response_type = res.result[0];
+ 
+diff --git a/include/linux/firmware/qcom/qcom_scm.h b/include/linux/firmware/qcom/qcom_scm.h
+index 5747bd191..52b9b8961 100644
+--- a/include/linux/firmware/qcom/qcom_scm.h
++++ b/include/linux/firmware/qcom/qcom_scm.h
+@@ -195,4 +195,9 @@ int qcom_scm_qtee_invoke_smc(phys_addr_t inbuf, size_t inbuf_size,
+ int qcom_scm_qtee_callback_response(phys_addr_t buf, size_t buf_size,
+ 				    u64 *result, u64 *response_type);
+ 
++void qcom_scm_qtee_set_rpmb_handler(bool (*fn)(u32 lid));
++int qcom_scm_qsee_listener_register(u32 lid, phys_addr_t pa, size_t len,
++				    u32 cmd);
++int qcom_scm_qsee_log_register(phys_addr_t pa, size_t size);
++
+ #endif
+-- 
+2.47.3
+

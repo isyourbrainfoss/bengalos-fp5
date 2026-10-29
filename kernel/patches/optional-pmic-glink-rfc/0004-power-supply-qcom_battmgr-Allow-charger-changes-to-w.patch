@@ -1,0 +1,70 @@
+From 62cfc4d986834dbb00fa5ce2f18885eef5fd9d40 Mon Sep 17 00:00:00 2001
+From: Vladyslav Tymoshchuk <tvlad744@gmail.com>
+Date: Thu, 22 Oct 2026 20:32:24 +0300
+Subject: [PATCH 4/4] power: supply: qcom_battmgr: Allow charger changes to
+ wake up the system
+
+The battery manager notifies about changes of the battery state, many
+of which arrive while the system is asleep, and about changes of the
+USB and wireless charger properties, a charger being plugged in or out
+for one. Only the latter can be worth a wakeup, to show the new
+charging state for example.
+
+Make the device wakeup capable, and set a wakeup filter that lets
+pmic_glink report only the charger notifications as wakeup events.
+Leave wakeup disabled, so that nothing changes by default: whether a
+charger change should wake up the system is up to user space, through
+power/wakeup.
+
+Signed-off-by: Vladyslav Tymoshchuk <tvlad744@gmail.com>
+---
+ drivers/power/supply/qcom_battmgr.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 91cf39b00..ba0658a2d 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -10,6 +10,7 @@
+ #include <linux/mutex.h>
+ #include <linux/nvmem-consumer.h>
+ #include <linux/of_device.h>
++#include <linux/pm_wakeup.h>
+ #include <linux/power_supply.h>
+ #include <linux/property.h>
+ #include <linux/soc/qcom/pdr.h>
+@@ -1569,6 +1570,20 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 	complete(&battmgr->ack);
+ }
+ 
++static bool qcom_battmgr_is_charger_notification(const void *data, size_t len, void *priv)
++{
++	const struct qcom_battmgr_message *msg = data;
++	unsigned int notification;
++
++	if (le32_to_cpu(msg->hdr.opcode) != BATTMGR_NOTIFICATION ||
++	    len != sizeof(msg->hdr) + sizeof(msg->notification))
++		return false;
++
++	notification = le32_to_cpu(msg->notification) & 0xff;
++
++	return notification == NOTIF_USB_PROPERTY || notification == NOTIF_WLS_PROPERTY;
++}
++
+ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ {
+ 	const struct pmic_glink_hdr *hdr = data;
+@@ -1723,6 +1738,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	if (IS_ERR(battmgr->client))
+ 		return PTR_ERR(battmgr->client);
+ 
++	device_set_wakeup_capable(dev, true);
++	pmic_glink_client_set_wakeup_filter(battmgr->client,
++					    qcom_battmgr_is_charger_notification);
++
+ 	pmic_glink_client_register(battmgr->client);
+ 
+ 	return 0;
+-- 
+2.47.3
+
