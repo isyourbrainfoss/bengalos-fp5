@@ -52,8 +52,8 @@ Legend:
 | IMS registered, grant-wake armed, mobile data left off | 1114.1 internal | 15 Nov 2026 | Read-only check 12:37 Europe/Oslo: registered, grant-wake re-arms, only the IMS PDN is up. No call was placed on 1114.1. |
 | Incoming and outgoing calls, including VoLTE | SD 1109.1 | 2 Nov 2026 (both ways); 8–10 Nov 2026 (incoming VoLTE, including from suspend) | Grant-wake and idle-rearm are installed and active on 1114.1, but call audio and a suspend/incoming-call test have not been repeated on this build. |
 | Fingerprint unlock on the Phosh lock screen | SD 1109.1 | 1 Nov 2026 | Templates and `fp5-qtee` / `fp5-fprintd` are present on 1114.1; lock-screen verify has not been re-tested on this build. |
-| Fingerprint in polkit / `run0` / app auth prompts | Pending | 15 Nov 2026 | [fp5-qtee PR #11](https://github.com/isyourbrainfoss/fp5-qtee/pull/11) is merged on the `bengalos` branch. The module is not yet in the published `fp5-qtee` feed asset, `/etc/pam.d/polkit-1` is not installed, and there has been no reboot to merge a new sysext. Untested. |
-| Microphone in apps (HiFi capture) | Pending | 15 Nov 2026 | Root cause: `ADC1 Switch` was off, so capture was digital zeros. A live `amixer` set fixed it. The two switches are now in `HiFi.conf` `Mic1` `EnableSequence` (backup under `/var/lib/fp5-backup/20261115-mic/`). Takes effect at the next reboot; a call test after that is still needed. |
+| Fingerprint in polkit / `run0` / app auth prompts | Pending | 15 Nov 2026 | [fp5-qtee PR #11](https://github.com/isyourbrainfoss/fp5-qtee/pull/11) is merged and shipped in the 0.26.1115.1 `fp5-qtee` sysext, which also carries `/usr/share/factory/etc/pam.d/polkit-1` (fingerprint first, 5 s timeout). Running on 1115.1 internal; a `pkexec true` test is still outstanding. |
+| Microphone in apps (HiFi capture) | 1115.1 internal (live fix) | 15 Nov 2026 | Works in the Grok Bot app after a live `amixer` fix. The UCM fix (one inline `Mic1` sequence, see Audio) is on disk and is first used at the next reboot. Call uplink after that reboot is still untested. |
 | Official Waydroid sysext + `fp5-waydroid-fix` (greeter stays up) | 1114.1 internal | 15 Nov 2026 | The official Waydroid sysext alone overlays incomplete GLib/GTK/mime caches and kills phoc/greetd. The fix sysext ships the correctly merged caches. |
 | Waydroid Bluetooth host bridge (Tesla phone-key pairing over BLE) | 1114.1 internal | 15 Nov 2026 | `waydroid-host-stack` branch `fp5-bengalos-fixes`, installed with `WHS_USER=fp5` and `WAYDROID_UID=60434`. |
 | Waydroid GPS (Android test providers, host GeoClue at accuracy level 8) | 1114.1 internal | 15 Nov 2026 | Android received fixes at roughly 1–3 m. Modem GNSS is not enabled; see the GeoClue TLS gap below. |
@@ -267,22 +267,24 @@ user session by `~/.config/environment.d/50-fp5-ucm.conf`
 (SD parity; unmask later only if a 1114 call test shows they are needed).
 
 On 15 Nov 2026, app capture (the Grok Bot microphone, and HiFi in general)
-was digital zeros because `ADC1 Switch` was off. A live mixer change fixed
-it immediately. The permanent UCM edit, already on disk, adds these two
-lines after `cset "name='TX_DEC0 Volume' 84"` in `HiFi.conf`
-`SectionDevice."Mic1"` `EnableSequence`:
+was digital zeros because `ADC1 Switch` was off.
 
-```
-cset "name='ADC1_MIXER Switch' 1"
-cset "name='ADC1 Switch' 1"
-```
+Root cause: `Mic1` in both `HiFi.conf` and `VoiceCall.conf` pulled in the
+wcd938x `AnalogMic1` and the tx-macro `SoundwireMic0` sequences with
+`Include`, and also had a local `EnableSequence`. alsa-lib merges these
+arrays by index, so only the last include survived. The effect was
+`TX_DEC0 Volume` 100 instead of 84, `ADC1 Switch` never set, and in
+`VoiceCall` the `dummystreamhack` and `fp5-call-mic` execs never ran.
+Adding two lines to the local sequence (the first try) changed nothing for
+the same reason.
 
-`CaptureMixerElem "ADC1"` is still present (it is also the mixer mute
-control). The change is backed up; it is loaded when the card profile is
-next applied (normally the next reboot). Do not reload the profile during
-a call. `VoiceCall.conf` shares the Mic1 include, so a call test after the
-reboot is worthwhile. Call audio on this official-style image has not been
-re-tested yet.
+The fix: both `Mic1` sections now have one inline `EnableSequence` and
+`DisableSequence`, with the same csets in order (wcd938x, then tx-macro,
+`TX_DEC0 Volume` 100, which is what has been in effect and works). In
+`VoiceCall` the two execs follow the csets. Both verbs parse with `alsaucm`.
+The backups are in `/var/lib/fp5-backup/20261115-mic/`. PipeWire reads UCM
+at start, so the change applies from the next reboot. Do not reload the
+profile during a call.
 
 ## Telephony and power
 
@@ -295,7 +297,7 @@ re-tested yet.
 - **`fp5-gsd-power-idle-rearm.service`**: `gsd-power` does not re-arm idle
   after an unattended resume; this unit does. Known leftover: it can fail
   in a greeter-only state.
-- Mobile data stays off. Do not change modem NV / PDC / MBN / RAT.
+- Mobile data is a user choice (currently off). Do not change modem NV / PDC / MBN / RAT.
 - SIM unlock after each boot stays manual; the PIN is not stored.
 
 ## Waydroid and Tesla helper
@@ -367,19 +369,46 @@ optional daily-driver glue, not part of the OS image.
   plus a userdata/metadata wipe, which destroys the internal install. Back
   up home first.
 
+## Deviations from official BengalOS (deliberate)
+
+These are local choices, not FP5 hardware fixes. They are listed so they can
+be reviewed or undone.
+
+- **Wi-Fi pauses mobile data (Android-like), 15 Nov 2026.** NetworkManager
+  keeps Wi-Fi and mobile data up at the same time. The home Wi-Fi is
+  IPv4-only, so all IPv6 traffic went over prepaid mobile data (about
+  20 NOK in a day on 2 Nov). Android instead uses one default network and
+  drops mobile data when Wi-Fi works. The NM dispatcher script
+  `/etc/NetworkManager/dispatcher.d/50-fp5-wifi-pauses-mobile-data` takes
+  any active `gsm` connection down when Wi-Fi connects. When Wi-Fi goes, it
+  brings back a connection it paused (or one with `autoconnect=yes`). IMS
+  (`imsd`) is not affected. It logs with the tag `fp5-wifi-mobile`. To undo,
+  delete the file. Limits: there is no captive-portal or "Wi-Fi without
+  internet" check as on Android. The flip with data on is not yet tested,
+  since mobile data is currently off.
+- **Waydroid is never frozen, 15 Nov 2026.** Setting
+  `persist.waydroid.suspend false` keeps Android running so the Tesla app
+  answers the phone key without opening Waydroid. With the screen off and
+  no suspend, measured over 4 minutes: about 257 mA frozen and 271 mA
+  running.
+- **Auto-suspend after 5 min on battery, never on AC, 15 Nov 2026**
+  (`gsd-power` `sleep-inactive-battery-type=suspend`, timeout 300 s). While
+  the phone is asleep, Bluetooth and Android stop, so wake the phone before
+  using the Tesla phone key.
+
 ## Open issues (short)
 
 1. GeoClue TLS trust store empty on the host (Wi-Fi/IP lookup fails).
 2. Runtime dm-verity for `/usr` not shown to be enforcing (1113.1).
 3. RTC stale until NTP.
-4. Fingerprint in polkit/run0: PR merged, not deployed, untested.
-5. Permanent mic UCM edit: on disk, pending reboot and a call test.
+4. Fingerprint in polkit/run0: shipped in 1115.1, `pkexec` test outstanding.
+5. Inline mic UCM fix (HiFi + VoiceCall): on disk, pending reboot and a call test.
 6. Voice calls, fingerprint lock-screen unlock, and incoming VoLTE from
    suspend: verified on SD 1109.1, not re-tested on 1114.1.
 7. SSC sensors: hexagonfs must be in the seed; user-facing re-test after
    the copy/reboot is still outstanding.
-8. Feed `fp5-qtee` payload is still the frozen pre-PR #11 image until it is
-   rebuilt and published.
+8. Feed check waits only 5 s after upload; the GitHub cache can give a false
+   error.
 9. systemd-boot 262 workarounds should go away after systemd ≥ 262.1.
 
 ## Sources
