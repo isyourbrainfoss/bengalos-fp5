@@ -374,18 +374,53 @@ optional daily-driver glue, not part of the OS image.
 These are local choices, not FP5 hardware fixes. They are listed so they can
 be reviewed or undone.
 
-- **Wi-Fi pauses mobile data (Android-like), 15 Nov 2026.** NetworkManager
-  keeps Wi-Fi and mobile data up at the same time. The home Wi-Fi is
-  IPv4-only, so all IPv6 traffic went over prepaid mobile data (about
-  20 NOK in a day on 2 Nov). Android instead uses one default network and
-  drops mobile data when Wi-Fi works. The NM dispatcher script
-  `/etc/NetworkManager/dispatcher.d/50-fp5-wifi-pauses-mobile-data` takes
-  any active `gsm` connection down when Wi-Fi connects. When Wi-Fi goes, it
-  brings back a connection it paused (or one with `autoconnect=yes`). IMS
-  (`imsd`) is not affected. It logs with the tag `fp5-wifi-mobile`. To undo,
-  delete the file. Limits: there is no captive-portal or "Wi-Fi without
-  internet" check as on Android. The flip with data on is not yet tested,
-  since mobile data is currently off.
+- **Wi-Fi preferred over mobile data (Android-like), 15 Nov 2026.**
+  NetworkManager keeps Wi-Fi and mobile data up at the same time. The home
+  Wi-Fi is IPv4-only, so all IPv6 traffic went over prepaid mobile data
+  (about 20 NOK in a day on 2 Nov). Android keeps mobile data connected but
+  sends traffic over Wi-Fi when Wi-Fi works. The first version (a dispatcher
+  that took the `gsm` connection down when Wi-Fi came up) was replaced the
+  same evening, because the mobile-data toggle looked as if it switched
+  itself off. The old script is kept in
+  `/var/lib/fp5-backup/20261115-wifi-mobile/`. The current setup:
+  - **Static config.** The `gsm` profiles have `ipv4.route-metric` and
+    `ipv6.route-metric` set to 2000 (Wi-Fi default is 600), and
+    `ipv4.dns-priority` and `ipv6.dns-priority` set to 200 (Wi-Fi default is
+    100). Wi-Fi therefore wins the default route, and with
+    systemd-resolved only Wi-Fi gets the `~.` DNS domain.
+    `/etc/NetworkManager/conf.d/50-fp5-wifi-preferred.conf`
+    (`match-device=type:gsm`) gives the same defaults to new `gsm` profiles.
+  - **IPv4-only Wi-Fi.** Metrics alone do not help when Wi-Fi has no IPv6
+    default route. While any Wi-Fi is connected,
+    `/etc/NetworkManager/dispatcher.d/50-fp5-wifi-preferred` sets
+    `ipv6.never-default=yes` at runtime on the active `gsm` device
+    (`nmcli device modify`, so the saved profile is unchanged). When Wi-Fi
+    goes it sets the value back to `no`. A new `gsm` activation starts from
+    the profile value (`no`) again. IPv6 then falls back to IPv4 over Wi-Fi
+    and never leaves over mobile data. The script logs with the tag
+    `fp5-wifi-mobile` and never brings connections up or down.
+  - IMS (`imsd`'s own mux and P-CSCF host route) is not affected.
+  - Undo: delete the dispatcher and the `conf.d` file, and restore the gsm
+    keyfiles from the backup directory (or reset the four properties).
+  - Limits: there is no captive-portal or "Wi-Fi without internet" check as
+    on Android, because any connected Wi-Fi counts as preferred. The live
+    flip with data on is untested. The dispatcher logic was dry-run tested
+    with a fake `nmcli`, but mobile data stays off until the
+    ModemManager crash below is fixed.
+- **`fp5-mic-kick` user service (workaround), 15 Nov 2026.** After a reboot
+  on 1115.1, `ADC1 Switch` was found off again even with the inline UCM fix,
+  so the microphone gave zeros. The cause is not known yet.
+  `~/.config/systemd/user/fp5-mic-kick.service` (enabled for `default.target`,
+  oneshot) runs `/var/lib/fp5-oot/bin/fp5-mic-kick` after PipeWire starts. The
+  script waits for the `HiFi__Mic1__source`, logs the switch state (tag
+  `fp5-mic-kick`), and if the switch is off it turns it on and suspends and
+  resumes the source once. To undo, disable the unit and delete both files.
+- **`dummystreamhack` copied to `/var/lib/fp5-oot/bin`, 15 Nov 2026.** The
+  `VoiceCall` UCM verb runs `dummystreamhack`, but on the internal install
+  the binary was missing: it had only been on the SD build. Without it there
+  was no call audio. It was copied to `/var/lib/fp5-oot/bin/dummystreamhack`
+  (root, 755). It is not in any sysext yet, so it should move into
+  `fp5-device` or `fp5-ims-app`.
 - **Waydroid is never frozen, 15 Nov 2026.** Setting
   `persist.waydroid.suspend false` keeps Android running so the Tesla app
   answers the phone key without opening Waydroid. With the screen off and
@@ -395,6 +430,36 @@ be reviewed or undone.
   (`gsd-power` `sleep-inactive-battery-type=suspend`, timeout 300 s). While
   the phone is asleep, Bluetooth and Android stop, so wake the phone before
   using the Tesla phone key.
+
+## Known issues
+
+- **ModemManager 1.25.95 segfaults when mobile data connects (15 Nov
+  2026).** On 1115.1 internal, `ModemManager` died with `SIGSEGV` twice when
+  mobile data was switched on: about 30–45 ms after
+  `[modem0/bearer1] net link qmapmux0.0 created (mux id 1)`. systemd
+  restarted it, and the modem was gone for about 30–40 s each time (and
+  `fp5-ims`, which is `BindsTo=ModemManager`, went down with it). Other
+  connects in the same boot succeeded, so the crash is intermittent. `imsd`
+  had **no** bearer at either crash, so this is not a mux collision with
+  IMS. The most likely cause is the use-after-free in `src/mm-netlink.c`
+  `transaction_complete()` (upstream issue
+  [ModemManager#1110](https://gitlab.freedesktop.org/mobile-broadband/ModemManager/-/work_items/1110),
+  fixed on main in commit `9317cbc4`, 4 Oct 2026). After the rmnet link is
+  created, MM brings it up with an `RTM_SETLINK` through `mm-netlink`, and
+  the completion callback is read from freed memory. Whether it crashes
+  depends on heap reuse. No Debian `modemmanager` build has the fix yet
+  (1.25.95-1 in experimental, 1.24.2-2 in unstable). There is no core dump,
+  because `core_pattern=core` and `systemd-coredump` is not in the image,
+  so this is not confirmed by a backtrace.
+  Fix: ship a patched `modemmanager` (cherry-pick `9317cbc4`) in BengalOS or
+  in an FP5 sysext. Until then, keep mobile data off or accept an occasional
+  30–40 s modem drop when data connects.
+- **IMS is blocked while any non-IMS bearer exists.** The `fp5-ims` guard
+  refuses to start while ModemManager lists any bearer
+  (`blocked-unowned-bearer`). An NM mobile-data bearer stays listed even
+  after it disconnects, so with mobile data in use VoLTE does not come up.
+  On a different SIM, IMS can also stop at the profile check
+  (`Existing profile2 is not verified IPv6`).
 
 ## Open issues (short)
 
@@ -410,6 +475,11 @@ be reviewed or undone.
 8. Feed check waits only 5 s after upload; the GitHub cache can give a false
    error.
 9. systemd-boot 262 workarounds should go away after systemd ≥ 262.1.
+10. ModemManager 1.25.95 segfault on data connect (upstream fix `9317cbc4`
+    not in Debian yet); mobile data and IMS cannot run together (see Known
+    issues).
+11. `ADC1 Switch` off after boot: root cause unknown, `fp5-mic-kick`
+    workaround in place.
 
 ## Sources
 
