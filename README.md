@@ -5,9 +5,13 @@ This is not affiliated with or endorsed by Fairphone or the BengalOS team.
 
 The repo holds the notes, patches, configs and scripts used for the bring-up: image build recipe changes, U-Boot setup, the flash runbook, udev rules, systemd units, sysext packaging and the fingerprint (QTEE) stack port. Large build artifacts (images, kernels, modules, sysext images) and proprietary firmware are **not** in the repo.
 
-## Status
+## Status / tested
 
-**Untested on hardware.** Nothing here has been flashed to or booted on a Fairphone 5 yet. The image, U-Boot and kernel builds only went through static checks and QEMU. Treat every step as a draft and keep a known-good way back (see `docs/flash-runbook.md`).
+The lab Fairphone 5 is daily-driving **BengalOS 0.26.1114.1** from internal UFS (nested GPT in `userdata`): official generic arm64 usr (`VARIANT_ID=sdm845`) plus an FP5 UKI, FP5 sysexts and a custom U-Boot. Updates use `systemd-sysupdate` against the rolling [`fp5-feed`](https://github.com/isyourbrainfoss/bengalos-fp5/releases/tag/fp5-feed) release (UKI + sysexts) and the official sdm845 usr feed.
+
+This remains an experimental, unofficial port. Treat flashing and partition writes as dangerous, and keep a known-good way back.
+
+What is FP5-specific, what must never be done (`qbootctl` especially), and a tested-status table (including items verified only on the earlier microSD 1109.1 build) are in **[`docs/FP5-CUSTOMIZATIONS.md`](docs/FP5-CUSTOMIZATIONS.md)**. The older SD/Nura-era draft runbook is still in `docs/flash-runbook.md`.
 
 ## ⚠️ Never run `qbootctl` on the Fairphone 5
 
@@ -18,7 +22,7 @@ See the [Fairphone 5 page on the Nura wiki](https://wiki.nura.eco/wiki/Fairphone
 
 | Path | Contents |
 |---|---|
-| `docs/` | `flash-runbook.md`, `prep-plan.md`, `public-prep.md`, `fingerprint-prep.md`, `nura-to-bengalos-migration.md` |
+| `docs/` | `FP5-CUSTOMIZATIONS.md` (current customizations and tested status), `flash-runbook.md`, `prep-plan.md`, `public-prep.md`, `fingerprint-prep.md`, `nura-to-bengalos-migration.md` |
 | `kernel/config/` | FP5 config fragment (`fp5-bengalos.config`), fragment check, the resulting full `.config`, config diff Debian 7.2.8 vs. the running Nura 7.2.9 kernel |
 | `kernel/patches/` | Kernel patches for Debian `linux-sc7280` 7.2.8: QTEE 0001/0002, PR #40 (snps-femto-v2 charger-detect), draft NFC node, FocalTech fingerprint driver + DT node, FocalTech wake patch |
 | `kernel/patches/optional-pmic-glink-rfc/` | Upstream pmic-glink sleep/wake RFC series (optional experiment) |
