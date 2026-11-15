@@ -1,5 +1,7 @@
 > **qbootctl: never, not even `-m`.** The Nura FP5 wiki says it does not work and WILL BRICK the device when it switches slots, and recovery needs EDL at a Fairphone repair centre ([Nura wiki FP5](https://wiki.nura.eco/wiki/Fairphone_5_(fairphone-fp5)), [qbootctl#4](https://github.com/linux-msm/qbootctl/issues/4)). Switch slots with fastboot only: `fastboot --set-active=b` + `fastboot getvar current-slot`.
 
+> **Current status (15 Nov 2026):** BengalOS now runs from internal storage on the lab FP5. This runbook is the earlier microSD / Nura-era draft and is no longer the description of the live install. See [`FP5-CUSTOMIZATIONS.md`](FP5-CUSTOMIZATIONS.md) for the current layout, customizations and tested-status table.
+
 # Fairphone 5: BengalOS test, flash and revert runbook (NOT EXECUTED)
 
 > ## ⚠️ READ THIS FIRST ⚠️
