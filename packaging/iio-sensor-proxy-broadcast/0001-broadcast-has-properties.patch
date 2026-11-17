@@ -1,0 +1,71 @@
+From 7e3017b9c0011850225ca86e30685b4379fb7194 Mon Sep 17 00:00:00 2001
+From: isyourbrainfoss <x@x>
+Date: Tue, 17 Nov 2026 22:17:54 +0100
+Subject: [PATCH] Broadcast Has* properties to all clients when sensors appear
+
+---
+ src/iio-sensor-proxy.c | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/src/iio-sensor-proxy.c b/src/iio-sensor-proxy.c
+index 9c7e8cd..1286341 100644
+--- a/src/iio-sensor-proxy.c
++++ b/src/iio-sensor-proxy.c
+@@ -373,10 +373,46 @@ send_dbus_event (SensorData     *data,
+ 	g_hash_table_destroy (ht);
+ }
+ 
++/* FP5/BengalOS: PropertiesChanged above is unicast to clients that claimed a sensor.
++ * Clients that only read the Has* properties (phosh's ambient/brightness, proximity
++ * and rotation helpers before they claim) GetAll right when the name appears - which
++ * is before the (slow, SSC) sensor probe finished - and then never learn that
++ * HasAmbientLight/HasProximity/HasAccelerometer became true. Broadcast the Has*
++ * properties to everyone whenever they may have changed. */
++static void
++broadcast_has_properties (SensorData *data)
++{
++	GVariantBuilder props_builder;
++
++	if (data->connection == NULL)
++		return;
++
++	g_variant_builder_init (&props_builder, G_VARIANT_TYPE ("a{sv}"));
++	g_variant_builder_add (&props_builder, "{sv}", "HasAccelerometer",
++			       g_variant_new_boolean (driver_type_exists (data, DRIVER_TYPE_ACCEL)));
++	g_variant_builder_add (&props_builder, "{sv}", "HasAmbientLight",
++			       g_variant_new_boolean (driver_type_exists (data, DRIVER_TYPE_LIGHT)));
++	g_variant_builder_add (&props_builder, "{sv}", "HasProximity",
++			       g_variant_new_boolean (driver_type_exists (data, DRIVER_TYPE_PROXIMITY)));
++
++	g_dbus_connection_emit_signal (data->connection,
++				       NULL,
++				       SENSOR_PROXY_DBUS_PATH,
++				       "org.freedesktop.DBus.Properties",
++				       "PropertiesChanged",
++				       g_variant_new ("(s@a{sv}@as)", SENSOR_PROXY_IFACE_NAME,
++						      g_variant_builder_end (&props_builder),
++						      g_variant_new_strv (NULL, 0)),
++				       NULL);
++}
++
+ static void
+ send_driver_changed_dbus_event (SensorData   *data,
+ 				DriverType    driver_type)
+ {
++	if (driver_type != DRIVER_TYPE_COMPASS)
++		broadcast_has_properties (data);
++
+ 	if (driver_type == DRIVER_TYPE_ACCEL)
+ 		send_dbus_event (data, PROP_HAS_ACCELEROMETER);
+ 	else if (driver_type == DRIVER_TYPE_LIGHT)
+@@ -786,6 +822,7 @@ name_acquired_handler (GDBusConnection *connection,
+ 
+ 	send_dbus_event (data, PROP_ALL);
+ 	send_dbus_event (data, PROP_ALL_COMPASS);
++	broadcast_has_properties (data);
+ 	return;
+ 
+ bail:
+-- 
+2.47.3
+
