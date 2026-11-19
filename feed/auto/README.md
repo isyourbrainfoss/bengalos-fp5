@@ -32,3 +32,25 @@ Waydroid (2026-11-15): every run also builds `fp5-waydroid-fix_<V>` (see `../way
 sysext downloaded + sha256-checked, caches regenerated from base usr + waydroid in `fp5-waydroid-fix-tools:20261115`,
 effective schema set must contain every base schema incl. mobi.phosh.phoc; any failure = CHECK_FAILED. Published as a
 6th asset for versions > 0.26.1114.1. A change to the official waydroid.transfer/feature also stops the run.
+
+Carry (2026-11-19): every run also builds `fp5-modemmanager_<V>` (MM#1110 daemon) and `fp5-frunk-qs_<V>` (Frunk tile)
+from `../sysext/carry/` (pinned, see PROVENANCE.md). These two used to be re-pinned by hand on the phone for every
+version. Fail closed, so the version is not published, if:
+- the inputs' sha256 do not match;
+- official modemmanager is not 1.25.95-1 (check for 9317cbc4 and drop the sysext);
+- official phosh is not 0.59.0 (rebuild the plugin);
+- a carry raw is missing;
+- fsck, extension-release or xz==raw fails;
+- the payload differs from the previous version's carry build;
+- any undefined symbol does not resolve against the new /usr (`lib/symcheck.py`).
+
+They are also covered by the ELF, python, unit and secret checks. They are published from `CARRY_FROM` (0.26.1119.1).
+The phone needs `../sysupdate.d/35-fp5-modemmanager.transfer` and `36-fp5-frunk-qs.transfer` in /etc/sysupdate.d.
+Install those only once the feed offers both for the candidate version.
+
+Review checkout: `FP5_FEED_O=<live official-20261114> FP5_FEED_LOGD=<scratch> bash feed/auto/fp5-feed-auto.sh --dry-run ...`.
+This uses this checkout's script, lib, build-sysexts.sh and carry, and the live uki/, sysext/src+out, baseline and waydroid.
+The lab identifiers for the secret audit live in the untracked `auto/lab-patterns.local` (name<TAB>regex).
+
+Post-upload index compare: 6 tries with backoff (5..160 s, about 5 min), cache-busted, instead of a single `sleep 5`.
+This failed with ERROR on 15, 17, 18 and 19 Nov.
