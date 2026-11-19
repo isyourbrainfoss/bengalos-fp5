@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""fp5-call-audio-snap — one redacted journal line per call phase (READ-ONLY).
+
+Usage: fp5-call-audio-snap PHASE [--mode=M]   -> logger -t fp5-call-audio
+       fp5-call-audio-snap --state            -> prints "<VoLTE|CS> <in|out|?> <state>" or "none - -"
+Env:   FP5_CALL_AUDIO_PRINT=1 prints the line instead of logging it.
+
+Reads only: pactl (get/list), amixer contents, /proc/asound pcm7 status,
+ModemManager call State/Direction, oFono (imsd) call State, gnome-calls Inbound.
+Never prints numbers, URIs, IPs or MACs (redacted again before output).
+Approved by Kristian 2026-11-19 (t777s3033).
+"""
+import json, os, re, subprocess, sys, time
+
+TAG = "fp5-call-audio"
+CARD = "F5"
+MIX_RE = re.compile(os.environ.get(
+    "FP5_CALL_AUDIO_MIX_RE",
+    r"^(ADC[1-4] Switch|ADC[1-4]_MIXER Switch|ADC[1-4] MUX|.*AMIC[0-9]? .*|TX DEC[0-3] MUX|TX SMIC MUX[0-3]"
+    r"|TX_AIF1_CAP Mixer DEC[0-3]|TX[0-3] MODE|.*VoiceMMode1.*|.*VOICEMMODE1.*|MultiMedia[0-9]+ Mixer .*VOICE.*)$"))
+MM = "org.freedesktop.ModemManager1"
+MM_STATE = {0: "unknown", 1: "dialing", 2: "ringing-out", 3: "ringing-in", 4: "active",
+            5: "held", 6: "waiting", 7: "terminated"}
+DIR_CACHE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "fp5-call-audio.dir")
+
+
+def run(cmd, timeout=3):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def redact(s):
+    s = re.sub(r"(sips?|tel):\S+", "<uri>", s)
+    s = re.sub(r"\+?\d{7,15}", "<num>", s)
+    s = re.sub(r"\b(\d{1,3}\.){3}\d{1,3}\b", "<ip>", s)
+    s = re.sub(r"\b[0-9a-fA-F]{1,4}(:[0-9a-fA-F]{0,4}){3,}\b", "<ip6>", s)
+    s = re.sub(r"([0-9A-Fa-f]{2}[:_-]){5}[0-9A-Fa-f]{2}", "<mac>", s)
+    s = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z.]+", "<id>", s)
+    return s
+
+
+def bus_json(args, user=False):
+    out = run(["busctl", "--user" if user else "--system", "--json=short"] + args)
+    try:
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def mm_prop(path, iface, prop):
+    j = bus_json(["get-property", MM, path, iface, prop])
+    return j.get("data") if isinstance(j, dict) else None
+
+
+def mm_calls():
+    res = []
+    for m in range(4):
+        calls = mm_prop(f"/org/freedesktop/ModemManager1/Modem/{m}", MM + ".Modem.Voice", "Calls")
+        if calls is None:
+            continue
+        for c in calls:
+            st = mm_prop(c, MM + ".Call", "State")
+            d = mm_prop(c, MM + ".Call", "Direction")
+            res.append(["CS", {1: "in", 2: "out"}.get(d, "?"), MM_STATE.get(st, str(st))])
+    return res
+
+
+def ims_calls():
+    j = bus_json(["call", "org.ofono", "/imsd", "org.ofono.VoiceCallManager", "GetCalls"])
+    res = []
+    try:
+        for _path, props in j["data"][0]:
+            st = (props.get("State") or {}).get("data", "?")   # only State is read
+            d = {"incoming": "in", "waiting": "in", "dialing": "out", "alerting": "out"}.get(st, "?")
+            res.append(["VoLTE", d, st])
+    except Exception:
+        pass
+    return res
+
+
+def gnome_inbound():
+    """Inbound flag of gnome-calls' exported calls (session bus); None if unknown."""
+    j = bus_json(["call", "org.gnome.Calls", "/org/gnome/Calls",
+                  "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"], user=True)
+    try:
+        for _path, ifaces in j["data"][0].items():
+            for _iface, props in ifaces.items():
+                if "Inbound" in props:
+                    return bool(props["Inbound"]["data"])
+    except Exception:
+        pass
+    return None
+
+
+def call_state():
+    calls = [c for c in mm_calls() + ims_calls() if c[2] not in ("terminated", "disconnected")]
+    if not calls:
+        return ["none", "-", "-"]
+    c = calls[0]
+    if c[1] == "?":
+        inb = gnome_inbound()
+        if inb is not None:
+            c[1] = "in" if inb else "out"
+    try:
+        if c[1] == "?":
+            c[1] = open(DIR_CACHE).read().strip() or "?"
+        else:
+            with open(DIR_CACHE, "w") as f:
+                f.write(c[1])
+    except Exception:
+        pass
+    return c
+
+
+def pa_sources():
+    m = {}
+    for line in run(["pactl", "list", "short", "sources"]).splitlines():
+        p = line.split("\t")
+        if len(p) >= 2:
+            m[p[0]] = p[1]
+    return m
+
+
+def vol(kind, name):
+    out = run(["pactl", f"get-{kind}-volume", name])
+    m = re.search(r"(\d+)%", out)
+    return (m.group(1) + "%") if m else "?"
+
+
+def mute(kind, name):
+    out = run(["pactl", f"get-{kind}-mute", name])
+    m = re.search(r"Mute:\s*(\w+)", out)
+    return m.group(1) if m else "?"
+
+
+def rec_streams(srcmap):
+    """Sources of the parecord streams (fp5-call-mic)."""
+    recs, cur = [], None
+    for line in run(["pactl", "list", "source-outputs"]).splitlines() + ["Source Output #end"]:
+        if line.startswith("Source Output #"):
+            if cur and cur.get("bin") == "parecord":
+                recs.append(srcmap.get(cur.get("src", ""), cur.get("src", "?")))
+            cur = {}
+            continue
+        s = line.strip()
+        if cur is None:
+            continue
+        if s.startswith("Source: "):
+            cur["src"] = s.split()[1]
+        elif s.startswith("application.process.binary = "):
+            cur["bin"] = s.split("=", 1)[1].strip().strip('"')
+    return recs
+
+
+def card_profile():
+    name, prof = None, "?"
+    for line in run(["pactl", "list", "cards"]).splitlines():
+        s = line.strip()
+        if s.startswith("Name: "):
+            name = s[6:]
+        elif s.startswith("Active Profile: ") and name and "platform-sound" in name:
+            prof = s[len("Active Profile: "):]
+    return prof
+
+
+def mixer():
+    out, vals, name = run(["amixer", "-c", CARD, "contents"]), [], None
+    for line in out.splitlines():
+        m = re.search(r"name='([^']*)'", line)
+        if m:
+            name = m.group(1)
+            continue
+        m = re.match(r"\s*: values=(.*)", line)
+        if m and name and MIX_RE.match(name):
+            vals.append(f"{name}={m.group(1)}")
+            name = None
+    return vals[:30]
+
+
+def pcm_status(sub):
+    path = f"/proc/asound/{CARD}/{sub}/sub0/status"
+
+    def read():
+        try:
+            t = open(path).read()
+        except Exception:
+            return None, None
+        st = re.search(r"state:\s*(\w+)", t)
+        hp = re.search(r"hw_ptr\s*:\s*(\d+)", t)
+        return (st.group(1) if st else "closed"), (int(hp.group(1)) if hp else None)
+
+    s1, h1 = read()
+    if s1 is None:
+        return "n/a"
+    if s1 != "RUNNING":
+        return s1
+    time.sleep(0.3)
+    _s2, h2 = read()
+    return "RUNNING+" if (h1 is not None and h2 is not None and h2 != h1) else "RUNNING(stalled)"
+
+
+def main():
+    args = sys.argv[1:]
+    if "--state" in args:
+        print(" ".join(call_state()))
+        return
+    phase = next((a for a in args if not a.startswith("--")), "manual")
+    mode = next((a.split("=", 1)[1] for a in args if a.startswith("--mode=")), "-")
+    c = call_state()
+    srcmap = pa_sources()
+    dsrc = run(["pactl", "get-default-source"]).strip() or "?"
+    dsink = run(["pactl", "get-default-sink"]).strip() or "?"
+    recs = rec_streams(srcmap)
+    fields = [
+        f"phase={phase}", f"mic_mode={mode}",
+        f"call={c[0]}/{c[1]}/{c[2]}",
+        f"profile='{card_profile()}'",
+        f"rec={','.join(recs) if recs else 'none'}",
+        f"src={dsrc} src_mute={mute('source', dsrc)} src_vol={vol('source', dsrc)}",
+        f"sink={dsink} sink_mute={mute('sink', dsink)} sink_vol={vol('sink', dsink)}",
+        f"pcm7p={pcm_status('pcm7p')} pcm7c={pcm_status('pcm7c')}",
+        "mix=[" + "; ".join(mixer()) + "]",
+    ]
+    line = redact(" ".join(fields))
+    if os.environ.get("FP5_CALL_AUDIO_PRINT") == "1":
+        print(f"{TAG}: {line}")
+    else:
+        run(["logger", "-t", TAG, "--", line])
+
+
+if __name__ == "__main__":
+    main()

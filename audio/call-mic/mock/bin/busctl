@@ -1,0 +1,8 @@
+#!/bin/sh
+M=$MOCK; el=$(echo "$(date +%s.%N) - $(cat $M/t0)" | bc)
+case "$*" in
+ *Modem/0*Calls*) echo '{"type":"ao","data":["/org/freedesktop/ModemManager1/Call/0"]}';;
+ *Call/0*State*) if [ $(echo "$el >= $(cat $M/active_at)" | bc) = 1 ]; then echo '{"type":"i","data":4}'; else echo '{"type":"i","data":1}'; fi;;
+ *Call/0*Direction*) echo '{"type":"i","data":2}';;
+ *) exit 1;;
+esac

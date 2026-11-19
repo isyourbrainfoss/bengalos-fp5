@@ -1,0 +1,18 @@
+#!/bin/sh
+M=$MOCK; now=$(date +%s.%N); start=$(cat $M/t0)
+el=$(echo "$now - $start" | bc)
+voice_ok() { [ -f $M/appear_at ] && [ $(echo "$el >= $(cat $M/appear_at)" | bc) = 1 ]; }
+case "$*" in
+ "list short sources") printf '50\talsa_input.platform-sound.HiFi__Mic1__source\tPipeWire\ts16le\tSUSPENDED\n'
+     voice_ok && printf '51\talsa_input.platform-sound.Voice_Call__Mic1__source\tPipeWire\ts16le\tRUNNING\n'
+     printf '52\tbluez_input.AA_BB_CC_DD_EE_FF.0\tPipeWire\ts16le\tSUSPENDED\n';;
+ "list source-outputs") [ -f $M/rec.pid ] || exit 0; idx=50
+     grep -q Voice_Call $M/rec.dev && idx=51; [ -f $M/wrong ] && [ "$(cat $M/rec.pid)" = "$(cat $M/first.pid)" ] && idx=52
+     printf 'Source Output #7\n\tDriver: PipeWire\n\tSource: %s\n\tProperties:\n\t\tapplication.process.id = "%s"\n\t\tapplication.process.binary = "parecord"\n\n' $idx $(cat $M/rec.pid);;
+ set-source-mute*) echo "MUTE $*" >> $M/actions;;
+ get-default-source) echo alsa_input.platform-sound.Voice_Call__Mic1__source;;
+ get-default-sink) echo alsa_output.platform-sound.Voice_Call__Earpiece__sink;;
+ get-source-mute*|get-sink-mute*) echo "Mute: no";;
+ get-source-volume*|get-sink-volume*) echo "Volume: front-left: 65536 /  100% / 0.00 dB";;
+ "list cards") printf 'Card #1\n\tName: alsa_card.platform-sound\n\tActive Profile: Voice Call\n';;
+esac

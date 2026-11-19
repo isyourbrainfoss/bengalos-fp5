@@ -1,0 +1,2 @@
+#!/bin/sh
+shift; t=$1; shift; [ "$1" = "--" ] && shift; echo "[$t] $*" >> $MOCK/log

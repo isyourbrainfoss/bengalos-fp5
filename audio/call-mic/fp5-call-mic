@@ -1,0 +1,132 @@
+#!/bin/sh
+# fp5-call-mic v2 — FP5 call uplink keeper (2026-11-19, approved by Kristian t777s3033).
+#
+# The voice TX path is only powered while a mic capture stream is open, so a
+# parecord to /dev/null is held open for the whole call. v1 opened
+# @DEFAULT_SOURCE@ after a fixed 1 s sleep, racing the UCM HiFi -> Voice Call
+# switch (suspected cause of "the other side can't hear me").
+#
+# v2:
+#  1. wait up to ~5 s for the Voice Call mic source, record from it BY NAME and
+#     unmute it; fall back to v1 behaviour (@DEFAULT_SOURCE@) if it never shows;
+#  2. ADC1 re-assert exactly as the 2026-11-16 ExecStartPost (approved t667s2594);
+#  3. when the call becomes active, check the stream is still on the right
+#     source (and alive); restart the recording if not;
+#  4. per-call snapshots via fp5-call-audio-snap (tag fp5-call-audio):
+#     start, +3 s, answer+3 s.
+# Logs (tag fp5-call-mic) contain only source names, never numbers or URIs.
+# Dry run (no parecord, no mute/mixer writes, prints instead of logging):
+#   FP5_CALL_MIC_DRYRUN=1 fp5-call-mic
+set -u
+TAG=fp5-call-mic
+SNAP=${FP5_CALL_AUDIO_SNAP:-/var/lib/fp5-oot/bin/fp5-call-audio-snap}
+DRY=${FP5_CALL_MIC_DRYRUN:-0}
+WAIT_STEPS=${FP5_CALL_MIC_WAIT_STEPS:-25}          # x 0.2 s = 5 s
+ANSWER_TIMEOUT=${FP5_CALL_MIC_ANSWER_TIMEOUT:-180}  # s to wait for "active"
+NOCALL_GIVEUP=${FP5_CALL_MIC_NOCALL_GIVEUP:-15}     # s with no call visible
+SRC_RE=${FP5_CALL_MIC_SRC_RE:-'(Voice_?Call|VoiceCall|Voice-Call).*Mic'}
+
+red() { printf '%s' "$1" | sed -E 's/([0-9A-Fa-f]{2}[:_-]){5}[0-9A-Fa-f]{2}/<mac>/g; s/\+?[0-9]{7,15}/<num>/g'; }
+log() { if [ "$DRY" = 1 ]; then echo "$TAG: $*"; else logger -t "$TAG" -- "$*"; fi; }
+snap() { if [ -x "$SNAP" ]; then FP5_CALL_AUDIO_PRINT="$DRY" "$SNAP" "$@" ${MODE:+--mode="$MODE"}; fi; }
+
+find_src() {
+    pactl list short sources 2>/dev/null | awk '{print $2}' \
+        | grep -E -- "$SRC_RE" | grep -v '\.monitor$' | head -n1
+}
+
+# name of the source the stream of process $1 is attached to (empty if none)
+rec_src() {
+    idx=$(pactl list source-outputs 2>/dev/null | awk -v pid="$1" '
+        /^Source Output #/ { if (mine && src != "") { print src; done = 1; exit } src = ""; mine = 0 }
+        /^[ \t]*Source: /  { src = $2 }
+        /application\.process\.id = / { v = $3; gsub(/"/, "", v); if (v == pid) mine = 1 }
+        END { if (!done && mine && src != "") print src }')
+    [ -n "$idx" ] || return 0
+    pactl list short sources 2>/dev/null | awk -v i="$idx" '$1 == i { print $2 }'
+}
+
+start_rec() {
+    dev=$1
+    if [ "$DRY" = 1 ]; then
+        log "dry: would unmute + parecord --device=$(red "$dev")"
+        sleep 100000 & PID=$!
+        return
+    fi
+    if [ "$dev" != "@DEFAULT_SOURCE@" ]; then
+        pactl set-source-mute "$dev" 0 2>/dev/null || log "unmute failed source=$(red "$dev")"
+    fi
+    parecord --device="$dev" --raw /dev/null &
+    PID=$!
+}
+
+# identical to the 2026-11-16 ExecStartPost (t667s2594)
+adc1_kick() {
+    if [ "$DRY" = 1 ]; then log "dry: would ADC1 kick (0.5 s on, 2.5 s check)"; sleep 2.5; return; fi
+    sleep 0.5
+    amixer -q -c F5 cset name='ADC1 Switch' on
+    logger -t "$TAG" ADC1-on-0.5s
+    sleep 2
+    st=$(amixer -c F5 cget name='ADC1 Switch' | sed -n 's/.*: values=//p' | tail -1)
+    logger -t "$TAG" "ADC1-at-2.5s=$st"
+    [ "$st" = on ] || amixer -q -c F5 cset name='ADC1 Switch' on
+}
+
+# 1. wait for the Voice Call mic
+i=0
+SRC=$(find_src)
+while [ -z "$SRC" ] && [ "$i" -lt "$WAIT_STEPS" ]; do
+    sleep 0.2; i=$((i + 1)); SRC=$(find_src)
+done
+if [ -n "$SRC" ]; then MODE=named; DEV=$SRC; else MODE=fallback; DEV=@DEFAULT_SOURCE@; fi
+start_rec "$DEV"
+log "mode=$MODE source=$(red "$DEV") waited_ms=$((i * 200))"
+snap start &
+
+# 2. ADC1 (2.5 s), then the +3 s snapshot
+adc1_kick
+sleep 0.5
+snap plus3 &
+
+# 3. wait for the call to be answered, then verify the stream
+ans=0; t=0; none=0
+while [ "$t" -lt "$ANSWER_TIMEOUT" ]; do
+    kill -0 "$PID" 2>/dev/null || break
+    st=$(snap --state 2>/dev/null)
+    case "$st" in
+        *" active") ans=1; break ;;
+        none*) none=$((none + 1)); [ "$none" -ge "$NOCALL_GIVEUP" ] && break ;;
+        *) none=0 ;;
+    esac
+    sleep 1; t=$((t + 1))
+done
+if [ "$ans" = 1 ]; then
+    sleep 1
+    want=$(find_src)
+    reason=""
+    if ! kill -0 "$PID" 2>/dev/null; then
+        reason=dead; have=none
+    else
+        have=$(rec_src "$PID"); [ -n "$have" ] || have=none
+        if [ -n "$want" ] && [ "$have" != "$want" ]; then reason=wrong-source; fi
+        [ "$DRY" = 1 ] && [ "$have" = none ] && reason=""   # dry run has no stream
+    fi
+    if [ -n "$reason" ]; then
+        kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null
+        if [ -n "$want" ]; then MODE=named-rewired; DEV=$want; else MODE=fallback-rewired; DEV=@DEFAULT_SOURCE@; fi
+        start_rec "$DEV"
+        log "answer-check: $reason have=$(red "$have") -> restarted on $(red "$DEV")"
+        adc1_kick &
+    else
+        log "answer-check: ok source=$(red "$have")"
+    fi
+    ( sleep 2; snap answer3 ) &
+elif [ "$t" -ge "$ANSWER_TIMEOUT" ]; then
+    log "answer-check: not answered within ${ANSWER_TIMEOUT}s"
+else
+    log "answer-check: skipped (no call visible or stream ended)"
+fi
+
+# 4. keep the service alive as long as the recording runs
+wait "$PID"
+exit $?
