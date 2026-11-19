@@ -4,7 +4,7 @@ Keeps the FP5 sysupdate feed (GitHub release `fp5-feed` in isyourbrainfoss/benga
 BengalOS (`https://bengalos.phosh.mobi/images/roaming/arm64/sdm845/`), built exactly like 0.26.1114.1 on 2026-11-15
 (the 1114.1 rebuild by this script is byte-identical to the published assets).
 
-    bash ~/repos/grok_build/fp5/internal-install/official-20261114/auto/fp5-feed-auto.sh            # daily run
+    bash <desk>/official-20261114/auto/fp5-feed-auto.sh            # daily run
     bash .../auto/fp5-feed-auto.sh --dry-run                                                         # build + checks, no upload
     bash .../auto/fp5-feed-auto.sh --dry-run --version 0.26.1114.1 --force                           # rebuild a published version
 
