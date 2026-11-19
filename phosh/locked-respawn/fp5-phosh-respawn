@@ -1,0 +1,42 @@
+#!/bin/sh
+# fp5-phosh-respawn — ExecStart wrapper for mobi.phosh.Shell.service (FP5, Grok Bot 2026-11-19)
+#
+# Upstream ExecStart is "/usr/libexec/phosh" with no arguments. Phosh started with
+# GDMSESSION=phosh comes up UNLOCKED, so an automatic restart after a crash
+# (RestartMode=direct drop-in) would bypass the lock screen. This wrapper:
+#   * first phosh start in a login session  -> exec /usr/libexec/phosh "$@"   (unchanged)
+#   * every later start in the same session -> exec /usr/libexec/phosh --locked "$@"
+# Session key: $XDG_SESSION_ID, else logind's "Display" session of this user.
+# Fail-safe: no/odd session id, no runtime dir, or marker not creatable -> --locked.
+# State: $XDG_RUNTIME_DIR/fp5-phosh-respawn/started-<session> (tmpfs, per boot).
+# Test hooks: FP5_PHOSH_BIN (binary), FP5_PHOSH_RESPAWN_DIR (state dir).
+# Rollback: ~/.local/state/fp5-phosh-respawn/rollback.sh
+
+PHOSH_BIN=${FP5_PHOSH_BIN:-/usr/libexec/phosh}
+log() { echo "fp5-phosh-respawn: $*" >&2; }
+
+sid=${XDG_SESSION_ID:-}
+if [ -z "$sid" ]; then
+	sid=$(loginctl show-user "$(id -u)" -p Display --value 2>/dev/null) || sid=
+fi
+
+locked=1
+case "$sid" in
+	''|*[!A-Za-z0-9]*)
+		log "no usable session id ('$sid'), starting --locked (fail-safe)" ;;
+	*)
+		dir=${FP5_PHOSH_RESPAWN_DIR:-${XDG_RUNTIME_DIR:-}/fp5-phosh-respawn}
+		if [ -n "${FP5_PHOSH_RESPAWN_DIR:-}${XDG_RUNTIME_DIR:-}" ] &&
+		   mkdir -p -m 0700 "$dir" 2>/dev/null &&
+		   ( set -C; : > "$dir/started-$sid" ) 2>/dev/null; then
+			locked=0
+			log "session $sid: first phosh start, upstream behaviour"
+		else
+			log "session $sid: restart (or marker not writable), starting --locked"
+		fi ;;
+esac
+
+if [ "$locked" = 1 ]; then
+	exec "$PHOSH_BIN" --locked "$@"
+fi
+exec "$PHOSH_BIN" "$@"
