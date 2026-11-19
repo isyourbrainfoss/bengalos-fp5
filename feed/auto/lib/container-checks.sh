@@ -1,14 +1,16 @@
 #!/bin/bash
-# Runs INSIDE fp5-official-tools (offline, --network none). Mounts: /work (rw, per-version scratch), /o (ro, official-20261114).
+# Runs INSIDE fp5-official-tools (offline, --network none). Mounts: /work (rw, per-version scratch), /o (ro, official-20261114),
+# /auto (ro, this pipeline's auto/ dir: lib/, lab-patterns.local).
 # usage: container-checks.sh V UNAME PREV
 # Writes /work/report/{failures,warnings,audit-hits.txt,shadow.txt,checks.log}. Exit 0 always unless the script itself breaks;
 # the host decides from /work/report/failures.
 set -uo pipefail
 V=$1 UNAME=$2 PREV=$3
-W=/work; R=$W/report; L=/o/auto/lib; mkdir -p $R; : > $R/failures; : > $R/warnings
+W=/work; R=$W/report; L=${L:-/auto/lib}; mkdir -p $R; : > $R/failures; : > $R/warnings
 F() { echo "FAIL: $*"; echo "$*" >> $R/failures; }
 WARN() { echo "WARN: $*"; echo "$*" >> $R/warnings; }
 OUT=$W/tree/sysext/out/$V; NAMES="fp5-volte-modules fp5-qtee fp5-ims-app fp5-device"
+CARRY="fp5-modemmanager fp5-frunk-qs"   # carried local add-ons (2026-11-19), extracted to $W/sxc
 echo "== [1] extract official usr ($V)"
 U=$W/usrx; rm -rf $U; mkdir -p $U
 fsck.erofs --extract=$U $W/usr.raw >/dev/null 2>&1 || F "official usr: erofs extract/fsck failed"
@@ -56,6 +58,29 @@ if [ -n "$PREV" ]; then
     else echo "$d" | head; F "sysext $n payload differs from $PREV"; fi
   done
 else WARN "no previous version to compare sysext payloads"; fi
+echo "== [5c] carried add-ons (fp5-modemmanager, fp5-frunk-qs): fsck, extension-release, xz==raw, payload vs $PREV, symbols vs $V usr"
+rm -rf $W/sxc; mkdir -p $W/sxc
+for n in $CARRY; do
+  f=$OUT/${n}_$V.raw; X=$W/sxc/${n}_$V; mkdir -p $X
+  [ -f "$f" ] || { F "carry $n missing (build failed?)"; continue; }
+  fsck.erofs "$f" >/dev/null 2>&1 || F "carry $n: fsck.erofs failed"
+  fsck.erofs --extract=$X "$f" >/dev/null 2>&1
+  er=$X/usr/lib/extension-release.d/extension-release.${n}_$V
+  { [ -f "$er" ] && grep -qx 'ID=bengalos' "$er" && grep -qx "VERSION_ID=$V" "$er" && grep -qx 'ARCHITECTURE=arm64' "$er" \
+    && [ "$(ls $X/usr/lib/extension-release.d | wc -l)" = 1 ]; } || F "carry $n: extension-release missing/wrong"
+  cmp -s <(xz -dc "$f.xz") "$f" && echo "xz==raw $n" || F "carry $n: .raw.xz does not decompress to .raw"
+  P=$W/sxprev/$n
+  if [ -n "$PREV" ] && [ -f /o/sysext/out/$PREV/${n}_$PREV.raw ]; then
+    rm -rf $P; mkdir -p $P; fsck.erofs --extract=$P /o/sysext/out/$PREV/${n}_$PREV.raw >/dev/null 2>&1
+    d=$(diff -rq --no-dereference -x extension-release.d -x README $P $X 2>&1)
+    [ -z "$d" ] && echo "same-payload-as-$PREV $n" || { echo "$d" | head; F "carry $n payload differs from $PREV"; }
+  else WARN "carry $n: no $PREV build to compare (first carried version)"; fi
+done
+M=$W/sxc/fp5-modemmanager_$V/usr/sbin/ModemManager
+[ -f $M ] && { python3 $L/symcheck.py $U $M || F "carry fp5-modemmanager: symbols do not resolve against $V usr"; }
+Q=$W/sxc/fp5-frunk-qs_$V/usr/lib/aarch64-linux-gnu/phosh/plugins/libphosh-plugin-frunk-quick-setting.so
+[ -f $Q ] && { python3 $L/symcheck.py $U $Q /usr/libexec/phosh || F "carry fp5-frunk-qs: plugin symbols do not resolve against $V phosh"; }
+[ -d $U/lib/aarch64-linux-gnu/phosh/plugins ] || F "official usr has no phosh plugin dir (Frunk tile would be ignored)"
 echo "== [5b] fp5-qtee factory pam.d/polkit-1 vs $V usr (it shadows the stock polkit-1 PAM file)"
 QP=$W/sx/fp5-qtee_$V/usr/share/factory/etc/pam.d/polkit-1
 if [ -f "$QP" ]; then
@@ -67,11 +92,11 @@ if [ -f "$QP" ]; then
 fi
 echo "== [6] ELF ABI (DT_NEEDED + symbol versions) vs $V usr"
 rm -rf $W/ims; mkdir -p $W/ims; tar -C $W/ims -xzf /o/test/opt/imsd-debian-arm64.tar.gz
-python3 $L/elfcheck.py $U --libdir $W/ims/imsd-debian-arm64/lib -- $W/sx $W/ims /o/test/opt || F "ELF ABI check failed against $V usr"
+python3 $L/elfcheck.py $U --libdir $W/ims/imsd-debian-arm64/lib -- $W/sx $W/sxc $W/ims /o/test/opt || F "ELF ABI check failed against $V usr"
 echo "== [7] python imports of FP5 scripts vs $V usr"
-python3 $L/pydeps.py $U $W/sx/* || F "python import check failed against $V usr"
+python3 $L/pydeps.py $U $W/sx/* $W/sxc/* || F "python import check failed against $V usr"
 echo "== [8] systemd units of FP5 sysexts vs $V usr"
-python3 $L/unitcheck.py $U $W/sx/* || F "unit check failed against $V usr"
+python3 $L/unitcheck.py $U $W/sx/* $W/sxc/* || F "unit check failed against $V usr"
 echo "== [9] official usr sysupdate.d vs baseline (1114.1)"
 B=/o/auto/baseline/usr-sysupdate.d
 for f in $(cd $U/lib/sysupdate.d && ls) ; do
@@ -91,7 +116,7 @@ python3 $L/fp5pe.py split-initrd $W/out/BengalOS_$V.efi $A/uki/parts
 for s in $A/uki/parts/seg*; do D=$A/uki/x_$(basename $s); mkdir -p $D
   case $s in *.zst) zstd -dc $s | (cd $D && cpio -idm --quiet 2>/dev/null);; *) (cd $D && cpio -idm --quiet < $s 2>/dev/null);; esac
   echo "$(basename $s): $(find $D -type f | wc -l) files"; done
-ln -s ../sx $A/sx
+ln -s ../sx $A/sx; ln -s ../sxc $A/sxc
 cd $A || exit 2
 # lab identifiers live in the untracked lab-patterns.local (name<TAB>regex), not in this public repo
 LABP=${FP5_LAB_PATTERNS:-/auto/lab-patterns.local}; export FP5_LAB_PATTERNS=$LABP

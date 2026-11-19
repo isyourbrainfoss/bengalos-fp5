@@ -3,7 +3,8 @@
 # with official BengalOS (roaming/arm64/sdm845). Desk only; never talks to the phone.
 #
 #   fp5-feed-auto.sh                      normal daily run: newest official version -> no-op if already in the feed,
-#                                         else download + verify, build UKI + 4 sysexts, check, publish
+#                                         else download + verify, build UKI + sysexts (incl. carried fp5-modemmanager +
+#                                         fp5-frunk-qs), check, publish
 #   fp5-feed-auto.sh --dry-run            same, but never uploads/deletes anything (build + checks only)
 #   fp5-feed-auto.sh --dry-run --version 0.26.1114.1 --force
 #                                         rebuild + check a version even if it is already published (no upload);
@@ -17,7 +18,10 @@ set -euo pipefail
 umask 022
 export LC_ALL=C
 AUTO=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
-O=$(dirname "$AUTO"); II=$(dirname "$O"); IMG=$II/images
+# O = the desk tree with uki/, sysext/src+out, feed/, logs/, test/, auto/baseline/ (default: parent of this script's dir).
+# FP5_FEED_O lets a checkout of this script (e.g. a review branch) run against the live tree without editing it.
+O=${FP5_FEED_O:-$(dirname "$AUTO")}; II=$(dirname "$O"); IMG=$II/images
+SX=$(cd "$AUTO/../sysext" && pwd)    # build-sysexts.sh + carry/ that go with THIS script
 OFF=https://bengalos.phosh.mobi/images/roaming/arm64/sdm845
 REPO=isyourbrainfoss/bengalos-fp5; TAG=fp5-feed; FEED=https://github.com/$REPO/releases/download/$TAG
 TOOLS=fp5-official-tools:20261114
@@ -30,7 +34,13 @@ CERT_FP=c56aaea912c8c09919b36838490564d970f5ce61ea649d1b12ee431faf9f73d5   # usr
 NAMES=(fp5-volte-modules fp5-qtee fp5-ims-app fp5-device)
 WDTOOLS=fp5-waydroid-fix-tools:20261115                 # = $TOOLS + libglib2.0-bin, shared-mime-info, gtk-update-icon-cache
 WDFIX_FROM=0.26.1114.2   # first version whose feed entry must include fp5-waydroid-fix (1114.1: built 2026-11-15, applied by hand)
-LOGD=$O/logs/auto; mkdir -p "$LOGD"
+# Carried local add-ons (2026-11-19, Kristian: "så alt blir med i nye oppdateringer"): built + checked for EVERY version,
+# published from CARRY_FROM on (0.26.1116.1-0.26.1118.1 were re-pinned by hand on the phone). Gates (fail closed):
+CARRY=(fp5-modemmanager fp5-frunk-qs)
+CARRY_FROM=0.26.1119.1
+CARRY_MM_PKG=1.25.95-1        # official modemmanager must still be this (else our daemon would override a newer one)
+CARRY_PHOSH_UPSTREAM=0.59.0   # plugin embeds PhoshQuickSetting's instance struct: new phosh => rebuild the plugin
+LOGD=${FP5_FEED_LOGD:-$O/logs/auto}; mkdir -p "$LOGD"
 
 DRY=0; FORCE=0; VER=; KEEP=3; PRUNE=1; KEEPWORK=0; BASELINE=0
 while [ $# -gt 0 ]; do case $1 in
@@ -66,6 +76,8 @@ docker image inspect $WDTOOLS >/dev/null 2>&1 || err "docker image $WDTOOLS miss
 docker image inspect $TOOLS >/dev/null 2>&1 || err "docker image $TOOLS missing (build from $O/tools/Dockerfile)"
 [ "$(sha256sum < "$PANEL3" | cut -d' ' -f1)" = $PANEL3_SHA ] || fail "panel3 source UKI checksum changed: $PANEL3"
 (cd "$O/sysext/src" && sha256sum -c --quiet SHA256SUMS) || fail "sysext/src inputs do not match their SHA256SUMS"
+(cd "$SX/carry" && sha256sum -c --quiet SHA256SUMS) || fail "sysext/carry inputs do not match their SHA256SUMS"
+[ -s "$AUTO/lab-patterns.local" ] || err "missing $AUTO/lab-patterns.local (lab identifiers for the secret audit; never committed)"
 [ -s "$KEYRING" ] || err "missing $KEYRING"
 if [ $DRY = 0 ]; then gh auth status -h github.com >/dev/null 2>&1 || err "gh not logged in"; fi
 
@@ -92,7 +104,9 @@ FEEDVERS=$(sed -n 's/.* BengalOS_\(.*\)\.efi\.xz$/\1/p' "$FD/SHA256SUMS" | sort 
 while read -r _ n; do [ -z "$n" ] && continue; grep -q "^$n " "$FD/assets" || fail "feed inconsistent: $n in SHA256SUMS but not a release asset"; done < "$FD/SHA256SUMS"
 say "feed versions: ${FEEDVERS:-none}"
 wdfix_for() { [ "$(printf '%s\n%s\n' "$1" "$WDFIX_FROM" | sort -V | head -1)" = "$WDFIX_FROM" ]; }
-want() { echo "BengalOS_$1.efi.xz"; for n in "${NAMES[@]}"; do echo "${n}_$1.raw.xz"; done; if wdfix_for "$1"; then echo "fp5-waydroid-fix_$1.raw.xz"; fi; }
+carry_for() { [ "$(printf '%s\n%s\n' "$1" "$CARRY_FROM" | sort -V | head -1)" = "$CARRY_FROM" ]; }
+want() { echo "BengalOS_$1.efi.xz"; for n in "${NAMES[@]}"; do echo "${n}_$1.raw.xz"; done; if wdfix_for "$1"; then echo "fp5-waydroid-fix_$1.raw.xz"; fi
+  if carry_for "$1"; then for n in "${CARRY[@]}"; do echo "${n}_$1.raw.xz"; done; fi; }
 published() { for a in $(want "$1"); do grep -q "  $a\$" "$FD/SHA256SUMS" && grep -q "^$a " "$FD/assets" || return 1; done; }
 PUBLISHED=0; published "$V" && PUBLISHED=1
 NEWEST_FEED=$(echo "$FEEDVERS" | tr ' ' '\n' | sort -V | tail -1)
@@ -113,6 +127,20 @@ for s in usr.raw.xz usr-verity.raw.xz usr-verity-sig.raw.xz manifest osrelease e
 done
 (cd "$D" && grep -E " BengalOS_$V\.(manifest|osrelease|usr\.raw\.xz|usr-verity\.raw\.xz|usr-verity-sig\.raw\.xz)\$" upstream-SHA256SUMS.sdm845 | sha256sum -c > verify.txt) || fail "official artifacts do not verify"
 say "official artifacts verified against the signed index"
+# carry gates from the signed official manifest
+pkgv() { python3 -c 'import json,sys
+m=json.load(open(sys.argv[1])); out={}
+def w(x):
+    if isinstance(x,dict):
+        if "name" in x and "version" in x: out[x["name"]]=x["version"]
+        for v in x.values(): w(v)
+    elif isinstance(x,list):
+        for v in x: w(v)
+w(m); print(out.get(sys.argv[2],""))' "$D/BengalOS_$V.manifest" "$1"; }
+MMV=$(pkgv modemmanager); PHV=$(pkgv phosh)
+[ "$MMV" = "$CARRY_MM_PKG" ] || fail "carry: official modemmanager is now '$MMV' (pinned $CARRY_MM_PKG): check whether it contains 9317cbc4 (then drop fp5-modemmanager) or rebuild it"
+[ "${PHV%%+*}" = "$CARRY_PHOSH_UPSTREAM" ] || fail "carry: official phosh is now '$PHV' (pinned $CARRY_PHOSH_UPSTREAM): rebuild the Frunk plugin against it"
+say "carry gates OK (modemmanager $MMV, phosh $PHV)"
 
 W=$AUTO/work/$V; [ -d "$W" ] && docker run --rm --network none -v "$AUTO/work":/x $TOOLS rm -rf "/x/$V"; mkdir -p "$W/out" "$W/report"
 SIG=$(xz -dc "$D/BengalOS_$V.usr-verity-sig.raw.xz" | tr -d '\0')
@@ -150,13 +178,14 @@ fi
 
 # ---- build the sysexts (exactly like 1114.1: build-sysexts.sh in the tools container, offline)
 say "build sysexts (prev=$PREV)"
-T=$W/tree; mkdir -p "$T/sysext" "$T/uki"; cp -a "$O/sysext/build-sysexts.sh" "$O/sysext/src" "$T/sysext/"; cp "$RULE" "$T/uki/"
+T=$W/tree; mkdir -p "$T/sysext" "$T/uki"; cp -a "$SX/build-sysexts.sh" "$SX/carry" "$O/sysext/src" "$T/sysext/"; cp "$RULE" "$T/uki/"
 docker run --rm --network none -v "$T":/t -w /t/sysext $TOOLS sh -c "sh build-sysexts.sh $V && chown -R $(id -u):$(id -g) /t" | tee "$W/report/build-sysexts.log"
 
 # ---- all checks against the new official usr (offline container)
 say "checks"
-docker run --rm --network none -v "$W":/work -v "$O":/o:ro $TOOLS bash /o/auto/lib/container-checks.sh "$V" "$UNAME" "$PREV" | tee "$W/report/checks.log"
-CLEAN="/work/usrx /work/sxprev /work/ims"; [ $KEEPWORK = 1 ] || CLEAN="$CLEAN /work/aud /work/sx"
+for n in "${CARRY[@]}"; do [ -s "$T/sysext/out/$V/${n}_$V.raw.xz" ] || fail "carry: ${n}_$V not built"; done
+docker run --rm --network none -v "$W":/work -v "$O":/o:ro -v "$AUTO":/auto:ro $TOOLS bash /auto/lib/container-checks.sh "$V" "$UNAME" "$PREV" | tee "$W/report/checks.log"
+CLEAN="/work/usrx /work/sxprev /work/ims"; [ $KEEPWORK = 1 ] || CLEAN="$CLEAN /work/aud /work/sx /work/sxc"
 docker run --rm --network none -v "$W":/work $TOOLS sh -c "rm -rf $CLEAN; chown -R $(id -u):$(id -g) /work"
 WARNS=$(wc -l < "$W/report/warnings")
 if [ $BASELINE = 1 ]; then
@@ -189,6 +218,7 @@ S=$W/feed; mkdir -p "$S"
 xz -T0 -9 -c "$W/out/BengalOS_$V.efi" > "$S/BengalOS_$V.efi.xz"
 cp "$T/sysext/out/$V/"*.raw.xz "$S/"
 wdfix_for "$V" || rm -f "$S/fp5-waydroid-fix_$V.raw.xz"     # 1114.1: not part of the published set
+carry_for "$V" || for n in "${CARRY[@]}"; do rm -f "$S/${n}_$V.raw.xz"; done   # built+checked, published from $CARRY_FROM
 (cd "$S" && sha256sum $(want "$V") > SHA256SUMS.part)
 cat "$FD/SHA256SUMS" "$S/SHA256SUMS.part" | awk 'NF==2' | sort -u -k2,2 > "$S/SHA256SUMS.merged"
 [ "$(awk '{print $2}' "$S/SHA256SUMS.merged" | sort | uniq -d)" = "" ] || fail "merged index has duplicate names with different hashes"
@@ -216,8 +246,11 @@ for a in $(want "$V"); do
 done
 say "upload SHA256SUMS"
 gh release upload $TAG --repo $REPO --clobber "$S/SHA256SUMS" || err "SHA256SUMS upload failed (new assets are present but not offered yet)"
-sleep 5
-curl -fsSL --retry 3 "$FEED/SHA256SUMS" | cmp -s - "$S/SHA256SUMS" || err "published SHA256SUMS does not match staged index"
+# the release-download CDN can serve the previous index for a while: retry with backoff (~5 min total), cache-busted
+ok=0; for d in 5 10 20 40 80 160; do sleep $d
+  if curl -fsSL --retry 3 "$FEED/SHA256SUMS?nocache=$(date +%s%N)" | cmp -s - "$S/SHA256SUMS"; then ok=1; break; fi
+  say "published SHA256SUMS not visible yet (waited ${d}s more)"; done
+[ $ok = 1 ] || err "published SHA256SUMS does not match staged index after ~5 min (CDN or upload problem)"
 for p in $PRUNEV; do for a in $(want "$p"); do
   grep -q "^$a " "$FD/assets" && { say "prune $a"; gh release delete-asset $TAG "$a" --repo $REPO -y || WARNS=$((WARNS+1)); }; done; done
 # local records, same layout as 1113.1/1114.1
