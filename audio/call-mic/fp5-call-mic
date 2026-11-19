@@ -50,7 +50,7 @@ start_rec() {
     dev=$1
     if [ "$DRY" = 1 ]; then
         log "dry: would unmute + parecord --device=$(red "$dev")"
-        sleep 100000 & PID=$!
+        sleep "${FP5_CALL_MIC_DRY_HOLD:-8}" & PID=$!
         return
     fi
     if [ "$dev" != "@DEFAULT_SOURCE@" ]; then

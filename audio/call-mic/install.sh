@@ -7,7 +7,13 @@ STAGE=${1:?staging dir}
 B=/var/lib/fp5-backup/20261119-call-mic
 BIN=/var/lib/fp5-oot/bin
 UNIT=/home/fp5/.config/systemd/user/fp5-call-mic.service
-FU() { runuser -u fp5 -- env XDG_RUNTIME_DIR=/run/user/60434 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/60434/bus "$@"; }
+FU() {
+    E="XDG_RUNTIME_DIR=/run/user/60434 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/60434/bus"
+    if command -v runuser >/dev/null 2>&1; then runuser -u fp5 -- env $E "$@"
+    else run0 --no-ask-password -u fp5 env $E "$@"; fi   # root -> fp5 never prompts
+}
+[ "$(id -u)" = 0 ] || { echo "run as root: run0 sh install.sh DIR"; exit 2; }
+[ "$(id -u fp5)" = 60434 ] && [ -d /run/user/60434 ] || { echo "ABORT: fp5 session (uid 60434) not found"; exit 2; }
 
 # --- guard: no call active
 calls=$(busctl --json=short get-property org.freedesktop.ModemManager1 /org/freedesktop/ModemManager1/Modem/0 org.freedesktop.ModemManager1.Modem.Voice Calls 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["data"]))' 2>/dev/null || echo err)
@@ -38,7 +44,8 @@ for f in fp5-call-mic fp5-call-audio-snap; do
     if [ -e "$B/$f.orig" ]; then cp -a "$B/$f.orig" "/var/lib/fp5-oot/bin/$f"; fi
 done
 while read -r f; do [ -n "$f" ] && rm -f "$f"; done < "$B/new-files.txt"
-runuser -u fp5 -- env XDG_RUNTIME_DIR=/run/user/60434 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/60434/bus systemctl --user daemon-reload
+E="XDG_RUNTIME_DIR=/run/user/60434 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/60434/bus"
+if command -v runuser >/dev/null 2>&1; then runuser -u fp5 -- env $E systemctl --user daemon-reload; else run0 --no-ask-password -u fp5 env $E systemctl --user daemon-reload; fi
 sha256sum -c "$B/before.sha256" && echo "rollback OK (v1 unit restored)"
 RB
 chmod 755 "$B/rollback.sh"
