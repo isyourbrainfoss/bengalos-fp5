@@ -1,0 +1,11 @@
+[Unit]
+Description=FP5: read-only capture of PMIC PON log + sleep stats at boot (suspend-freeze diagnosis 2026-11-19)
+After=local-fs.target sys-kernel-debug.mount
+ConditionPathExists=/var/lib/fp5-suspend-guard/fp5-pon-capture
+
+[Service]
+Type=oneshot
+ExecStart=/var/lib/fp5-suspend-guard/fp5-pon-capture boot
+
+[Install]
+WantedBy=multi-user.target

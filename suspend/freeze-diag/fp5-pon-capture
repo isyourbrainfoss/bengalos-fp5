@@ -1,0 +1,33 @@
+#!/bin/sh
+# fp5-pon-capture — READ-ONLY capture of PMK8350 PON state + sleep stats (FP5 suspend-freeze diagnosis, 19 Nov 2026).
+# Reads PMIC registers only via the existing regmap debugfs (dd read); never writes PMIC/watchdog/panic settings.
+# Usage: fp5-pon-capture boot|pre|post     Logs: /var/lib/fp5-suspend-guard/pon/ (newest $KEEP files kept)
+#        Battery/idle line for drain stats: /var/lib/fp5-suspend-guard/drain.log (trimmed to 5000 lines)
+set -u
+MODE=${1:-boot}; D=/var/lib/fp5-suspend-guard; O=$D/pon; KEEP=${KEEP:-400}
+mkdir -p "$O"
+BID=$(cut -c1-8 /proc/sys/kernel/random/boot_id); NOW=$(date +%Y-%m-%dT%H:%M:%S%z)
+F="$O/$(date +%Y%m%dT%H%M%S)-$MODE-$BID.txt"
+RM=/sys/kernel/debug/regmap/0-00/registers
+rd() { dd if=$RM bs=9 skip=$(($1)) count=$(($2)) status=none 2>/dev/null | awk '{printf "%s ", $2; if (NR%16==0) printf "\n"}'; }
+BAT=/sys/class/power_supply/qcom-battmgr-bat
+cap=$(cat $BAT/capacity 2>/dev/null); st=$(cat $BAT/status 2>/dev/null); uv=$(cat $BAT/voltage_now 2>/dev/null)
+idl=$(cat /sys/devices/system/cpu/cpu0/cpuidle/state2/disable 2>/dev/null)
+s2=$(for c in /sys/devices/system/cpu/cpu[0-7]/cpuidle/state[0-2]; do printf "%s," "$(cat $c/s2idle/usage 2>/dev/null || echo -)"; done)
+{
+  echo "# $MODE boot=$BID $NOW uptime=$(cut -d' ' -f1 /proc/uptime) bat=$cap/$st uV=$uv idle_s12_disabled=$idl"
+  echo "## SDAM5 0x7440-0x74bf"; rd 0x7440 0x80
+  if [ "$MODE" = boot ]; then
+    echo "## PON_PBS 0x0800-0x08ff"; rd 0x0800 0x100
+    echo "## PON_HLOS 0x1300-0x13ff"; rd 0x1300 0x100
+  fi
+  for s in aosd cxsd ddr; do echo "## qcom_stats $s: $(tr '\n' ' ' < /sys/kernel/debug/qcom_stats/$s 2>/dev/null)"; done
+  echo "## suspend_stats: $(for f in success fail last_hw_sleep total_hw_sleep max_hw_sleep; do printf "%s=%s " $f "$(cat /sys/power/suspend_stats/$f 2>/dev/null)"; done)"
+  echo "## s2idle usage cpu0-7 state0-2: $s2"
+  echo "## idle usage: $(for c in /sys/devices/system/cpu/cpu[0-7]/cpuidle/state[0-2]; do printf "%s," "$(cat $c/usage)"; done)"
+} > "$F.new" && mv -f "$F.new" "$F"
+echo "$NOW $MODE boot=$BID bat=$cap st=$st uV=$uv idle_dis=$idl" >> "$D/drain.log"
+[ "$(wc -l < "$D/drain.log")" -gt 5000 ] && tail -n 4000 "$D/drain.log" > "$D/drain.log.new" && mv -f "$D/drain.log.new" "$D/drain.log"
+ls -1t "$O"/*.txt 2>/dev/null | tail -n +$((KEEP+1)) | xargs -r rm -f
+sync -f "$F" 2>/dev/null || sync
+exit 0

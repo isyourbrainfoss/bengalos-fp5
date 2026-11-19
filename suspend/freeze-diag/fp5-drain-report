@@ -1,0 +1,25 @@
+#!/bin/sh
+# Battery drain per hour across suspends (pre -> next post, same boot, both Discharging).
+# Sources: drain.log (fp5-pon-capture, has idle_dis flag) and history.log (fp5-suspend-guard, baseline before the test).
+D=/var/lib/fp5-suspend-guard
+{
+  awk '/ pre boot=| post boot=/{print $1, $2, $3, $0}' "$D/history.log" 2>/dev/null | \
+  sed -E 's/^([^ ]+) (pre|post) boot=([0-9a-f]{8})[^ ]* .*bat=([0-9]+)\/([A-Za-z]+).*/\1 \2 \3 \4 \5 G/'
+  awk '{b=$3; sub("boot=","",b); c=$4; sub("bat=","",c); s=$5; sub("st=","",s); i=$7; sub("idle_dis=","",i); if ($2=="pre"||$2=="post") print $1, $2, b, c, s, "I" i}' "$D/drain.log" 2>/dev/null
+} | sort -u -k1,1 -k2,2 | python3 -c '
+import sys, datetime as dt, collections
+rows=[l.split() for l in sys.stdin if len(l.split())==6]
+best={}
+for t,m,b,c,s,src in rows:  # prefer drain.log rows (I*) over history.log (G) for the same event
+    k=(t[:16],m,b)
+    if k not in best or src.startswith("I"): best[k]=(t,m,b,c,s,src)
+ev=sorted(best.values(), key=lambda r: r[0])
+agg=collections.defaultdict(lambda:[0.0,0.0,0])
+for a,z in zip(ev,ev[1:]):
+    if a[1]=="pre" and z[1]=="post" and a[2]==z[2] and a[4]==z[4]=="Discharging":
+        h=(dt.datetime.strptime(z[0][:19],"%Y-%m-%dT%H:%M:%S")-dt.datetime.strptime(a[0][:19],"%Y-%m-%dT%H:%M:%S")).total_seconds()/3600
+        if h<=0.05: continue
+        grp="test(WFI-only)" if a[5]=="I1" else "baseline"
+        agg[grp][0]+=int(a[3])-int(z[3]); agg[grp][1]+=h; agg[grp][2]+=1
+for g,(p,h,n) in agg.items(): print(f"{g:15} suspends={n:3} hours={h:6.2f} drop={p:4.0f}%  -> {p/h:.2f} %/h")
+'
