@@ -685,3 +685,65 @@ class BridgeHelpersTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GhostCallCheckTest(unittest.TestCase):
+    """20.11 17:15: gnome-calls/Phosh kept Call/3 in state 3 after the call ended."""
+    def setUp(self):
+        self.busy, self.calls, self.runs, self.logs, self.t = [False], [], [], [], [0.0]
+        def run(argv, timeout=10):
+            self.runs.append(argv); return 0, ""
+        self.g = bridge.GhostCallCheck(lambda: self.busy[0], lambda: list(self.calls), run=run,
+                                       timers=False, log=self.logs.append, clock=lambda: self.t[0])
+
+    def restarts(self):
+        return [a for a in self.runs if "try-restart" in a]
+
+    def test_no_ghost_nothing_done(self):
+        self.g.call_ended()
+        self.assertEqual(self.restarts(), [])
+
+    def test_ended_object_is_not_a_ghost(self):
+        self.calls = [("/org/gnome/Calls/Call/3", 7)]
+        self.g.call_ended()
+        self.assertEqual(self.restarts(), [])
+
+    def test_ghost_restarts_calls_daemon_once(self):
+        self.calls = [("/org/gnome/Calls/Call/3", 3)]
+        self.g.call_ended()
+        self.assertEqual(self.restarts(), [["systemctl", "--user", "try-restart", "calls-daemon.service"]])
+        self.t[0] += 60
+        self.g.call_ended()                      # rate limit: one per 10 min
+        self.assertEqual(len(self.restarts()), 1)
+        self.t[0] += 700
+        self.g.call_ended()
+        self.assertEqual(len(self.restarts()), 2)
+        self.assertFalse(any(c.isdigit() and len(c) > 5 for l in self.logs for c in l.split()))
+
+    def test_never_during_a_call(self):
+        self.calls = [("/org/gnome/Calls/Call/4", 1)]
+        self.busy[0] = True
+        self.g.call_ended()
+        self.assertEqual(self.restarts(), [])
+
+    def test_gnome_calls_not_answering(self):
+        def boom():
+            raise RuntimeError("no gnome-calls")
+        self.g.list_calls = boom
+        self.g.call_ended()
+        self.assertEqual(self.restarts(), [])
+
+    def test_bridge_triggers_on_call_end_only(self):
+        seen = []
+        class B:  # minimal stand-in for Bridge._audio's state machine
+            pass
+        b = bridge.Bridge.__new__(bridge.Bridge)
+        b.audio = None; b.refresher = None; b._was_live = False; b.calls = {}
+        b.ghost = type("G", (), {"call_ended": lambda s: seen.append(1)})()
+        b._audio()
+        self.assertEqual(seen, [])
+        b.calls = {"x": type("C", (), {"state": 4})()}
+        b._audio()
+        b.calls = {}
+        b._audio()
+        self.assertEqual(seen, [1])

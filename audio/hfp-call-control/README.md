@@ -227,3 +227,20 @@ bridge got no `Hangup` (same as 16:05). Read-only findings:
 - Install (not while driving: restarts WirePlumber, car audio reconnects):
   `sh ~/.local/share/fp5-hfp-staging-v4/install-v4.sh`; undo `rollback-v4.sh`.
   After the next car call: `journalctl --user -u wireplumber | grep 'fp5:'`.
+
+### v4 addition: ghost call in gnome-calls/Phosh (20.11 17:15)
+At 17:15 Phosh still saw `/org/gnome/Calls/Call/3` in state 3 ("calling") with no call in
+imsd/ModemManager (proximity blanking, wallpaper lost); restarting calls-daemon fixed it.
+Journal: Call/3 was **not** the 16:40:51 car call (that one was exported as Call/1 and removed
+16:41:25). imsd-ofonod vanished 17:06:11, so phone-dialled calls went over CS (ModemManager):
+17:09:53 Call/2 (MM refused Start: Unauthorized), 17:13:43 Call/3 (ended 17:13:51 still
+"calling"). gnome-calls itself logged both as ended and unexported ("Call … removed" 17:09:56,
+17:13:54), so the stale copy may have been on the Phosh side (its object-manager client missed
+the removal) rather than in gnome-calls. A calls-daemon restart resets both.
+v4 bridge `GhostCallCheck`: 8 s after the last call ends (gnome-calls drops ended calls after
+3 s) and again 5 s later, read org.gnome.Calls GetManagedObjects (paths + State only); if a
+Call object not in state 7 is still there and no call exists in imsd/MM, try-restart
+calls-daemon; never during a call, at most once per 10 min, `FP5_GHOST_CALL_FIX=off` disables.
+Limitation: if gnome-calls has already unexported it and only Phosh holds the ghost, the bridge
+cannot see it; then the manual fix stays `systemctl --user restart calls-daemon`.
+Tests: 6 new unit tests (54 total) + harness pass.

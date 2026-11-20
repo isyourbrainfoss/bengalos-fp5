@@ -53,7 +53,7 @@
 #   start-up if the running gnome-calls already logged "Ofono vanished".
 # - diagnostics: log once when PipeWire reads a call's state, and log car
 #   commands for unknown call objects (car hangup at 16:05 left no trace).
-import argparse, os, re, signal, subprocess, sys, syslog
+import argparse, os, re, signal, subprocess, sys, syslog, time
 
 import gi
 gi.require_version("Gio", "2.0")
@@ -275,6 +275,81 @@ class CallsRefresher:
         return rc == 0
 
 
+GHOST_DELAY_S = 8        # gnome-calls drops an ended call after 3 s
+GHOST_RECHECK_S = 5
+GHOST_GAP_S = 600        # at most one ghost-call restart per 10 min
+CUI_DISCONNECTED = 7     # org.gnome.Calls.Call State: 7 = ended
+
+
+class GhostCallCheck:
+    """After a call ends (bridge and imsd/ModemManager idle), gnome-calls must
+    not still export a live org.gnome.Calls.Call: Phosh treats one as an active
+    call (proximity blanking, lock screen). Seen 20.11 17:15 (Call/3 left in
+    state 3 'calling'). If one is still there after GHOST_DELAY_S and again
+    GHOST_RECHECK_S later, try-restart calls-daemon (never during a call, at
+    most once per 10 min). Only object paths and states are read."""
+    def __init__(self, busy, list_calls, run=_run, timers=True, log=None, clock=time.monotonic):
+        self.busy, self.list_calls, self.run, self.timers = busy, list_calls, run, timers
+        self.log = log or (lambda m: None)
+        self.clock = clock
+        self.timer = None
+        self.last = -1e9
+        self.restarts = 0
+
+    def call_ended(self):
+        self._later(GHOST_DELAY_S, lambda: self._check(first=True))
+
+    def _later(self, s, fn):
+        if not self.timers:
+            return fn()
+        if self.timer is not None:
+            GLib.source_remove(self.timer)
+        def cb():
+            self.timer = None
+            fn()
+            return False
+        self.timer = GLib.timeout_add_seconds(s, cb)
+
+    def _ghosts(self):
+        try:
+            return [p for p, st in self.list_calls() if st != CUI_DISCONNECTED]
+        except Exception:
+            return []  # gnome-calls not running / no answer: nothing to fix
+
+    def _check(self, first):
+        if self.busy():
+            return False
+        ghosts = self._ghosts()
+        if not ghosts:
+            return False
+        if first:
+            self.log("gnome-calls: %d call object(s) still live after the call ended; re-checking" % len(ghosts))
+            self._later(GHOST_RECHECK_S, lambda: self._check(first=False))
+            return False
+        if self.clock() - self.last < GHOST_GAP_S:
+            self.log("gnome-calls: ghost call still there, restart skipped (one per 10 min)")
+            return False
+        self.last = self.clock()
+        rc, _ = self.run(["systemctl", "--user", "try-restart", CALLS_UNIT], 30)
+        self.restarts += rc == 0
+        self.log("gnome-calls: %s (ghost call left after the call ended)"
+                 % ("restarted" if rc == 0 else "restart FAILED rc=%d" % rc))
+        return rc == 0
+
+
+def gnome_calls_list(sesbus):
+    """[(object path, State)] of org.gnome.Calls.Call objects (no numbers/names)."""
+    r = sesbus.call_sync("org.gnome.Calls", "/org/gnome/Calls", "org.freedesktop.DBus.ObjectManager",
+                         "GetManagedObjects", None, GLib.VariantType("(a{oa{sa{sv}}})"),
+                         Gio.DBusCallFlags.NO_AUTO_START, 3000, None).unpack()[0]
+    out = []
+    for path, ifs in r.items():
+        c = ifs.get("org.gnome.Calls.Call")
+        if c is not None:
+            out.append((path, int(c.get("State", 0))))
+    return out
+
+
 class Bridge:
     def __init__(self, bus, ofono_bus, mm_bus, audio=None, allow_uids=None, refresher=None):
         self.bus = bus
@@ -282,6 +357,8 @@ class Bridge:
         self.mm_bus = mm_bus
         self.audio = audio
         self.refresher = refresher
+        self.ghost = None
+        self._was_live = False
         self.read_logged = set()  # calls whose state PipeWire has read (logged once)
         self._ofono_seen = False
         self.allow_uids = allow_uids if allow_uids is not None else {0, os.getuid()}
@@ -627,6 +704,12 @@ class Bridge:
             self.audio.calls_changed(len(live))
         if self.refresher and not live:
             self.refresher.calls_idle()
+        if live:
+            self._was_live = True
+        elif self._was_live:
+            self._was_live = False
+            if self.ghost:
+                self.ghost.call_ended()
 
     # ---------------- oFono (imsd-ofonod) side ----------------
     def watch_ofono(self):
@@ -875,6 +958,13 @@ def main(argv=None):
     if a.calls_refresh == "on" and a.bus == "system":
         bridge.refresher = CallsRefresher(lambda: bool(bridge.live_calls()), log=log)
         bridge.refresher.startup_check()
+    if os.environ.get("FP5_GHOST_CALL_FIX", "on") != "off" and a.bus == "system":
+        try:
+            sesbus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            bridge.ghost = GhostCallCheck(lambda: bool(bridge.live_calls()),
+                                          lambda: gnome_calls_list(sesbus), log=log)
+        except GLib.Error as e:
+            log("ghost-call check off: no session bus (%s)" % errname(e), syslog.LOG_WARNING)
     bridge.export()
     loop = GLib.MainLoop()
 

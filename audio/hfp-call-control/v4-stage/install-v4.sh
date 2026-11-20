@@ -3,7 +3,10 @@
 #   - libspa-bluez5.so = Debian 1.6.9-2 + 0001 (service key) + 0002 (number-free
 #     warn-level log of every call-control AT command from the car, hang-up
 #     fallback: first known call, else Voice.HangupAll; AT+CHLD=0/1 = hang up)
-#   - fp5-hfp-modem-bridge: logs "car: hang up all" and dial-reply latency
+#   - fp5-hfp-modem-bridge: logs "car: hang up all" and dial-reply latency;
+#     ghost-call check: 8+5 s after a call ends, if gnome-calls still exports a
+#     live org.gnome.Calls.Call while no call exists, try-restart calls-daemon
+#     (never during a call, max 1 per 10 min; off: FP5_GHOST_CALL_FIX=off)
 # Run as fp5 (one run0 password prompt), NOT during a call and NOT while driving:
 # it restarts WirePlumber (car Bluetooth audio drops for a few seconds and
 # reconnects) and the bridge user service. PipeWire/bluetooth are not touched.
