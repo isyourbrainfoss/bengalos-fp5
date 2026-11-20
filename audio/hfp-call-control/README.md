@@ -1,6 +1,7 @@
 # Car call control over Bluetooth HFP (FP5, BengalOS 0.26.1118.1)
 
-Status: **prototype, offline tests only. Nothing installed on the phone.**
+Status: **staged, offline tests only. Nothing installed on the phone.**
+aarch64 plugin built from Debian pipewire 1.6.9-2 (= the phone's build), see `build/`.
 Needs Kristian's yes for install, the WirePlumber restart and the first car test.
 
 ## What happens today when the car dials (ATD)
@@ -36,8 +37,14 @@ phone. It does not help when we are the AG.
    ModemManager-shaped modem (`Device = "fp5-imsd"`):
    - ObjectManager, Modem, Modem3gpp, Voice and Call.
    - Calls mirror imsd-ofonod: `CreateCall`→`Dial`, `Accept`→`Answer`, `Hangup`, `SendDtmf`→`SendTones`.
+   - **VoLTE first, CS when needed** (Kristian 20 Nov): IMS usable → imsd `Dial`. If imsd
+     refuses fast (< 8 s, and no imsd call object was ever created, so a busy/rejected VoLTE
+     call is never re-dialled) and CS is usable → ModemManager `Voice.CreateCall` +
+     `Call.Start`. IMS not usable → CS directly. CS usable = ModemManager modem registered,
+     has Voice, not EmergencyOnly. ModemManager CS calls (ours, GNOME Calls', incoming) are
+     mirrored too, so a CS call rings/answers/hangs up in the car. Car service indicator = VoLTE
+     or CS usable. This uses only ModemManager's normal call API (no profile/RAT/NV change).
    - Signal, operator name and roaming are mirrored **read-only** from ModemManager.
-   - Service = imsd modem Online and MM registered.
    - IMEI and own numbers are never exposed. Logs contain no numbers or SIP text.
    - Only uid 0 and fp5 may call it (bus policy plus an in-daemon check).
 3. **WirePlumber drop-in** (`config/60-fp5-hfp-modem.conf`): `native-modem = "fp5-imsd"` and the
@@ -64,6 +71,17 @@ phone. It does not help when we are the AG.
 Not covered: `AT+BLDN` (redial from the car) stays ERROR outside PTS mode (upstream behaviour).
 Three-way calling (`AT+CHLD`) is not supported by the native AG either.
 
+## Build (aarch64, desk, Docker debian:sid amd64 cross)
+`build/build.sh`: `apt-get source pipewire=1.6.9-2`, cross `dpkg-buildpackage -a arm64`, then the
+patch and a rebuild of `libspa-bluez5.so` only, stripped like dh_strip. `build/verify.sh` compares:
+- official Debian `libspa-0.2-bluetooth_1.6.9-2_arm64.deb` plugin sha256 == phone's stock plugin
+  (`ba0e8214…5d21`);
+- our stock rebuild vs official: same exported/imported symbols and identical .text/.rodata sizes;
+- patched vs official: same exported symbols and NEEDED; one new import
+  (`dbus_validate_bus_name`, libdbus); changed functions are only modemmanager.c's
+  (`add_filters mm_* spa_scnprintf`); new strings are only the new key and its 2 log messages.
+Hashes: `build/SHA256SUMS`.
+
 ## Tests (offline)
     ./run-tests.sh /path/to/pipewire-1.6.9+patch
 - Unit tests: audio router (engage/restore/second call/no car/crash recovery/car leaves),
@@ -76,14 +94,25 @@ Three-way calling (`AT+CHLD`) is not supported by the native AG either.
   - incoming RING/+CLIP → ATA → active → remote hangup;
   - imsd Dial failure → ERROR;
   - IMS offline → service=0;
-  - wrong Device → not linked.
+  - wrong Device → not linked; no service key → still talks to `org.freedesktop.ModemManager1`
+    (stock behaviour);
+  - VoLTE first (imsd Dial, no CS); imsd fast failure → CS CreateCall+Start → active → CS hangup;
+  - VoLTE busy (call object existed) → ERROR, **no** CS re-dial; both fail → ERROR;
+  - IMS down + CS up → service stays, CS dial, imsd not tried;
+  - CS incoming → RING/+CLIP → ATA → ModemManager Accept → remote hangup;
+  - IMS + CS down → service 0; back → 1;
+  - no number/IMEI/own number/operator code in bridge log or towards PipeWire.
+- `tests/test_install.sh`: install.sh on a fake root (dry run touches nothing; apply layout;
+  refuses foreign stock plugin / bad bundle hash).
 
 ## Install (needs yes; nothing restarts)
-1. Build `libspa-bluez5.so` for aarch64 from the BengalOS PipeWire 1.6.9 source with the patch.
-   Match the stock build options and check that the stock .so's exported symbols/strings match.
-2. `sh install.sh --dry-run` on the phone, then
-   `run0 sh install.sh --apply <patched.so>`. It refuses during a call, backs up, and writes
-   `/var/lib/fp5-backup/<ts>-hfp-call-control/rollback.sh`.
+Bundle: `hfp-call-control-bundle.tar.gz` (+ `.sha256`), staged on desk in `~/repos/grok_build/fp5/out/`.
+    scp hfp-call-control-bundle.tar.gz* fp5ops@<phone>:/tmp/   # or copy as fp5
+    cd /tmp && sha256sum -c hfp-call-control-bundle.tar.gz.sha256 && tar xzf hfp-call-control-bundle.tar.gz
+    sh hfp-call-control/install.sh --dry-run
+    run0 sh hfp-call-control/install.sh --apply
+It refuses during a call (VoLTE or CS), on a stock plugin other than Debian 1.6.9-2, or on a bad
+bundle hash. Writes `/var/lib/fp5-backup/<ts>-hfp-call-control/rollback.sh`. Nothing restarts.
 
 ## Activate (needs yes; car connected, no call)
     systemctl --user daemon-reload

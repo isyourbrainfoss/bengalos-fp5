@@ -1,0 +1,4 @@
+e5ccbe83cd54e7f96fd0389e942f6a2afb9cca5e8a7203d1e1d5411249a4dc90  libspa-bluez5.so.patched
+24eae8e0a8ca859fcf8a5a26a95c293f4fd96862978a088283bb54011b975003  libspa-bluez5.so.patched.unstripped
+ba0e821483dd6b46725e9bd58c23bc27784e685045cbe12e47628b1038165d21  official-debian-1.6.9-2/libspa-bluez5.so
+862ff534aaac4e534b5bae98cf47368f5a0c74baef97b5b713b2374059fd9fd8  our-stock-rebuild/libspa-bluez5.so

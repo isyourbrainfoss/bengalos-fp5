@@ -11,6 +11,7 @@ PW=${1:-${PW_SRC:-}}
 cd "$HERE"
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 sh tests/test_guard.sh
+sh tests/test_install.sh
 if [ -z "$PW" ]; then
     echo "SKIP harness: pass a patched PipeWire source dir"; exit 0
 fi

@@ -90,8 +90,12 @@ def method(conn, sender, path, iface, m, params, inv):
         if m == "Dial":
             number, _ = params.unpack()
             log.append("Dial:" + number)
-            if number.startswith("999"):
-                return inv.return_dbus_error("org.ofono.Error.Failed", "nope")
+            if number.startswith("999") or number.startswith("998"):
+                return inv.return_dbus_error("org.ofono.Error.Failed", "sip:+4712345678@ims.mnc001.mcc242.3gppnetwork.org nope")
+            if number.startswith("997"):   # call object created, then busy -> error
+                p = new_call(number, "dialing")
+                remove(p)
+                return inv.return_dbus_error("org.ofono.Error.Failed", "busy")
             p = new_call(number, "dialing")
             inv.return_value(GLib.Variant("(o)", (p,)))
             GLib.timeout_add(100, lambda: (set_state(p, "alerting"), False)[1])
