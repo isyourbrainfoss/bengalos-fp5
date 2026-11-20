@@ -1,0 +1,37 @@
+From 09455bd1cd9f54a43411c2d9fd13aaf1c948092a Mon Sep 17 00:00:00 2001
+From: isyourbrainfoss <isyourbrainfoss@proton.me>
+Date: Fri, 20 Nov 2026 16:19:28 +0100
+Subject: [PATCH] ofono: forget modems when oFono vanishes
+
+When org.ofono vanished, only the origins were removed. The modem table
+and the manager proxy stayed, so when oFono came back modem_added_cb()
+warned "Modem already exists" and returned: no origin was created again
+and new calls were added to stale objects (assertion failures, no call UI,
+or a crash). Seen on a Fairphone 5 with a userspace IMS oFono service that
+restarts during the day.
+---
+ plugins/provider/ofono/calls-ofono-provider.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/plugins/provider/ofono/calls-ofono-provider.c b/plugins/provider/ofono/calls-ofono-provider.c
+index 7e6a7dd..f220e67 100644
+--- a/plugins/provider/ofono/calls-ofono-provider.c
++++ b/plugins/provider/ofono/calls-ofono-provider.c
+@@ -460,6 +460,14 @@ ofono_vanished_cb (GDBusConnection    *connection,
+ {
+   g_debug ("Ofono vanished from D-Bus");
+   g_list_store_remove_all (self->origins);
++  /* The modem proxies belong to the old oFono instance. Keeping them makes
++   * modem_added_cb() skip the modem when oFono comes back ("already exists"),
++   * so no origin is created again and new calls end up on dead objects. */
++  g_hash_table_remove_all (self->modems);
++  if (self->manager) {
++    g_signal_handlers_disconnect_by_data (self->manager, self);
++    g_clear_object (&self->manager);
++  }
+   update_status (self);
+ }
+ 
+-- 
+2.47.3
+

@@ -53,6 +53,10 @@ check(first_ready is not None and first_dial is not None and first_add is not No
       and first_dial < first_ready < first_add, "car dial: HFP + defaults before imsd Dial")
 check("AA:BB" not in log and "AA_BB" not in log and "bluez_" not in log, "no node names/BT address in log")
 check(not re.search(r"moved once", log), "no stream moves")
+mic = next((i for i, l in enumerate(lines) if "car mic volume 0% -> 100% (start)" in l), None)
+check(st.get("micvol") == 65536 and mic is not None and first_dial < mic < first_add,
+      "car mic 0% raised to 100% before imsd Dial, left at 100%")
+check("car side read call" in log, "PipeWire read the call state (diagnostic logged)")
 sys.exit(0 if ok else 1)
 PY
 fi

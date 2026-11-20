@@ -12,7 +12,7 @@ try:
     st = json.load(open(P))
 except (OSError, ValueError):
     st = {"profile": "a2dp-sink", "sink": SINK, "source": "alsa_input.mic", "wait": 0, "sco": False,
-          "mute": {SINK: True}}
+          "mute": {SINK: True}, "micvol": 0}  # 16:04 phone: car HFP mic route at 0%
 a = sys.argv[1:]
 with open(P + ".log", "a") as f:
     f.write("%.3f %s\n" % (time.monotonic(), " ".join(a)))
@@ -41,8 +41,10 @@ if a[:3] == ["-f", "json", "list"]:
                 st["sco"] = True
         out = sinks()
     elif w == "sources":
+        v = st.get("micvol", 0)
         out = [{"index": 10, "name": "alsa_input.mic", "mute": False, "properties": {}},
                {"index": 11, "name": LOOP, "mute": False,
+                "volume": {"mono": {"value": v, "value_percent": "%d%%" % round(v * 100 / 65536)}},
                 "properties": {"device.id": str(IDX), "bluez5.loopback": "true"}}]
     else:
         out = []
@@ -53,6 +55,8 @@ elif a and a[0] == "set-card-profile":
     st["profile"], st["sco"], st["wait"] = a[2], False, 2
 elif a and a[0] in ("set-default-sink", "set-default-source"):
     st[a[0].rsplit("-", 1)[1]] = a[1]
+elif a and a[0] == "set-source-volume" and a[1] == LOOP:
+    st["micvol"] = round(int(a[2].rstrip("%")) * 65536 / 100)
 elif a and a[0] == "set-sink-mute":
     st["mute"][a[1]] = a[2] == "1"
 elif a and a[0].startswith(("move-", "set-source-mute")):

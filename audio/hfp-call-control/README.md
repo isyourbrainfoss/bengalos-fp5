@@ -1,7 +1,9 @@
 # Car call control over Bluetooth HFP (FP5, BengalOS 0.26.1118.1)
 
 Status: 294e54f installed 2026-11-20 12:26; v1 (32365cc) tested 12:56 and rolled back;
-**v2 staged, not installed** (offline tests + on-phone dry run).
+v2 (08c6789) installed 2026-11-20 16:03:54, car test 16:04: downlink OK, **uplink silent**,
+car hangup not seen by the bridge, call not shown on the phone.
+**v3 staged, not installed** (offline tests + on-phone dry run), see "v3" below.
 aarch64 plugin built from Debian pipewire 1.6.9-2 (= the phone's build), see `build/`.
 Needs Kristian's yes for install, the WirePlumber restart and the first car test.
 
@@ -90,6 +92,50 @@ phone. It does not help when we are the AG.
    - `FP5_HFP_AUDIO=off|dry`.
    - Side note: the stock `qcom-call-audio-idle-suspend-workaround.sh` reacts to the bridge's
      call signals (two `pw-loopback`s on incoming calls); they do not touch the defaults.
+
+## v3 (2026-11-20, after the 16:04 car test)
+Findings (read-only, phone logs and state):
+- **Uplink silent = car mic volume 0 %.** WirePlumber's saved route for the car
+  (`default-routes`, `input:handsfree-input`) is `channelVolumes [0.000000]`, `mute: false`.
+  The loopback source `bluez_input.<addr>` (`device.routes=1`, `card.profile.device=0`, so the
+  route volume *is* its volume; flags HARDWARE) shows `0% / -inf dB`. pw-record was correctly
+  linked to it (bridge log "pw-record 16000Hz is on car"; SCO source node `running` until hangup),
+  but recorded silence, or the car was told `+VGM=0`. v2 only unmuted; it never looked at the
+  volume. How the route got to 0 is unproven (likely the car's `AT+VGM=0`, which PipeWire turns
+  into the input volume, then WirePlumber saves and restores it every call).
+- **Call not on the phone = gnome-calls 51.1 bug.** Its oFono provider removes the origin when
+  org.ofono vanishes but keeps the modem in its table. When imsd-ofonod comes back:
+  "Modem `/imsd' already exists" and no new origin. imsd-ofonod vanished at 15:59:18 and came
+  back at 16:02:43; at 16:04:34 "Adding call `/imsd/voicecall01'" was followed by
+  `G_IS_DBUS_CONNECTION` assertions and the call never reached the UI. The same bug crashed
+  calls-daemon (SEGV) on the first imsd call after an imsd-ofonod restart at 08:40, 09:15 and 12:27.
+  Upstream-style fix: `gnome-calls/0001-ofono-forget-modems-when-oFono-vanishes.patch`
+  (against 51.1, **not built, not deployed**).
+- **Car hangup:** the bridge got no `Hangup` (it logs every one). Either the car sent no
+  `AT+CHUP`, or PipeWire refused it (`mm_hangup_call` finds no active call; only a debug log).
+  Not provable without WirePlumber debug logs, and those would contain the phone number.
+  Note: Kristian's words were "couldn't hang up from the Fairphone 5" - with no call UI
+  (above) that is expected; whether the car's red button was tried is to be asked.
+- fp5-call-mic (mic v3) did not run for this call. That is expected: it is started by the
+  Voice Call UCM device, which a car (BT) call does not use, and it skips car calls anyway.
+
+Changes:
+- `fp5_hfp_audio.py`: car mic floor. When the car becomes the default source (before imsd
+  Dial) and every 2 s while the call lasts (read-only unless needed, at most 6 writes per
+  call): car mic < 10 % -> `pactl set-source-volume <loopback> 100%`. imsd-media's
+  pw-record stream: unmute / 100 % if muted or < 10 %. Not put back at call end (0 % = dead
+  mic; WirePlumber then saves 100 %). Logs "car mic volume N% -> 100% (start|during call)" and
+  "mic was N%" in the ready line.
+- `fp5-hfp-modem-bridge`: gnome-calls refresh. After imsd-ofonod comes back (and at start-up
+  if the running gnome-calls already logged "Ofono vanished from D-Bus"), wait 5 s and, only
+  when no call is live, `systemctl --user try-restart calls-daemon.service`. During a call it
+  waits for the call to end. Off switch: `FP5_CALLS_REFRESH=off` (service Environment) or
+  `--calls-refresh off`. Diagnostics: logs once per call "car side read call fp5imsdN (state
+  S)" (PipeWire saw the call) and "car: <method> on unknown call" (car command for a stale call).
+- Tests: 14 new unit tests (mic floor at start / mid-call / cap / not restored / per call /
+  pw-record stream / vol_pct / no node names; refresher idle-only, never during a call,
+  start-up detection, failed restart, bridge wiring). Harness with fake pactl now starts with
+  the car mic at 0 % and checks it is 100 % before imsd Dial.
 
 Not covered: `AT+BLDN` (redial from the car) stays ERROR outside PTS mode (upstream behaviour).
 Three-way calling (`AT+CHLD`) is not supported by the native AG either.

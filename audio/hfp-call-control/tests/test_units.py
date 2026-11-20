@@ -27,8 +27,9 @@ class FakePactl:
       on the phone mic all along.
     Indices: sinks speaker=1 car=2; sources mic=10 car loopback=11."""
     def __init__(self, profile="a2dp-sink", sink=SINK, source="alsa_input.mic", node_delay=0,
-                 sco_ever=True, muted=True):
+                 sco_ever=True, muted=True, mic_vol=65536):
         self.profile, self.default_sink, self.default_source = profile, sink, source
+        self.mic_vol = mic_vol       # loopback (= car HFP input route) volume, pactl units
         self.calls, self.muted = [], {SINK: muted}
         self.card_gone = False
         self.node_delay, self.sco_ever = node_delay, sco_ever
@@ -93,6 +94,8 @@ class FakePactl:
             s = [{"index": 10, "name": "alsa_input.mic", "properties": {}, "mute": False}]
             if not self.card_gone:
                 s.append({"index": 11, "name": LOOP, "mute": False,
+                          "volume": {"mono": {"value": self.mic_vol,
+                                              "value_percent": "%d%%" % round(self.mic_vol * 100 / 65536)}},
                           "properties": {"device.id": str(CAR_IDX), "bluez5.loopback": "true",
                                          "media.class": "Audio/Source"}})
                 s.append({"index": 12, "name": SINK + ".monitor", "mute": False,
@@ -119,6 +122,15 @@ class FakePactl:
             self.default_source = a[1]
         elif a[0] == "set-sink-mute":
             self.muted[a[1]] = a[2] == "1"
+        elif a[0] == "set-source-volume" and a[1] == LOOP:
+            self.mic_vol = round(int(a[2].rstrip("%")) * 65536 / 100)
+        elif a[0] in ("set-source-output-volume", "set-source-output-mute"):
+            for s in self.outputs:
+                if str(s["index"]) == a[1]:
+                    if a[0].endswith("mute"):
+                        s["mute"] = a[2] == "1"
+                    else:
+                        s["volume"] = {"mono": {"value": round(int(a[2].rstrip("%")) * 65536 / 100)}}
         elif a[0] in ("move-source-output", "move-sink-input"):
             lst, field, nodes = ((self.outputs, "source", self.json("sources")) if a[0] == "move-source-output"
                                  else (self.inputs, "sink", self._sinks()))
@@ -252,6 +264,74 @@ class AudioRouterTest(unittest.TestCase):
         n = len(self.p.calls)
         self.r.calls_changed(2)      # second call: nothing re-done
         self.assertEqual(self.p.calls[n:], [])
+
+    # ---- v3: car mic volume floor (car test 2026-11-20 16:04) ----
+    def test_zero_car_mic_raised_before_dial(self):
+        """Phone at 16:04: loopback 0% (route handsfree-input 0.0, mute=false)."""
+        self.p.mic_vol = 0
+        order = []
+        self.r.prepare(lambda: order.append(self.p.mic_vol))
+        self.assertEqual(order, [65536], "car mic at 100% before imsd Dial")
+        self.assertIn(("set-source-volume", LOOP, "100%"), self.p.calls)
+        self.assertTrue(any("car mic volume 0% -> 100% (start)" in l for l in self.logs), self.logs)
+        self.assertTrue(any("mic was 0%" in l for l in self.logs))
+
+    def test_good_car_mic_not_touched(self):
+        self.p.mic_vol = 40000
+        self.r.calls_changed(1)
+        self.p.spawn()
+        self.r._watch_step()
+        self.r._mic_guard_step()
+        self.assertEqual(self.p.acts("set-source-volume", "set-source-output"), [])
+
+    def test_car_mic_dropping_mid_call_raised_capped(self):
+        self.r.calls_changed(1)
+        self.p.spawn()
+        self.r._watch_step()
+        for _ in range(A.MIC_FIX_MAX + 3):
+            self.p.mic_vol = 0      # e.g. the car sends AT+VGM=0 again
+            self.r._mic_guard_step()
+        self.assertEqual(len(self.p.acts("set-source-volume")), A.MIC_FIX_MAX)
+        self.assertEqual(sum("giving up" in l for l in self.logs), 1)
+
+    def test_car_mic_not_put_back_to_zero_at_end(self):
+        self.p.mic_vol = 0
+        self.r.calls_changed(1)
+        self.r.calls_changed(0)
+        self.assertEqual(self.p.mic_vol, 65536)
+        self.assertEqual(self.p.acts("set-source-volume"), [("set-source-volume", LOOP, "100%")])
+
+    def test_fix_counter_resets_per_call(self):
+        for _ in range(2):
+            self.p.mic_vol = 0
+            self.r.calls_changed(1)
+            self.r.calls_changed(0)
+        self.assertEqual(len(self.p.acts("set-source-volume")), 2)
+
+    def test_muted_or_silent_pw_record_stream_fixed(self):
+        self.r.calls_changed(1)
+        self.p.spawn()
+        rec = self.p.stream(self.p.outputs, "pw-record")
+        rec["mute"], rec["volume"] = True, {"mono": {"value": 0}}
+        self.r._watch_step()
+        self.assertIn(("set-source-output-mute", "50", "0"), self.p.calls)
+        self.assertIn(("set-source-output-volume", "50", "100%"), self.p.calls)
+        self.assertNotIn(("set-source-output-mute", "51", "0"), self.p.calls, "fp5-call-mic parecord untouched")
+
+    def test_vol_pct(self):
+        self.assertEqual(A.vol_pct({"volume": {"mono": {"value": 0, "value_percent": "0%"}}}), 0)
+        self.assertEqual(A.vol_pct({"volume": {"front-left": {"value": 65536}, "front-right": {"value": 32768}}}), 100)
+        self.assertEqual(A.vol_pct({"volume": {"mono": {"value_percent": "35%"}}}), 35)
+        self.assertIsNone(A.vol_pct({}))
+        self.assertIsNone(A.vol_pct({"volume": "x"}))
+
+    def test_mic_logs_no_node_names(self):
+        self.p.mic_vol = 0
+        self.r.prepare(lambda: None)
+        self.r.calls_changed(1)
+        self.p.mic_vol = 0
+        self.r._mic_guard_step()
+        self.assertFalse([l for l in self.logs if "bluez_" in l or "XX" in l], self.logs)
 
     def test_unmute_only_when_muted(self):
         self.p.muted[SINK] = False
@@ -502,6 +582,77 @@ class SinkPrefTest(unittest.TestCase):
         self.p.default_sink = "alsa_output.speaker"
         self.r.idle_check()
         self.assertEqual(self.p.default_sink, "alsa_output.speaker")
+
+
+class CallsRefresherTest(unittest.TestCase):
+    """gnome-calls 51.1 keeps a dead oFono modem after imsd-ofonod restarts."""
+    def setUp(self):
+        self.busy = [False]
+        self.runs, self.logs = [], []
+        self.rc = 0
+        self.journal = ""
+        def run(argv, timeout=10):
+            self.runs.append(argv)
+            if argv[:2] == ["systemctl", "--user"] and "show" in argv:
+                return 0, "4242\n"
+            if argv[0] == "journalctl":
+                return 0, self.journal
+            return self.rc, ""
+        self.f = bridge.CallsRefresher(lambda: self.busy[0], run=run, timers=False, log=self.logs.append)
+
+    def restarts(self):
+        return [a for a in self.runs if "try-restart" in a]
+
+    def test_restart_after_ofono_comes_back_idle(self):
+        self.f.ofono_back()                      # first appearance: gnome-calls fine
+        self.assertEqual(self.restarts(), [])
+        self.f.ofono_gone()
+        self.assertEqual(self.restarts(), [], "not while org.ofono is away")
+        self.f.ofono_back()
+        self.assertEqual(self.restarts(), [["systemctl", "--user", "try-restart", "calls-daemon.service"]])
+        self.f.ofono_gone(); self.f.ofono_back()
+        self.assertEqual(len(self.restarts()), 2)
+
+    def test_never_during_a_call(self):
+        self.f.ofono_gone()
+        self.busy[0] = True
+        self.f.ofono_back()
+        self.assertEqual(self.restarts(), [])
+        self.f.calls_idle()                      # still busy
+        self.assertEqual(self.restarts(), [])
+        self.busy[0] = False
+        self.f.calls_idle()
+        self.assertEqual(len(self.restarts()), 1)
+        self.assertEqual(sum("waiting for the call" in l for l in self.logs), 1)
+
+    def test_startup_detects_stale_instance(self):
+        self.journal = "Adding modem `/imsd'\nOfono vanished from D-Bus\nModem `/imsd' already exists\n"
+        self.assertTrue(self.f.startup_check())
+        self.assertIn(["journalctl", "--user", "-b", "_PID=4242", "-o", "cat", "--no-pager"], self.runs)
+        self.f.ofono_back()
+        self.assertEqual(len(self.restarts()), 1)
+
+    def test_startup_fresh_instance_left_alone(self):
+        self.journal = "Adding modem `/imsd'\n"
+        self.assertFalse(self.f.startup_check())
+        self.f.ofono_back()
+        self.assertEqual(self.restarts(), [])
+
+    def test_failed_restart_stays_stale_and_logs(self):
+        self.rc = 5
+        self.f.ofono_gone(); self.f.ofono_back()
+        self.assertTrue(self.f.stale)
+        self.assertTrue(any("FAILED" in l for l in self.logs))
+
+    def test_bridge_wiring(self):
+        b = bridge.Bridge(None, None, None)
+        b.refresher = self.f
+        b._modem_changed = lambda *a: None
+        b._ofono_vanished(None, "org.ofono")     # initial "not there": not stale
+        self.assertFalse(self.f.stale)
+        b._ofono_seen = True
+        b._ofono_vanished(None, "org.ofono")
+        self.assertTrue(self.f.stale)
 
 
 class BridgeHelpersTest(unittest.TestCase):

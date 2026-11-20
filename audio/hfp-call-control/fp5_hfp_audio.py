@@ -37,6 +37,19 @@
 #   end        last call gone (or at start-up with a stale state file = crash
 #              recovery, or a prepared dial that never became a call):
 #              card -> remembered profile (a2dp-sink); defaults back; unmute.
+# v3 (car test 2026-11-20 16:04: far end heard nothing although pw-record
+# was on the car loopback): the car's HFP input route had volume 0.0
+# (WirePlumber default-routes "input:handsfree-input" = 0.000000, mute=false;
+# the loopback source bluez_input.<addr> showed 0% / -inf dB). The loopback
+# has device.routes=1, so the route volume IS its volume: pw-record got
+# digital silence (or the car was told +VGM=0). v2 only unmuted, it never
+# looked at the volume. Now:
+#   mic floor  when the car is made the default source, and while the call
+#              lasts (read every 2 s, write only when needed, at most
+#              MIC_FIX_MAX times per call): car mic below MIC_FLOOR_PCT ->
+#              100%. imsd-media's pw-record stream: unmute / 100% if it is
+#              muted or below the floor. Not put back at call end (0% is a
+#              dead mic; WirePlumber then saves 100% for the route).
 # Idle: if WirePlumber restarts (or the bridge starts) while the car is the
 # default sink, put it back as default once its A2DP sink reappears.
 # Never touches the ALSA card, mixers or the modem. Never logs node names
@@ -54,6 +67,11 @@ WATCH_EVERY_MS = 1000
 WATCH_LIMIT_MS = 90000
 IDLE_POLL_MS = 5000
 SINK_GRACE_S = 90
+MIC_FLOOR_PCT = 10            # car mic (route/loopback) below this = dead mic
+MIC_TARGET = "100%"
+MIC_GUARD_MS = 2000           # read-only check while a call lasts
+MIC_GUARD_LIMIT_MS = 6 * 3600 * 1000
+MIC_FIX_MAX = 6               # writes per call, then only log
 # the call media helpers imsd-media spawns (MIC_BACKEND=pw)
 CALL_CAPTURE_APPS = ("pw-record", "pw-cat")
 CALL_PLAYBACK_APPS = ("pw-play", "pw-cat")
@@ -105,6 +123,27 @@ def _props(item):
 
 def _true(v):
     return str(v).lower() in ("true", "1", "yes")
+
+
+def vol_pct(item):
+    """Highest channel volume of a pactl json node/stream in percent, or None."""
+    vol = item.get("volume")
+    if not isinstance(vol, dict) or not vol:
+        return None
+    out = []
+    for ch in vol.values():
+        if not isinstance(ch, dict):
+            continue
+        if "value" in ch:
+            try:
+                out.append(int(ch["value"]) * 100.0 / 65536)
+                continue
+            except (TypeError, ValueError):
+                pass
+        m = re.match(r"\s*(\d+)%", str(ch.get("value_percent", "")))
+        if m:
+            out.append(float(m.group(1)))
+    return max(out) if out else None
 
 
 def bt_cards(cards):
@@ -201,6 +240,8 @@ class AudioRouter:
         self.gen = 0              # bumps on restore: stale callbacks do nothing
         self.after_engage = None
         self.restoring = None     # state whose defaults are still to be put back
+        self.mic_fixes = 0        # car mic volume corrections this call
+        self.mic_guarding = False
 
     # ---- state file ----
     def _load(self):
@@ -347,6 +388,7 @@ class AudioRouter:
         self.ready = self.engaging = self.profile_asked = False
         self.after_engage = None
         self.seen = set()
+        self.mic_fixes, self.mic_guarding = 0, False
         self.restore()
 
     # ---- engage: profile + defaults, once ----
@@ -407,12 +449,51 @@ class AudioRouter:
             self.p.set("set-default-source", src["name"])
         if src.get("mute"):
             self.p.set("set-source-mute", src["name"], "0")
+        self._mic_floor(src, "start")
         self.ready = True
-        self.log("call: car is default sink+source (codec %s, %s source) after %d ms"
+        v = vol_pct(src)
+        self.log("call: car is default sink+source (codec %s, %s source, mic was %s) after %d ms"
                  % (_props(sink).get("api.bluez5.codec", "?"),
                     "loopback" if _true(_props(src).get("bluez5.loopback")) else "plain",
+                    "?" if v is None else "%d%%" % round(v),
                     (time.monotonic() - self.t_engage) * 1000))
         return True
+
+    # ---- car mic volume floor (v3) ----
+    def _mic_floor(self, src, why):
+        """src: pactl json of the car source. Raise it to MIC_TARGET when it is
+        below MIC_FLOOR_PCT. Returns True if it wrote."""
+        v = vol_pct(src)
+        if v is None or v >= MIC_FLOOR_PCT:
+            return False
+        if self.mic_fixes >= MIC_FIX_MAX:
+            if self.mic_fixes == MIC_FIX_MAX:
+                self.mic_fixes += 1
+                self.log("call: car mic volume keeps dropping (%d%%); giving up for this call" % round(v))
+            return False
+        self.mic_fixes += 1
+        ok = self.p.set("set-source-volume", src["name"], MIC_TARGET)
+        self.log("call: car mic volume %d%% -> %s (%s)%s" % (round(v), MIC_TARGET, why, "" if ok else " FAILED"))
+        return ok
+
+    def _start_mic_guard(self):
+        if self.mic_guarding:
+            return
+        self.mic_guarding = True
+        self._poll(MIC_GUARD_MS, MIC_GUARD_LIMIT_MS, self._mic_guard_step)
+
+    def _mic_guard_step(self):
+        """Read-only unless the car mic dropped below the floor mid-call."""
+        if not self.live:
+            return True
+        st = self._load()
+        if not st:
+            return True
+        card = st["card"]
+        src = car_source(card, card_index(self.p.json("cards"), card), self.p.json("sources"))
+        if src is not None:
+            self._mic_floor(src, "during call")
+        return not self.timers  # tests: one step; phone: until the call ends
 
     # ---- watch: where did imsd-media's streams land? one move at most ----
     def _start_watch(self):
@@ -420,6 +501,7 @@ class AudioRouter:
         if not st:
             return
         self.seen = set()
+        self._start_mic_guard()
         self._poll(WATCH_EVERY_MS, WATCH_LIMIT_MS, self._watch_step,
                    lambda ok: ok or self.log("call: imsd-media streams not all seen (rec=%s play=%s)"
                                              % tuple("yes" if k in {x[0] for x in self.seen} else "no"
@@ -455,6 +537,14 @@ class AudioRouter:
             if where != "car" and target is not None:
                 if self.p.set("move-" + kind, str(s.get("index")), target["name"]):
                     self.log("call: %s #%s moved once -> %s" % (kind, s.get("index"), what))
+            if kind == "source-output":
+                if s.get("mute"):
+                    self.p.set("set-source-output-mute", str(s.get("index")), "0")
+                    self.log("call: %s #%s was muted -> unmuted" % (kind, s.get("index")))
+                v = vol_pct(s)
+                if v is not None and v < MIC_FLOOR_PCT:
+                    self.p.set("set-source-output-volume", str(s.get("index")), MIC_TARGET)
+                    self.log("call: %s #%s volume %d%% -> %s" % (kind, s.get("index"), round(v), MIC_TARGET))
 
     # ---- restore ----
     def restore(self):

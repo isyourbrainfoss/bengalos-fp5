@@ -40,7 +40,20 @@
 # car-dialled call this happens BEFORE imsd Dial. No mid-call re-assert; one
 # move at most for a stream found off the car. Restore A2DP + defaults +
 # unmute afterwards, also after a crash.
-import argparse, os, re, signal, sys, syslog
+#
+# v3 (car test 2026-11-20 16:04):
+# - car mic volume floor in fp5_hfp_audio (the car's HFP input route was 0%).
+# - gnome-calls refresh: gnome-calls 51.1's oFono provider forgets the origin
+#   when org.ofono vanishes but keeps the modem in its table, so when
+#   imsd-ofonod comes back ("Modem `/imsd' already exists") calls are added
+#   to a dead origin: no call UI (16:04, assertion G_IS_DBUS_CONNECTION) or a
+#   calls-daemon SEGV (08:40, 09:15, 12:27). imsd-ofonod restarts many times a
+#   day. After it comes back and no call is live, `systemctl --user
+#   try-restart calls-daemon` (FP5_CALLS_REFRESH=off to disable). Also at
+#   start-up if the running gnome-calls already logged "Ofono vanished".
+# - diagnostics: log once when PipeWire reads a call's state, and log car
+#   commands for unknown call objects (car hangup at 16:05 left no trace).
+import argparse, os, re, signal, subprocess, sys, syslog
 
 import gi
 gi.require_version("Gio", "2.0")
@@ -176,12 +189,101 @@ class Call:
                 "Multiparty": GLib.Variant("b", self.multiparty)}
 
 
+CALLS_UNIT = "calls-daemon.service"
+CALLS_STALE_MARK = "Ofono vanished from D-Bus"
+REFRESH_DELAY_S = 5
+
+
+def _run(argv, timeout=10):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return -1, ""
+
+
+class CallsRefresher:
+    """Restart gnome-calls (calls-daemon) when it holds a dead oFono modem.
+    stale: gnome-calls has seen org.ofono vanish since it started. Restart
+    only once org.ofono is back and no call is live; never during a call."""
+    def __init__(self, busy, run=_run, timers=True, log=None, delay_s=REFRESH_DELAY_S):
+        self.busy, self.run, self.timers = busy, run, timers
+        self.log = log or (lambda m: None)
+        self.delay_s = delay_s
+        self.stale = False
+        self.ofono_up = False
+        self.timer = None
+        self.waiting = False
+        self.restarts = 0
+
+    def startup_check(self):
+        """Does the running gnome-calls already hold a dead modem? Only a fixed
+        string is looked for in its own journal lines; nothing is logged."""
+        rc, out = self.run(["systemctl", "--user", "show", "-p", "MainPID", "--value", CALLS_UNIT])
+        pid = out.strip() if rc == 0 else ""
+        if not pid.isdigit() or pid == "0":
+            return False
+        rc, out = self.run(["journalctl", "--user", "-b", "_PID=" + pid, "-o", "cat", "--no-pager"], 20)
+        if rc == 0 and CALLS_STALE_MARK in out:
+            self.stale = True
+            self.log("gnome-calls: running instance lost oFono earlier (stale modem); refresh when idle")
+        return self.stale
+
+    def ofono_gone(self):
+        self.ofono_up = False
+        self.stale = True
+        self._cancel()
+
+    def ofono_back(self):
+        self.ofono_up = True
+        self._schedule()
+
+    def calls_idle(self):
+        if self.waiting:
+            self._schedule()
+
+    def _cancel(self):
+        if self.timer is not None and self.timers:
+            GLib.source_remove(self.timer)
+        self.timer = None
+
+    def _schedule(self):
+        if not self.stale or not self.ofono_up or self.timer is not None:
+            return
+        if not self.timers:
+            return self._fire()
+        def cb():
+            self.timer = None
+            self._fire()
+            return False
+        self.timer = GLib.timeout_add_seconds(self.delay_s, cb)
+
+    def _fire(self):
+        if not self.stale or not self.ofono_up:
+            return False
+        if self.busy():
+            if not self.waiting:
+                self.log("gnome-calls: stale oFono modem, waiting for the call to end before refreshing")
+            self.waiting = True
+            return False
+        self.waiting = False
+        rc, _ = self.run(["systemctl", "--user", "try-restart", CALLS_UNIT], 30)
+        self.stale = rc != 0
+        self.restarts += rc == 0
+        self.log("gnome-calls: %s after imsd-ofonod came back (stale oFono modem)"
+                 % ("restarted" if rc == 0 else "restart FAILED rc=%d" % rc))
+        return rc == 0
+
+
 class Bridge:
-    def __init__(self, bus, ofono_bus, mm_bus, audio=None, allow_uids=None):
+    def __init__(self, bus, ofono_bus, mm_bus, audio=None, allow_uids=None, refresher=None):
         self.bus = bus
         self.ofono_bus = ofono_bus
         self.mm_bus = mm_bus
         self.audio = audio
+        self.refresher = refresher
+        self.read_logged = set()  # calls whose state PipeWire has read (logged once)
+        self._ofono_seen = False
         self.allow_uids = allow_uids if allow_uids is not None else {0, os.getuid()}
         self.calls = {}          # ofono path -> Call
         self.next_idx = 0
@@ -240,6 +342,9 @@ class Bridge:
             return self.modem_props(iface).get(prop)
         for c in self.calls.values():
             if c.path == path:
+                if prop == "State" and c.path not in self.read_logged:
+                    self.read_logged.add(c.path)
+                    log("car side read call %s (state %d)" % (c.path.rsplit("/", 1)[-1], c.state))
                 return c.props().get(prop)
         return None
 
@@ -282,6 +387,7 @@ class Bridge:
             call = next((c for c in self.calls.values() if c.path == path), None)
             if iface == IF_CALL:
                 if call is None:
+                    log("car: %s on unknown call %s" % (method, path.rsplit("/", 1)[-1]), syslog.LOG_WARNING)
                     return inv.return_dbus_error(ERR_FAILED, "no such call")
                 if method == "Start":
                     return inv.return_value(None)  # oFono Dial already started it
@@ -510,10 +616,15 @@ class Bridge:
         for opath in [k for k, c in self.calls.items() if c.origin == origin]:
             self._remove_call(opath)
 
+    def live_calls(self):
+        return [c for c in self.calls.values() if c.state != MM_CALL_STATE_TERMINATED]
+
     def _audio(self):
+        live = self.live_calls()
         if self.audio:
-            live = [c for c in self.calls.values() if c.state != MM_CALL_STATE_TERMINATED]
             self.audio.calls_changed(len(live))
+        if self.refresher and not live:
+            self.refresher.calls_idle()
 
     # ---------------- oFono (imsd-ofonod) side ----------------
     def watch_ofono(self):
@@ -531,6 +642,9 @@ class Bridge:
 
     def _ofono_appeared(self, conn, name, owner):
         log("imsd-ofonod appeared")
+        self._ofono_seen = True
+        if self.refresher:
+            self.refresher.ofono_back()
         conn.call("org.ofono", "/", "org.ofono.Manager", "GetModems", None,
                   GLib.VariantType("(a(oa{sv}))"), Gio.DBusCallFlags.NONE, 5000, None, self._got_modems)
 
@@ -561,6 +675,8 @@ class Bridge:
             log("GetCalls failed: %s" % errname(e), syslog.LOG_WARNING)
 
     def _ofono_vanished(self, conn, name):
+        if self._ofono_seen and self.refresher:
+            self.refresher.ofono_gone()
         if self.ofono_modem:
             log("imsd-ofonod vanished")
         self.ofono_modem = None
@@ -737,6 +853,8 @@ def main(argv=None):
     ap.add_argument("--ofono-bus", choices=("system", "session"), default="system")
     ap.add_argument("--mm-bus", choices=("system", "session", "none"), default="system")
     ap.add_argument("--audio", choices=("on", "off", "dry"), default=os.environ.get("FP5_HFP_AUDIO", "on"))
+    ap.add_argument("--calls-refresh", choices=("on", "off"), default=os.environ.get("FP5_CALLS_REFRESH", "on"),
+                    help="restart gnome-calls when it holds a dead oFono modem (idle only)")
     ap.add_argument("--print", action="store_true", help="log to stderr instead of syslog")
     a = ap.parse_args(argv)
     _print = a.print
@@ -752,6 +870,9 @@ def main(argv=None):
         import fp5_hfp_audio
         audio = fp5_hfp_audio.AudioRouter(dry=(a.audio == "dry"), log=log)
     bridge = Bridge(get(a.bus), get(a.ofono_bus), get(a.mm_bus), audio=audio)
+    if a.calls_refresh == "on" and a.bus == "system":
+        bridge.refresher = CallsRefresher(lambda: bool(bridge.live_calls()), log=log)
+        bridge.refresher.startup_check()
     bridge.export()
     loop = GLib.MainLoop()
 
