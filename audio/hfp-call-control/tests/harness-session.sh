@@ -29,6 +29,8 @@ if grep -E '12345678|87654321|99912345|55556666|22223333|4799999999|350000000000
     echo "FAIL private data in bridge log"; rc=1; else echo "PASS no numbers/IMEI/operator code in bridge log"; fi
 if grep -E 'OWN_NUMBER_LEAK|operator 24299' "$L/fp5-harness.out"; then
     echo "FAIL own number/operator code reached PipeWire"; rc=1; else echo "PASS PipeWire never sees own number/operator code"; fi
+grep -q "car: hang up all" "$L/fp5-bridge.log" && echo "PASS v4 CHUP fallback reached the bridge (HangupAll)" || { echo "FAIL v4 CHUP fallback"; rc=1; }
+grep -q "car: dial accepted after" "$L/fp5-bridge.log" && echo "PASS v4 dial latency logged" || { echo "FAIL v4 dial latency log"; rc=1; }
 grep -q '^operator TestNet' "$L/fp5-harness.out" && echo "PASS operator name mirrored" || { echo "FAIL operator name"; rc=1; }
 if kill -0 $B 2>/dev/null; then echo "bridge alive"; else wait $B; echo "bridge DIED rc=$?"; rc=1; fi
 if [ "$AUDIO" = on ]; then

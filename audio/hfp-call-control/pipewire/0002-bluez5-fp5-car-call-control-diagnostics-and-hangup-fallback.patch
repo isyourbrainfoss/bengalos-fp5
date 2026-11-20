@@ -1,0 +1,169 @@
+From: fp5 <noreply@isyourbrainfoss>
+Subject: [PATCH 2/2] bluez5: fp5 car call-control diagnostics (number-free) and hang-up fallback
+
+Why: the Tesla red button did not end VoLTE calls (20.11 16:05 and 16:41)
+and nothing showed which AT command (if any) arrived: PipeWire logs AT
+commands only at debug level, which also prints phone numbers.
+- warn-level, number-free line for every call-control command from the car
+  (ATA, ATD without digits, AT+CHUP, AT+CHLD=n, AT+BLDN, AT+BVRA=n, AT+CKPD),
+  for every unsupported command (name only) and every ERROR sent back;
+- AT+CHUP: log the call list (count + CLCC states); if no active/setup call
+  matches, hang up the first known call; if none is known and the service is
+  not ModemManager itself, ask it for Voice.HangupAll;
+- AT+CHLD=0 / AT+CHLD=1[x] are treated as hang up (cars that use CHLD).
+Applies on top of 0001.
+---
+diff --git a/spa/plugins/bluez5/backend-native.c b/spa/plugins/bluez5/backend-native.c
+index 7c5fcef..bc96fae 100644
+--- a/spa/plugins/bluez5/backend-native.c
++++ b/spa/plugins/bluez5/backend-native.c
+@@ -657,6 +657,7 @@ static ssize_t rfcomm_send_reply(const struct rfcomm *rfcomm, const char *format
+ 
+ static void rfcomm_send_error(const struct rfcomm *rfcomm, enum cmee_error error)
+ {
++	spa_log_warn(rfcomm->backend->log, "fp5: answering car with ERROR %d", (int)error);
+ 	if (rfcomm->extended_error_reporting)
+ 		rfcomm_send_reply(rfcomm, "+CME ERROR: %d", error);
+ 	else
+@@ -1088,6 +1089,32 @@ static void rfcomm_hfp_ag_set_cind(struct rfcomm *rfcomm, bool call_active)
+ 	rfcomm_send_reply(rfcomm, "+CIEV: 2,%d", rfcomm->cind_call_active);
+ }
+ 
++/* fp5: the AT command name only (letters, '+', '=', '?'), never digits or
++ * dial strings, so it can be logged at the default level without leaking a
++ * phone number. "ATD<number>;" becomes "ATD", "AT+CHLD=1" stays "AT+CHLD=1"
++ * (a single digit argument is kept for call-control commands). */
++static void fp5_at_name(const char *buf, char *out, size_t size)
++{
++	size_t i = 0, j = 0;
++	if (size == 0)
++		return;
++	if (spa_strstartswith(buf, "ATD")) {
++		snprintf(out, size, "ATD");
++		return;
++	}
++	for (; buf[i] && j + 1 < size && i < 16; i++) {
++		char c = buf[i];
++		if ((c >= 'A' && c <= 'Z') || c == '+' || c == '=' || c == '?')
++			out[j++] = c;
++		else
++			break;
++	}
++	if ((spa_strstartswith(buf, "AT+CHLD=") || spa_strstartswith(buf, "AT+BVRA=")) &&
++			buf[i] >= '0' && buf[i] <= '9' && j + 1 < size)
++		out[j++] = buf[i];
++	out[j] = '\0';
++}
++
+ static bool rfcomm_hfp_ag(struct rfcomm *rfcomm, char* buf)
+ {
+ 	struct impl *backend = rfcomm->backend;
+@@ -1104,6 +1131,18 @@ static bool rfcomm_hfp_ag(struct rfcomm *rfcomm, char* buf)
+ 	int xapl_product;
+ 	int xapl_features;
+ 
++	if (spa_strstartswith(buf, "ATA") || spa_strstartswith(buf, "ATD") ||
++			spa_strstartswith(buf, "AT+CHUP") || spa_strstartswith(buf, "AT+CHLD") ||
++			spa_strstartswith(buf, "AT+BLDN") || spa_strstartswith(buf, "AT+BVRA") ||
++			spa_strstartswith(buf, "AT+CKPD")) {
++		char name[24];
++		fp5_at_name(buf, name, sizeof(name));
++		spa_log_warn(backend->log, "fp5: car sent %s (modem %s, network %s, call %d, callsetup %d)",
++				name, mm_is_available(backend->modemmanager) ? "yes" : "no",
++				backend->modem.network_has_service ? "yes" : "no",
++				backend->modem.active_call, backend->modem.call_setup);
++	}
++
+ 	if (sscanf(buf, "AT+BRSF=%u", &features) == 1) {
+ 		unsigned int ag_features = SPA_BT_HFP_AG_FEATURE_NONE;
+ 
+@@ -1490,6 +1529,17 @@ next_indicator:
+ 	} else if (spa_strstartswith(buf, "AT+CHUP")) {
+ 		enum cmee_error error;
+ 
++		if (!mm_hangup_call(backend->modemmanager, rfcomm, &error)) {
++			rfcomm_send_error(rfcomm, error);
++			return true;
++		}
++	} else if (spa_strstartswith(buf, "AT+CHLD=0") || spa_strstartswith(buf, "AT+CHLD=1")) {
++		/* fp5: we never advertise 3-way calling, but some cars still use
++		 * AT+CHLD=1 (release active) / =0 (release held/waiting) as their
++		 * red button. With one call there is nothing else to release, so
++		 * treat both as hang up. */
++		enum cmee_error error;
++
+ 		if (!mm_hangup_call(backend->modemmanager, rfcomm, &error)) {
+ 			rfcomm_send_error(rfcomm, error);
+ 			return true;
+@@ -2553,8 +2603,12 @@ static void rfcomm_process_events(struct rfcomm *rfcomm, char *buf, bool ag, boo
+ 
+ 		if (!handler(rfcomm, token)) {
+ 			spa_log_debug(backend->log, "RFCOMM received unsupported event: %s", token);
+-			if (ag)
++			if (ag) {
++				char name[24];
++				fp5_at_name(token, name, sizeof(name));
++				spa_log_warn(backend->log, "fp5: car sent unsupported %s -> ERROR", name);
+ 				rfcomm_send_error(rfcomm, CMEE_OPERATION_NOT_SUPPORTED);
++			}
+ 		}
+ 	}
+ }
+diff --git a/spa/plugins/bluez5/modemmanager.c b/spa/plugins/bluez5/modemmanager.c
+index 574c0aa..78508b7 100644
+--- a/spa/plugins/bluez5/modemmanager.c
++++ b/spa/plugins/bluez5/modemmanager.c
+@@ -889,6 +889,53 @@ bool mm_hangup_call(void *modemmanager, void *user_data, enum cmee_error *error)
+ 			}
+ 		}
+ 	}
++	{
++		/* fp5: number-free diagnostic, visible at the default log level */
++		char st[64] = "";
++		size_t n = 0, len = 0;
++		spa_list_for_each(call_tmp, &this->call_list, link) {
++			n++;
++			if (len < sizeof(st) - 4)
++				len += snprintf(st + len, sizeof(st) - len, "%s%d", len ? "," : "", (int)call_tmp->state);
++		}
++		spa_log_warn(this->log, "fp5: hangup request: %zu call(s) [clcc states %s], %s",
++				n, n ? st : "-", call_object ? "hanging up the matching call" :
++				(n ? "no active/setup call, hanging up the first one" :
++				(spa_streq(this->service, MM_DBUS_SERVICE) ? "nothing to hang up" : "none known, asking the service to hang up all")));
++	}
++	if (!call_object && !spa_list_is_empty(&this->call_list))
++		call_object = spa_list_first(&this->call_list, struct call, link);
++
++	if (!call_object && !spa_streq(this->service, MM_DBUS_SERVICE) &&
++			this->modem.path && !this->voice_pending) {
++		/* The service (e.g. fp5-hfp-modem-bridge) may know a call that we lost
++		 * track of: let it hang up everything it has. */
++		data = malloc(sizeof(struct dbus_cmd_data));
++		if (!data) {
++			if (error)
++				*error = CMEE_AG_FAILURE;
++			return false;
++		}
++		data->this = this;
++		data->call = NULL;
++		data->user_data = user_data;
++		m = dbus_message_new_method_call(this->service, this->modem.path,
++				MM_DBUS_INTERFACE_MODEM_VOICE, MM_MODEM_VOICE_METHOD_HANGUPALL);
++		if (m == NULL) {
++			if (error)
++				*error = CMEE_AG_FAILURE;
++			return false;
++		}
++		this->voice_pending = send_with_reply(this->conn, m, mm_get_call_create_reply, data);
++		if (!this->voice_pending) {
++			spa_log_error(this->log, "dbus call failure");
++			if (error)
++				*error = CMEE_AG_FAILURE;
++			return false;
++		}
++		return spa_steal_ptr(data), true;
++	}
++
+ 	if (!call_object) {
+ 		spa_log_debug(this->log, "No call to reject or hang up");
+ 		if (error)

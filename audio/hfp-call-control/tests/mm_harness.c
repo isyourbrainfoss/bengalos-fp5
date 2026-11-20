@@ -195,6 +195,13 @@ int main(int argc, char **argv)
 	CHECK(wait_for(&service, 1, 3000), "IMS back -> service=1");
 	mockmm("SetRegistered", NULL, 1);
 
+	/* v4: AT+CHUP with no call known to PipeWire -> Voice.HangupAll on the bridge -> OK */
+	pump(300);
+	CHECK(spa_list_is_empty(mm_get_calls(mm)), "no calls before CHUP fallback");
+	ok0 = results_ok;
+	CHECK(mm_hangup_call(mm, NULL, &e), "AT+CHUP with no known call accepted (HangupAll)");
+	CHECK(wait_for(&results_ok, ok0 + 1, 3000), "HangupAll -> OK to the car");
+
 	mm_unregister(mm);
 	printf("ALL PASS\n");
 	return 0;

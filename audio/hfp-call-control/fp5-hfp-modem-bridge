@@ -466,6 +466,7 @@ class Bridge:
                 self._audio_abort()
                 return inv.return_dbus_error(ERR_FAILED, "dial failed")
             call = self.calls.get(opath) or self._add_call(opath, {"State": "dialing"})
+            log("car: dial accepted after %.1f s (OK to the car)" % ((GLib.get_monotonic_time() - t0) / 1e6))
             inv.return_value(GLib.Variant("(o)", (call.path,)))
         self.ofono_bus.call("org.ofono", self.ofono_modem, "org.ofono.VoiceCallManager", "Dial",
                             GLib.Variant("(ss)", (number, "")), GLib.VariantType("(o)"),
@@ -504,6 +505,7 @@ class Bridge:
                          GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 15000, None, created)
 
     def hangup_all(self, inv):
+        log("car: hang up all (%d call(s) known here)" % len(self.calls))
         pending = []
         if self.ofono_modem and any(c.origin == ORIGIN_IMS for c in self.calls.values()):
             pending.append((self.ofono_bus, "org.ofono", self.ofono_modem, "org.ofono.VoiceCallManager"))

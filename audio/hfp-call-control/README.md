@@ -200,3 +200,30 @@ the car to the lab OnePlus, unanswered, ~13 s, hang up from the car.
     systemctl --user daemon-reload && systemctl --user restart wireplumber
 Fast off switch without uninstalling: `systemctl --user stop fp5-hfp-modem-bridge`. PipeWire
 then sees no modem → ATD gets ERROR, as today.
+
+## v4 (staged, not installed): car red button
+Test 16:40:51 (v3): audio both ways OK, but the Tesla red button did not end the call and the
+bridge got no `Hangup` (same as 16:05). Read-only findings:
+- PipeWire 1.6.9 `mm_hangup_call` sends `Call.Hangup` to the bridge for any ACTIVE/DIALING/
+  ALERTING/INCOMING call; the bridge logs every Hangup. PipeWire did read the call (GetAll,
+  state 1) and nothing in WirePlumber's log (warn level) shows an error, a missing call, a
+  "network not available" refusal or a D-Bus failure. The offline harness (same code, CHUP →
+  Hangup → OK) passes. The car's AT channel was alive during the call (it set the mic to 0%
+  at 16:41:00).
+- So either the car sent no `AT+CHUP`, or it sent something PipeWire's AG does not handle
+  (e.g. `AT+CHLD=1`): unsupported AT commands, "no call to hang up" and the AT trace are all
+  debug-only, and debug level also prints phone numbers, so nothing could be seen.
+- v4 makes the next test conclusive and covers the likely cases:
+  - `pipewire/0002-…patch`: warn-level, number-free `fp5:` lines for every call-control command
+    from the car (`ATD` without digits), every unsupported command (name only) and every ERROR
+    sent back; on `AT+CHUP` the call count + states; if no call matches, hang up the first
+    known call, and if none is known ask the bridge for `Voice.HangupAll`; `AT+CHLD=0/1[x]`
+    = hang up.
+  - bridge: logs `car: hang up all` and how long the car's dial took to get its OK.
+- Built in debian:sid (podman) with `build/build-v4.sh`: `libspa-bluez5.so` 3c876af7…, same
+  NEEDED / exported / imported symbols as the installed patched copy (e5ccbe83…).
+- Tests: 48 unit tests + harness (session bus, patched modemmanager.c incl. 0002) all pass,
+  incl. CHUP-with-no-known-call → HangupAll → OK.
+- Install (not while driving: restarts WirePlumber, car audio reconnects):
+  `sh ~/.local/share/fp5-hfp-staging-v4/install-v4.sh`; undo `rollback-v4.sh`.
+  After the next car call: `journalctl --user -u wireplumber | grep 'fp5:'`.
