@@ -1,0 +1,15 @@
+#!/bin/sh
+# mock parec for fp5-mic-level: noise if the TX backend was configured with
+# ADC1 on ($MOCK/backend_ok), zeros otherwise; $MOCK/nodata -> no output
+echo "PAREC $*" >> $MOCK/actions
+[ -f $MOCK/nodata ] && { [ -f $MOCK/nodata_once ] && rm -f $MOCK/nodata $MOCK/nodata_once; exit 0; }
+exec python3 -c '
+import os, random, sys
+ok = os.path.exists(os.path.join(os.environ["MOCK"], "backend_ok"))
+n = 16000 * 2
+out = bytearray()
+for _ in range(n):
+    v = random.randint(-300, 300) if ok else 0
+    out += v.to_bytes(2, "little", signed=True)
+sys.stdout.buffer.write(bytes(out))
+'

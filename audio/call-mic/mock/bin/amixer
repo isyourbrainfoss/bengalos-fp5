@@ -1,6 +1,8 @@
 #!/bin/sh
+# mock amixer: ADC1 Switch state lives in $MOCK/adc1 (on/off)
+a=$(cat $MOCK/adc1 2>/dev/null || echo on)
 case "$*" in
- *contents*) printf "numid=1,iface=MIXER,name='ADC1 Switch'\n  ; type=BOOLEAN,access=rw------,values=1\n  : values=on\nnumid=2,iface=MIXER,name='TX DEC0 MUX'\n  ; type=ENUMERATED\n  : values=1\nnumid=3,iface=MIXER,name='RX_RX0 Digital Volume'\n  : values=84\n";;
- *cget*) echo "  : values=on";;
- *cset*) echo "AMIXER $*" >> $MOCK/actions;;
+ *contents*) printf "numid=1,iface=MIXER,name='ADC1 Switch'\n  ; type=BOOLEAN,access=rw------,values=1\n  : values=%s\nnumid=2,iface=MIXER,name='TX DEC0 MUX'\n  ; type=ENUMERATED\n  : values=1\nnumid=3,iface=MIXER,name='RX_RX0 Digital Volume'\n  : values=84\n" "$a";;
+ *cget*) echo "  : values=$a";;
+ *cset*) echo "AMIXER $*" >> $MOCK/actions; case "$*" in *" on"|*" 1") echo on > $MOCK/adc1;; *" off"|*" 0") echo off > $MOCK/adc1;; esac;;
 esac

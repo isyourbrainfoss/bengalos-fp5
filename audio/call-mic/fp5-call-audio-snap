@@ -9,6 +9,7 @@ Reads only: pactl (get/list), amixer contents, /proc/asound pcm7 status,
 ModemManager call State/Direction, oFono (imsd) call State, gnome-calls Inbound.
 Never prints numbers, URIs, IPs or MACs (redacted again before output).
 Approved by Kristian 2026-11-19 (t777s3033).
+v3 2026-11-20 (fix/first-call-mic): rec= also counts pacat/pw-cat streams.
 """
 import json, os, re, subprocess, sys, time
 
@@ -135,13 +136,20 @@ def mute(kind, name):
     return m.group(1) if m else "?"
 
 
+REC_BINS = {"parecord": "pa", "pacat": "pa", "parec": "pa", "pw-record": "pw", "pw-cat": "pw"}
+
+
 def rec_streams(srcmap):
-    """Sources of the parecord streams (fp5-call-mic)."""
+    """Sources of the call capture streams: fp5-call-mic's parecord hold
+    (binary is pacat, parecord is a symlink -> "pa") and imsd's pw-record
+    (binary pw-cat -> "pw"). v2 only matched "parecord" and always said
+    rec=none. The fp5-mic-level probe is left out."""
     recs, cur = [], None
     for line in run(["pactl", "list", "source-outputs"]).splitlines() + ["Source Output #end"]:
         if line.startswith("Source Output #"):
-            if cur and cur.get("bin") == "parecord":
-                recs.append(srcmap.get(cur.get("src", ""), cur.get("src", "?")))
+            if cur and cur.get("bin") in REC_BINS and cur.get("app") != "fp5-mic-level":
+                src = srcmap.get(cur.get("src", ""), cur.get("src", "?"))
+                recs.append(REC_BINS[cur["bin"]] + ":" + src)
             cur = {}
             continue
         s = line.strip()
@@ -151,6 +159,8 @@ def rec_streams(srcmap):
             cur["src"] = s.split()[1]
         elif s.startswith("application.process.binary = "):
             cur["bin"] = s.split("=", 1)[1].strip().strip('"')
+        elif s.startswith("application.name = "):
+            cur["app"] = s.split("=", 1)[1].strip().strip('"')
     return recs
 
 

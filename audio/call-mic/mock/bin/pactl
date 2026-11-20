@@ -1,16 +1,23 @@
 #!/bin/sh
 M=$MOCK; now=$(date +%s.%N); start=$(cat $M/t0)
-el=$(echo "$now - $start" | bc)
-voice_ok() { [ -f $M/appear_at ] && [ $(echo "$el >= $(cat $M/appear_at)" | bc) = 1 ]; }
+el=$(awk -v a="$now" -v b="$start" "BEGIN{print a-b}")
+voice_ok() { [ -f $M/appear_at ] && awk -v e="$el" -v t="$(cat $M/appear_at)" "BEGIN{exit !(e>=t)}"; }
 case "$*" in
  "list short sources") printf '50\talsa_input.platform-sound.HiFi__Mic1__source\tPipeWire\ts16le\tSUSPENDED\n'
      voice_ok && printf '51\talsa_input.platform-sound.Voice_Call__Mic1__source\tPipeWire\ts16le\tRUNNING\n'
      printf '52\tbluez_input.AA_BB_CC_DD_EE_FF.0\tPipeWire\ts16le\tSUSPENDED\n';;
  "list source-outputs") [ -f $M/rec.pid ] || exit 0; idx=50
      grep -q Voice_Call $M/rec.dev && idx=51; [ -f $M/wrong ] && [ "$(cat $M/rec.pid)" = "$(cat $M/first.pid)" ] && idx=52
-     printf 'Source Output #7\n\tDriver: PipeWire\n\tSource: %s\n\tProperties:\n\t\tapplication.process.id = "%s"\n\t\tapplication.process.binary = "parecord"\n\n' $idx $(cat $M/rec.pid);;
+     printf 'Source Output #7\n\tDriver: PipeWire\n\tSource: %s\n\tProperties:\n\t\tapplication.process.id = "%s"\n\t\tapplication.process.binary = "pacat"\n\t\tapplication.name = "parecord"\n\n' $idx $(cat $M/rec.pid)
+     [ -f $M/imsd ] && printf 'Source Output #8\n\tDriver: PipeWire\n\tSource: 51\n\tProperties:\n\t\tapplication.process.id = "4242"\n\t\tapplication.process.binary = "pw-cat"\n\t\tapplication.name = "pw-cat"\n\n'
+     [ -f $M/imsd ] && printf 'Source Output #9\n\tDriver: PipeWire\n\tSource: 51\n\tProperties:\n\t\tapplication.process.id = "4243"\n\t\tapplication.process.binary = "pacat"\n\t\tapplication.name = "fp5-mic-level"\n\n'
+     true;;
  set-source-mute*) echo "MUTE $*" >> $M/actions;;
- get-default-source) echo alsa_input.platform-sound.Voice_Call__Mic1__source;;
+ suspend-source*) echo "SUSPEND $*" >> $M/actions
+     # all PCMs on the TX backend closed -> it re-runs hw_params with the current ADC1
+     case "$*" in *" 1") if [ ! -f $M/t_active ] && [ ! -f $M/broken ]; then
+         if [ "$(cat $M/adc1 2>/dev/null || echo on)" = on ]; then touch $M/backend_ok; else rm -f $M/backend_ok; fi; fi;; esac;;
+ get-default-source) if [ -f $M/car_src ]; then echo bluez_input.AA_BB_CC_DD_EE_FF; else echo alsa_input.platform-sound.Voice_Call__Mic1__source; fi;;
  get-default-sink) echo alsa_output.platform-sound.Voice_Call__Earpiece__sink;;
  get-source-mute*|get-sink-mute*) echo "Mute: no";;
  get-source-volume*|get-sink-volume*) echo "Volume: front-left: 65536 /  100% / 0.00 dB";;

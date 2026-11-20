@@ -2,12 +2,13 @@
 # FP5 call uplink: the voice TX path only gets powered while the mic
 # capture stream is open, so hold it open (to /dev/null) during calls.
 # Started/stopped by the Mic1 device in UCM Voice Call.
-# v2 2026-11-19 (approved t777s3033): the wrapper waits for the Voice Call mic
-# source, records from it by name (fallback @DEFAULT_SOURCE@), re-asserts ADC1
-# (the 2026-11-16 t667s2594 fix, moved from ExecStartPost into the wrapper),
-# re-checks the source when the call is answered, and logs per-call snapshots
-# (journalctl -t fp5-call-mic -t fp5-call-audio).
-# Rollback: run0 sh /var/lib/fp5-backup/20261119-call-mic/rollback.sh
+# v2 2026-11-19 (approved t777s3033): waits for the Voice Call mic source,
+# records from it by name, re-checks it when the call is answered, logs
+# per-call snapshots (journalctl -t fp5-call-mic -t fp5-call-audio).
+# v3 2026-11-20 (branch fix/first-call-mic): ADC1 on at once, ~1.5 s level
+# check (levels only, no audio kept) and, if the mic is flat, the TX backend
+# is reopened so the first call after boot is not silent. Skips car calls.
+# Rollback: sh ~/.local/share/fp5-mic-staging-v3/rollback-mic-v3.sh
 [Unit]
 Description=Keep mic capture open during voice calls
 [Service]

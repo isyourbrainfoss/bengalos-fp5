@@ -1,5 +1,11 @@
 # FP5 call uplink race fix + per-call audio logging (2026-11-19)
 
+> **v3 (2026-11-20, branch `fix/first-call-mic`)**: fixes the dead phone mic on the first call after a boot.
+> Root cause, fix, install and rollback are in [CHANGES.md](CHANGES.md).
+> Part B (`fp5-call-mic` v3 + `fp5-mic-level`) works without a restart.
+> Part A (UCM) needs a WirePlumber restart.
+
+
 Status: approved by Kristian 2026-11-19 (t777s3033). Offline mock tests pass.
 
 Problem: sometimes the other party can't hear the FP5, or there is no audio at all, and a redial works.
@@ -41,4 +47,12 @@ got a live mic.
     journalctl -t fp5-call-mic -t fp5-call-audio --since today
 
 ## Rollback
+v2 → v1:
+
     run0 --no-ask-password sh /var/lib/fp5-backup/20261119-call-mic/rollback.sh
+
+v3 → v2:
+
+    sh ~/.local/share/fp5-mic-staging-v3/rollback-mic-v3.sh
+
+See CHANGES.md.

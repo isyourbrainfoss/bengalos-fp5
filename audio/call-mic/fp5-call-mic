@@ -1,29 +1,52 @@
 #!/bin/sh
-# fp5-call-mic v2 — FP5 call uplink keeper (2026-11-19, approved by Kristian t777s3033).
+# fp5-call-mic v3 — FP5 call uplink keeper (2026-11-20, branch fix/first-call-mic).
+# v2: 2026-11-19 (approved by Kristian t777s3033), branch fix/call-mic-race.
 #
 # The voice TX path is only powered while a mic capture stream is open, so a
-# parecord to /dev/null is held open for the whole call. v1 opened
-# @DEFAULT_SOURCE@ after a fixed 1 s sleep, racing the UCM HiFi -> Voice Call
-# switch (suspected cause of "the other side can't hear me").
+# parecord to /dev/null is held open for the whole call (as in v1/v2).
 #
-# v2:
-#  1. wait up to ~5 s for the Voice Call mic source, record from it BY NAME and
-#     unmute it; fall back to v1 behaviour (@DEFAULT_SOURCE@) if it never shows;
-#  2. ADC1 re-assert exactly as the 2026-11-16 ExecStartPost (approved t667s2594);
-#  3. when the call becomes active, check the stream is still on the right
-#     source (and alive); restart the recording if not;
-#  4. per-call snapshots via fp5-call-audio-snap (tag fp5-call-audio):
-#     start, +3 s, answer+3 s.
-# Logs (tag fp5-call-mic) contain only source names, never numbers or URIs.
-# Dry run (no parecord, no mute/mixer writes, prints instead of logging):
+# Why v3 (the "first call after boot has a dead phone mic" bug, 20.11 09:04
+# and 12:21, both CS calls):
+#  * On mainline wcd938x, 'ADC1 Switch' (and its alias 'ADC2 Switch') is not
+#    an analog switch: it sets the SoundWire TX port channel mask, and the
+#    mask is applied ONLY when the TX_CODEC_DMA_TX_3 backend runs hw_params
+#    (when the first PCM on it opens). Flipping it while the call stream is
+#    open changes nothing until every PCM on that backend closes and reopens.
+#  * On the first Voice Call of a boot the switch is OFF when the call PCMs
+#    open (PipeWire/ACP uses ADC1 as the hardware mute of the mic and the
+#    Voice Call device starts out "muted" after boot). v2 switched it on
+#    0.5 s later — too late for the open stream, so the mic stayed silent
+#    until a redial reopened everything.
+#
+# v3:
+#  1. ADC1 on immediately (no 0.5 s sleep), log what it was;
+#  2. wait for the Voice Call mic source and hold it open (as v2);
+#  3. read-only level check (fp5-mic-level, ~1.5 s, levels only, no audio
+#     kept); if the stream is flat: ADC1 on, close the backend completely
+#     (stop dummystreamhack T, suspend the source, start T again) so it is
+#     reconfigured with the port enabled, and check again (max 2 tries);
+#  4. same check once more ~1 s after the call is answered;
+#  5. car calls (hfp bridge state file present or default source is
+#     bluez_*) skip 3+4 and never touch the backend;
+#  6. snapshots start / plus3 / answer3 as v2 (rec= is fixed in the snap).
+# Logs (tag fp5-call-mic) contain only source names and levels.
+# Dry run (no parecord, no probe, no mute/mixer/service changes):
 #   FP5_CALL_MIC_DRYRUN=1 fp5-call-mic
 set -u
 TAG=fp5-call-mic
-SNAP=${FP5_CALL_AUDIO_SNAP:-/var/lib/fp5-oot/bin/fp5-call-audio-snap}
+BIN=${FP5_CALL_MIC_BIN:-/var/lib/fp5-oot/bin}
+SNAP=${FP5_CALL_AUDIO_SNAP:-$BIN/fp5-call-audio-snap}
+LEVEL=${FP5_MIC_LEVEL:-$BIN/fp5-mic-level}
 DRY=${FP5_CALL_MIC_DRYRUN:-0}
+CARD=${FP5_CALL_MIC_CARD:-F5}
 WAIT_STEPS=${FP5_CALL_MIC_WAIT_STEPS:-25}          # x 0.2 s = 5 s
 ANSWER_TIMEOUT=${FP5_CALL_MIC_ANSWER_TIMEOUT:-180}  # s to wait for "active"
 NOCALL_GIVEUP=${FP5_CALL_MIC_NOCALL_GIVEUP:-15}     # s with no call visible
+PROBE_S=${FP5_CALL_MIC_PROBE_S:-1.5}
+TRIES=${FP5_CALL_MIC_RECOVER_TRIES:-2}
+CHECK=${FP5_CALL_MIC_CHECK:-1}                      # 0 = v2 behaviour (no probe/recovery)
+TX_UNIT=${FP5_CALL_MIC_TX_UNIT:-dummystreamhack@Thw:$CARD,7.service}
+HFP_STATE=${FP5_HFP_STATE:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fp5-hfp-audio.json}
 SRC_RE=${FP5_CALL_MIC_SRC_RE:-'(Voice_?Call|VoiceCall|Voice-Call).*Mic'}
 
 red() { printf '%s' "$1" | sed -E 's/([0-9A-Fa-f]{2}[:_-]){5}[0-9A-Fa-f]{2}/<mac>/g; s/\+?[0-9]{7,15}/<num>/g'; }
@@ -60,19 +83,82 @@ start_rec() {
     PID=$!
 }
 
-# identical to the 2026-11-16 ExecStartPost (t667s2594)
-adc1_kick() {
-    if [ "$DRY" = 1 ]; then log "dry: would ADC1 kick (0.5 s on, 2.5 s check)"; sleep 2.5; return; fi
-    sleep 0.5
-    amixer -q -c F5 cset name='ADC1 Switch' on
-    logger -t "$TAG" ADC1-on-0.5s
-    sleep 2
-    st=$(amixer -c F5 cget name='ADC1 Switch' | sed -n 's/.*: values=//p' | tail -1)
-    logger -t "$TAG" "ADC1-at-2.5s=$st"
-    [ "$st" = on ] || amixer -q -c F5 cset name='ADC1 Switch' on
+adc1_get() { amixer -c "$CARD" cget name='ADC1 Switch' 2>/dev/null | sed -n 's/.*: values=//p' | tail -1; }
+
+# ADC1 on now; prints the value it had before ("on"/"off"/"?")
+adc1_on() {
+    was=$(adc1_get); [ -n "$was" ] || was="?"
+    if [ "$DRY" = 1 ]; then
+        log "dry: ADC1 is '$was' (would set on)"
+    elif [ "$was" != on ]; then
+        amixer -q -c "$CARD" cset name='ADC1 Switch' on 2>/dev/null
+    fi
+    ADC1_WAS=$was
 }
 
-# 1. wait for the Voice Call mic
+car_call() {
+    [ -e "$HFP_STATE" ] && return 0
+    case "$(pactl get-default-source 2>/dev/null)" in bluez_*) return 0 ;; esac
+    return 1
+}
+
+# level probe; sets LVL (text) and returns 0 live / 1 flat / 2 unknown
+probe() {
+    LVL=$("$LEVEL" "$1" "$PROBE_S" 2>/dev/null); rc=$?
+    [ -n "$LVL" ] || LVL="no-output"
+    return $rc
+}
+
+# close every PCM on the TX backend at once so it re-runs hw_params with the
+# ADC1 port enabled: T hostless stream down, source suspend (PipeWire reopens
+# it at once because streams are linked), T up again.
+reopen_backend() {
+    t_active=0
+    systemctl --user is-active --quiet "$TX_UNIT" 2>/dev/null && t_active=1
+    [ "$t_active" = 1 ] && systemctl --user stop "$TX_UNIT" 2>/dev/null
+    pactl suspend-source "$1" 1 2>/dev/null
+    sleep 0.3
+    pactl suspend-source "$1" 0 2>/dev/null
+    [ "$t_active" = 1 ] && systemctl --user start "$TX_UNIT" 2>/dev/null
+    REOPEN="t_unit=$([ "$t_active" = 1 ] && echo restarted || echo inactive)"
+}
+
+# check + recover; $1 = phase name
+check_mic() {
+    phase=$1
+    [ "$CHECK" = 1 ] || return 0
+    [ "$MODE" = named ] || [ "$MODE" = named-rewired ] || { log "$phase: level check skipped (no Voice Call source)"; return 0; }
+    if car_call; then log "$phase: car call (HFP) - level check skipped"; return 0; fi
+    if [ "$DRY" = 1 ]; then log "dry: $phase: would probe $(red "$DEV") for ${PROBE_S}s and reopen the TX backend if flat"; return 0; fi
+    probe "$DEV"; r=$?
+    if [ "$r" = 0 ]; then log "$phase: mic live ($LVL)"; return 0; fi
+    if [ "$r" = 2 ]; then log "$phase: level unknown ($LVL) - no action"; return 0; fi
+    n=0
+    while [ "$n" -lt "$TRIES" ]; do
+        n=$((n + 1))
+        adc1_on
+        if car_call; then log "$phase: car call started - recovery stopped"; return 0; fi
+        reopen_backend "$DEV"
+        sleep 0.3
+        probe "$DEV"; r=$?
+        if [ "$r" = 2 ]; then
+            # no data: the source did not come back by itself -> re-link the hold stream
+            kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null
+            start_rec "$DEV"; REOPEN="$REOPEN hold=restarted"
+            sleep 0.3; probe "$DEV"; r=$?
+        fi
+        log "$phase: mic was flat -> backend reopened (try $n, ADC1 was '$ADC1_WAS', $REOPEN): $LVL"
+        [ "$r" = 1 ] || return 0
+    done
+    log "$phase: mic still flat after $TRIES reopen(s) - redial needed"
+    return 1
+}
+
+# 1. ADC1 on before anything else
+adc1_on
+ADC1_START=$ADC1_WAS
+
+# 2. wait for the Voice Call mic
 i=0
 SRC=$(find_src)
 while [ -z "$SRC" ] && [ "$i" -lt "$WAIT_STEPS" ]; do
@@ -80,15 +166,15 @@ while [ -z "$SRC" ] && [ "$i" -lt "$WAIT_STEPS" ]; do
 done
 if [ -n "$SRC" ]; then MODE=named; DEV=$SRC; else MODE=fallback; DEV=@DEFAULT_SOURCE@; fi
 start_rec "$DEV"
-log "mode=$MODE source=$(red "$DEV") waited_ms=$((i * 200))"
+log "v3 mode=$MODE source=$(red "$DEV") waited_ms=$((i * 200)) adc1_at_start=$ADC1_START"
 snap start &
 
-# 2. ADC1 (2.5 s), then the +3 s snapshot
-adc1_kick
-sleep 0.5
+# 3. level check right away (the call is still dialing/ringing)
+check_mic start
+st=$(adc1_get); [ "$DRY" = 1 ] || [ "$st" = on ] || amixer -q -c "$CARD" cset name='ADC1 Switch' on 2>/dev/null
 snap plus3 &
 
-# 3. wait for the call to be answered, then verify the stream
+# 4. wait for the call to be answered, then verify the stream
 ans=0; t=0; none=0
 while [ "$t" -lt "$ANSWER_TIMEOUT" ]; do
     kill -0 "$PID" 2>/dev/null || break
@@ -114,19 +200,20 @@ if [ "$ans" = 1 ]; then
     if [ -n "$reason" ]; then
         kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null
         if [ -n "$want" ]; then MODE=named-rewired; DEV=$want; else MODE=fallback-rewired; DEV=@DEFAULT_SOURCE@; fi
+        adc1_on
         start_rec "$DEV"
         log "answer-check: $reason have=$(red "$have") -> restarted on $(red "$DEV")"
-        adc1_kick &
     else
         log "answer-check: ok source=$(red "$have")"
     fi
-    ( sleep 2; snap answer3 ) &
+    check_mic answer
+    ( sleep 1; snap answer3 ) &
 elif [ "$t" -ge "$ANSWER_TIMEOUT" ]; then
     log "answer-check: not answered within ${ANSWER_TIMEOUT}s"
 else
     log "answer-check: skipped (no call visible or stream ended)"
 fi
 
-# 4. keep the service alive as long as the recording runs
+# 5. keep the service alive as long as the recording runs
 wait "$PID"
 exit $?

@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""fp5-mic-level — read-only level probe for the call mic (fp5-call-mic v3).
+
+Usage: fp5-mic-level SOURCE [SECONDS]
+Prints one line:  "frames=<n> span=<max-min> peak=<abs max> rms_dbfs=<x>"
+Exit 0 = signal present, 1 = flat (span <= FP5_MIC_DEAD_SPAN, default 4 LSB),
+     2 = no data / probe failed.
+
+Opens a short 16 kHz mono s16 capture (parec) on SOURCE for SECONDS (default
+1.5), keeps only running min/max/sum-of-squares in memory and throws every
+sample away. Nothing is written to disk, nothing is logged here.
+A SoundWire TX port that was configured with ADC1 off delivers a flat stream
+(digital silence); a live analog mic always has a noise floor of many LSB.
+"""
+import array, math, os, select, subprocess, sys, time
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: fp5-mic-level SOURCE [SECONDS]", file=sys.stderr)
+        return 2
+    src = sys.argv[1]
+    secs = float(sys.argv[2]) if len(sys.argv) > 2 else 1.5
+    dead = int(os.environ.get("FP5_MIC_DEAD_SPAN", "4"))
+    skip = float(os.environ.get("FP5_MIC_SKIP_S", "0.1"))   # ignore open transient
+    rate = 16000
+    cmd = [os.environ.get("FP5_MIC_PAREC", "parec"), "--device=" + src, "--raw",
+           "--format=s16le", "--rate=%d" % rate, "--channels=1", "--latency-msec=20",
+           "--client-name=fp5-mic-level"]
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        print("frames=0 span=? peak=? rms_dbfs=? (parec missing)")
+        return 2
+    want = int(rate * (secs + skip)) * 2
+    skipb = int(rate * skip) * 2
+    got, n, lo, hi, sq, carry = 0, 0, 32767, -32768, 0, b""
+    end = time.monotonic() + secs + skip + 2.0
+    fd = p.stdout.fileno()
+    try:
+        while got < want:
+            left = end - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                break
+            b = os.read(fd, 8192)
+            if not b:
+                break
+            start = got
+            got += len(b)
+            if got <= skipb:
+                continue
+            if start < skipb:
+                b = b[skipb - start:]
+            b = carry + b
+            carry, b = (b[-1:], b[:-1]) if len(b) % 2 else (b"", b)
+            a = array.array("h")
+            a.frombytes(b)
+            if sys.byteorder != "little":
+                a.byteswap()
+            if a:
+                lo, hi = min(lo, min(a)), max(hi, max(a))
+                sq += sum(v * v for v in a)
+                n += len(a)
+    finally:
+        p.kill()
+        p.wait()
+    if n == 0:
+        print("frames=0 span=? peak=? rms_dbfs=?")
+        return 2
+    rms = math.sqrt(sq / n)
+    db = 20 * math.log10(rms / 32768) if rms > 0 else -150.0
+    span = hi - lo
+    print("frames=%d span=%d peak=%d rms_dbfs=%.1f" % (n, span, max(abs(lo), abs(hi)), db))
+    return 1 if span <= dead else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

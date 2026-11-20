@@ -1,0 +1,9 @@
+#!/bin/sh
+# mock systemctl --user for the dummystreamhack T unit; $MOCK/t_active = unit running
+[ "$1" = --user ] && shift
+case "$1" in
+ is-active) [ -f $MOCK/t_active ];;
+ stop) echo "SYSTEMCTL stop $2" >> $MOCK/actions; rm -f $MOCK/t_active;;
+ start) echo "SYSTEMCTL start $2" >> $MOCK/actions; touch $MOCK/t_active;;
+ *) echo "SYSTEMCTL $*" >> $MOCK/actions;;
+esac
