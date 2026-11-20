@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""Stop control for the GNOME Clocks timer sound (v2, 2026-11-20).
+
+Clocks asks feedbackd to play timeout-completed once. On this phone the
+full profile plays Argon-timer.ogg (~35 s) and Clocks never calls
+EndFeedback. This helper shows a Stopp button and a notification and ends
+the feedback when either is used, when Clocks is opened, or at the end.
+
+Safety (v1 broke all feedbackd sounds 19-20 Nov): v1 eavesdropped on its
+main bus connection and libdbus auto-replied UnknownMethod to other
+clients' TriggerFeedback calls. v2 never eavesdrops in-process. Watching
+is done by a child `busctl --user monitor` process. That uses
+org.freedesktop.DBus.Monitoring.BecomeMonitor, and the bus forbids a
+monitor connection from sending anything, so it cannot answer or block
+calls. The main connection only makes normal calls (EndFeedback, Notify)
+and plain signal matches. If this process or the child dies, feedbackd is
+not involved at all.
+"""
+
+import ctypes
+import json
+import os
+import signal
+import subprocess
+import sys
+
+import dbus
+import dbus.mainloop.glib
+from gi.repository import GLib
+
+FB_NAME = "org.sigxcpu.Feedback"
+FB_PATH = "/org/sigxcpu/Feedback"
+FB_IFACE = "org.sigxcpu.Feedback"
+NOTIFY_NAME = "org.freedesktop.Notifications"
+NOTIFY_PATH = "/org/freedesktop/Notifications"
+NOTIFY_IFACE = "org.freedesktop.Notifications"
+EVENT = "timeout-completed"
+CLOCKS_PATH = "/org/gnome/clocks"
+SAFETY_SECONDS = 50
+
+MATCHES = [
+    "type='method_call',interface='org.sigxcpu.Feedback',member='TriggerFeedback'",
+    "type='method_return',sender='org.sigxcpu.Feedback'",
+    "type='error',sender='org.sigxcpu.Feedback'",
+    "type='signal',interface='org.sigxcpu.Feedback',member='FeedbackEnded'",
+    # Clocks opened from its notification or the launcher (DBusActivatable).
+    "type='method_call',interface='org.freedesktop.Application',path='/org/gnome/clocks'",
+    "type='method_call',interface='org.gtk.Actions',path='/org/gnome/clocks'",
+]
+
+# (caller unique name, cookie) -> waiting for the event id
+pending = {}
+active_ids = set()
+notif_id = None
+# Calls seen while a stop was requested; end them as soon as the id arrives.
+cancelled = set()
+overlay = None
+bus = None
+monitor_proc = None
+safety_source = None
+
+LAYER_TOP = 2
+EDGE_LEFT, EDGE_RIGHT, EDGE_TOP, EDGE_BOTTOM = 0, 1, 2, 3
+KEYBOARD_NONE = 0
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def feedback():
+    return dbus.Interface(bus.get_object(FB_NAME, FB_PATH), FB_IFACE)
+
+
+def notifications():
+    return dbus.Interface(bus.get_object(NOTIFY_NAME, NOTIFY_PATH), NOTIFY_IFACE)
+
+
+def gobject_pointer(obj):
+    """C GObject* for a PyGObject. gtk4-layer-shell has no typelib here."""
+
+    class Head(ctypes.Structure):
+        _fields_ = [
+            ("ob_refcnt", ctypes.c_ssize_t),
+            ("ob_type", ctypes.c_void_p),
+            ("obj", ctypes.c_void_p),
+        ]
+
+    return ctypes.cast(id(obj), ctypes.POINTER(Head)).contents.obj
+
+
+class Overlay:
+    def __init__(self):
+        self.window = None
+        self.lib = None
+        self.ready = False
+
+    def setup(self):
+        if self.ready:
+            return True
+        try:
+            import gi
+
+            gi.require_version("Gdk", "4.0")
+            gi.require_version("Gtk", "4.0")
+            from gi.repository import Gdk, Gtk
+        except Exception as err:
+            log(f"overlay unavailable: {err}")
+            return False
+        self.Gtk = Gtk
+        self.Gdk = Gdk
+        if Gdk.Display.get_default() is None:
+            log("overlay unavailable: no display")
+            return False
+        lib = ctypes.CDLL("libgtk4-layer-shell.so.0")
+        lib.gtk_layer_is_supported.restype = ctypes.c_int
+        lib.gtk_layer_init_for_window.argtypes = [ctypes.c_void_p]
+        lib.gtk_layer_set_layer.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.gtk_layer_set_anchor.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        lib.gtk_layer_set_margin.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        lib.gtk_layer_set_exclusive_zone.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.gtk_layer_set_namespace.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.gtk_layer_set_keyboard_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        if not lib.gtk_layer_is_supported():
+            log("overlay unavailable: layer shell not supported")
+            return False
+        self.lib = lib
+        css = self.Gtk.CssProvider()
+        css.load_from_data(
+            b"""
+            window.timer-stop { background: transparent; }
+            window.timer-stop button {
+              background: #9f1d1d;
+              color: white;
+              font-size: 20pt;
+              font-weight: 700;
+              border-radius: 16px;
+              margin: 0;
+              padding: 10px 16px;
+              min-height: 56px;
+            }
+            """,
+            -1,
+        )
+        self.Gtk.StyleContext.add_provider_for_display(
+            self.Gdk.Display.get_default(),
+            css,
+            self.Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+        self.ready = True
+        return True
+
+    def show(self):
+        if not self.setup():
+            return
+        try:
+            if self.window is None:
+                win = self.Gtk.Window(title="fp5-timer-stop")
+                win.add_css_class("timer-stop")
+                win.set_decorated(False)
+                # Width follows the screen. A fixed width overflows at scale 3
+                # (logical size is 408x900 on the 1224x2700 panel).
+                win.set_default_size(0, 64)
+                ptr = gobject_pointer(win)
+                lib = self.lib
+                lib.gtk_layer_init_for_window(ptr)
+                lib.gtk_layer_set_layer(ptr, LAYER_TOP)
+                lib.gtk_layer_set_namespace(ptr, b"fp5-timer-stop")
+                lib.gtk_layer_set_keyboard_mode(ptr, KEYBOARD_NONE)
+                lib.gtk_layer_set_exclusive_zone(ptr, 0)
+                for edge in (EDGE_LEFT, EDGE_RIGHT, EDGE_BOTTOM):
+                    lib.gtk_layer_set_anchor(ptr, edge, 1)
+                lib.gtk_layer_set_margin(ptr, EDGE_LEFT, 12)
+                lib.gtk_layer_set_margin(ptr, EDGE_RIGHT, 12)
+                lib.gtk_layer_set_margin(ptr, EDGE_BOTTOM, 24)
+                button = self.Gtk.Button(label="Stopp")
+                button.set_hexpand(True)
+                button.set_size_request(-1, 56)
+                button.connect("clicked", lambda *_: stop_all("button"))
+                win.set_child(button)
+                self.window = win
+            self.window.set_visible(True)
+            log("overlay up")
+        except Exception as err:
+            log(f"overlay show: {err}")
+
+    def hide(self):
+        if self.window is not None and self.window.get_visible():
+            self.window.set_visible(False)
+            log("overlay hidden")
+
+
+
+def timer_streams():
+    """Only streams playing the timer file. Used as a fallback after EndFeedback."""
+    try:
+        raw = subprocess.check_output(["pw-dump"], text=True, timeout=3)
+        nodes = json.loads(raw)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as err:
+        log(f"pw-dump: {err}")
+        return []
+    found = []
+    for node in nodes:
+        if node.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = (node.get("info") or {}).get("props") or {}
+        if not isinstance(props, dict):
+            continue
+        if "Audio" not in str(props.get("media.class") or ""):
+            continue
+        if "Argon-timer" in str(props.get("media.name") or ""):
+            found.append(int(node["id"]))
+    return found
+
+
+def fallback_cut():
+    for node_id in timer_streams():
+        log(f"timer stream {node_id} still playing, cutting it")
+        subprocess.run(["pw-cli", "destroy", str(node_id)], check=False, timeout=2,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return False
+
+
+def end_feedback(event_id):
+    try:
+        feedback().EndFeedback(dbus.UInt32(int(event_id)), timeout=3)
+        log(f"stopped {int(event_id)}")
+    except dbus.DBusException as err:
+        log(f"end {int(event_id)}: {err.get_dbus_name()}")
+
+
+def close_notification():
+    global notif_id
+    current = notif_id
+    if current is None:
+        return
+    notif_id = None
+    try:
+        notifications().CloseNotification(dbus.UInt32(current), timeout=3)
+    except dbus.DBusException as err:
+        log(f"close {current}: {err.get_dbus_name()}")
+
+
+def show_notification():
+    global notif_id
+    try:
+        new_id = notifications().Notify(
+            "Klokke",
+            dbus.UInt32(notif_id or 0),
+            "alarm-symbolic",
+            "Timeren ringer",
+            "Trykk på Stopp, eller sveip vekk varselet.",
+            dbus.Array(["default", "Stopp", "stop", "Stopp"], signature="s"),
+            dbus.Dictionary(
+                {
+                    "urgency": dbus.Byte(2),
+                    "resident": dbus.Boolean(True),
+                    "suppress-sound": dbus.Boolean(True),
+                    "desktop-entry": dbus.String("org.gnome.clocks", variant_level=1),
+                    "category": dbus.String("alarm", variant_level=1),
+                },
+                signature="sv",
+            ),
+            dbus.Int32(0),
+            timeout=3,
+        )
+    except dbus.DBusException as err:
+        log(f"notify: {err.get_dbus_name()}")
+        return
+    notif_id = int(new_id)
+    log(f"notification {notif_id} for {sorted(active_ids)}")
+
+
+def arm_safety():
+    global safety_source
+    if safety_source is None:
+        safety_source = GLib.timeout_add_seconds(SAFETY_SECONDS, safety_stop)
+
+
+def disarm_safety():
+    global safety_source
+    if safety_source is not None:
+        GLib.source_remove(safety_source)
+        safety_source = None
+
+
+def show_controls():
+    arm_safety()
+    show_notification()
+    overlay.show()
+    return False
+
+
+def finish_if_idle():
+    if active_ids or pending:
+        return False
+    disarm_safety()
+    overlay.hide()
+    close_notification()
+    return False
+
+
+def stop_all(reason):
+    if not active_ids and not pending and notif_id is None and not (
+        overlay is not None and overlay.window is not None and overlay.window.get_visible()
+    ):
+        return
+    log(f"stop requested via {reason}")
+    # feedbackd stops the sound at once but FeedbackEnded can lag until the
+    # caller disconnects, so forget the ids now; a later timer must ring.
+    ids = list(active_ids)
+    active_ids.clear()
+    cancelled.update(pending.keys())
+    pending.clear()
+    for event_id in ids:
+        end_feedback(event_id)
+    disarm_safety()
+    overlay.hide()
+    close_notification()
+    GLib.timeout_add(1500, fallback_cut)
+
+
+def safety_stop():
+    global safety_source
+    safety_source = None
+    log("safety stop")
+    stop_all("safety")
+    pending.clear()
+    active_ids.clear()
+    finish_if_idle()
+    return False
+
+
+def on_action(nid, _action):
+    if notif_id is None or int(nid) != int(notif_id):
+        return
+    stop_all("notification")
+
+
+def on_closed(nid, reason):
+    # Swipe-away closes with reason 3, same code as CloseNotification. Our own
+    # close clears notif_id first, so a matching close is the user.
+    if notif_id is None or int(nid) != int(notif_id):
+        return
+    log(f"notification {int(nid)} closed reason {int(reason)}")
+    stop_all("dismiss")
+
+
+def handle(msg):
+    kind = msg.get("type")
+    payload = (msg.get("payload") or {}).get("data") or []
+    if kind == "method_call" and msg.get("member") == "TriggerFeedback":
+        if len(payload) >= 2 and str(payload[1]) == EVENT:
+            pending[(msg.get("sender"), msg.get("cookie"))] = True
+            log(f"timer sound from {payload[0]}")
+            show_controls()
+    elif kind == "method_call" and msg.get("path") == CLOCKS_PATH:
+        if msg.get("member") not in ("Activate", "ActivateAction", "Open"):
+            return
+        if active_ids or pending:
+            stop_all(f"clocks {msg.get('member')}")
+    elif kind == "method_return":
+        key = (msg.get("destination"), msg.get("reply_cookie"))
+        if key in cancelled:
+            cancelled.discard(key)
+            if payload:
+                log(f"ringing {int(payload[0])} after stop, ending it")
+                end_feedback(int(payload[0]))
+            return
+        if pending.pop(key, None) is None or not payload:
+            return
+        event_id = int(payload[0])
+        active_ids.add(event_id)
+        log(f"ringing {event_id}")
+        show_controls()
+    elif kind == "error":
+        key = (msg.get("destination"), msg.get("reply_cookie"))
+        cancelled.discard(key)
+        if pending.pop(key, None) is not None:
+            log(f"timer trigger failed: {msg.get('error')}")
+            finish_if_idle()
+    elif kind == "signal" and msg.get("member") == "FeedbackEnded":
+        if payload:
+            event_id = int(payload[0])
+            if event_id in active_ids:
+                active_ids.discard(event_id)
+                log(f"ended {event_id}")
+                finish_if_idle()
+
+
+def on_monitor_line(source, condition):
+    if condition & (GLib.IO_HUP | GLib.IO_ERR) and not condition & GLib.IO_IN:
+        return restart_monitor("hangup")
+    line = source.readline()
+    if not line:
+        return restart_monitor("eof")
+    try:
+        handle(json.loads(line))
+    except Exception as err:  # never let one odd message kill the helper
+        log(f"monitor: {type(err).__name__}: {err}")
+    return True
+
+
+def set_pdeathsig():
+    # Child dies with us.
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+
+
+def start_monitor():
+    global monitor_proc
+    cmd = ["busctl", "--user", "monitor", "--json=short"]
+    cmd += [f"--match={m}" for m in MATCHES]
+    monitor_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    stdin=subprocess.DEVNULL, text=True, bufsize=1,
+                                    preexec_fn=set_pdeathsig)
+    GLib.io_add_watch(monitor_proc.stdout, GLib.PRIORITY_DEFAULT,
+                      GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, on_monitor_line)
+    log(f"monitor started (busctl pid {monitor_proc.pid})")
+
+
+def restart_monitor(why):
+    log(f"monitor {why}, exiting so systemd restarts us")
+    try:
+        monitor_proc.kill()
+    except Exception:
+        pass
+    try:
+        stop_all("monitor lost")
+    except Exception:
+        pass
+    os._exit(1)
+
+
+def on_exit_signal():
+    try:
+        stop_all("exit")
+    finally:
+        loop.quit()
+    return False
+
+
+def main():
+    global bus, overlay
+    os.environ.pop("LD_PRELOAD", None)  # children (busctl, pw-dump) don't need it
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    GLib.set_prgname("fp5-timer-sound-stop")
+    bus = dbus.SessionBus()
+    overlay = Overlay()
+    bus.add_signal_receiver(on_action, signal_name="ActionInvoked",
+                            dbus_interface=NOTIFY_IFACE, path=NOTIFY_PATH)
+    bus.add_signal_receiver(on_closed, signal_name="NotificationClosed",
+                            dbus_interface=NOTIFY_IFACE, path=NOTIFY_PATH)
+    start_monitor()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, on_exit_signal)
+    log("watching timer sound")
+    loop.run()
+
+
+loop = GLib.MainLoop()
+
+if __name__ == "__main__":
+    main()

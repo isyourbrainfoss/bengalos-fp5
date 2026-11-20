@@ -1,0 +1,257 @@
+{
+  "name": "fp5-strong",
+  "parent-name": "$device",
+  "profiles": [
+    {
+      "name": "full",
+      "feedbacks": [
+        {
+          "event-name": "button-pressed",
+          "type": "VibraPattern",
+          "magnitudes": [
+            0.8
+          ],
+          "durations": [
+            18
+          ]
+        },
+        {
+          "event-name": "key-pressed",
+          "type": "VibraPattern",
+          "magnitudes": [
+            0.7
+          ],
+          "durations": [
+            15
+          ]
+        },
+        {
+          "event-name": "theme-demo",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0
+          ],
+          "durations": [
+            400,
+            300
+          ]
+        },
+        {
+          "event-name": "fp5-qtee-match",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0
+          ],
+          "durations": [
+            60
+          ]
+        },
+        {
+          "event-name": "fp5-qtee-miss",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            60,
+            100,
+            60
+          ]
+        },
+        {
+          "event-name": "fp5-qtee-toofast",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            35,
+            50,
+            35,
+            50,
+            35
+          ]
+        },
+        {
+          "event-name": "fp5-qtee-lockout",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            150,
+            100,
+            150,
+            100,
+            150
+          ]
+        },
+        {
+          "event-name": "timeout-completed",
+          "type": "Sound",
+          "file-name": "/home/fp5/.local/share/sounds/alarms/Argon-timer.ogg",
+          "media-role": "Alarm"
+        }
+      ]
+    },
+    {
+      "name": "quiet",
+      "feedbacks": [
+        {
+          "event-name": "fp5-qtee-match",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0
+          ],
+          "durations": [
+            60
+          ]
+        },
+        {
+          "event-name": "fp5-qtee-miss",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            60,
+            100,
+            60
+          ]
+        },
+        {
+          "event-name": "fp5-qtee-toofast",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            35,
+            50,
+            35,
+            50,
+            35
+          ]
+        },
+        {
+          "event-name": "fp5-qtee-lockout",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            150,
+            100,
+            150,
+            100,
+            150
+          ]
+        },
+        {
+          "event-name": "timeout-completed",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            300,
+            200,
+            300
+          ]
+        },
+        {
+          "event-name": "message-new-sms",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            300,
+            150,
+            300
+          ]
+        },
+        {
+          "event-name": "message-new-instant",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0
+          ],
+          "durations": [
+            200
+          ]
+        },
+        {
+          "event-name": "message-new-email",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0
+          ],
+          "durations": [
+            200
+          ]
+        },
+        {
+          "event-name": "notification-new-generic",
+          "type": "VibraPattern",
+          "magnitudes": [
+            1.0,
+            0.0,
+            1.0
+          ],
+          "durations": [
+            80,
+            150,
+            80
+          ]
+        },
+        {
+          "event-name": "alarm-clock-elapsed",
+          "type": "VibraPattern",
+          "magnitudes": [
+            0.0
+          ],
+          "durations": [
+            10
+          ]
+        },
+        {
+          "event-name": "phone-incoming-call",
+          "type": "VibraPattern",
+          "magnitudes": [
+            0.0
+          ],
+          "durations": [
+            10
+          ]
+        }
+      ]
+    }
+  ],
+  "comment": "FP5 2026-11-01: added fp5-qtee-match/miss/toofast/lockout (fingerprint haptics; the watcher calls fbcli -E fp5-qtee-*). Revert: mv fp5-strong.json.bak-20261101 fp5-strong.json | 2026-11-16: per-event feedbacks are one per profile, so full-level vibra overrode sounds. Calls/alarm: sound only in full (no vibra; also silent in quiet). SMS/IM/email/notification/timeout vibra moved to quiet so full = sound + vibra. Revert: mv fp5-strong.json.bak-20261116-soundfix fp5-strong.json | 2026-11-20: timer timeout-completed in full plays Argon-timer.ogg (~35s) again; fp5-timer-sound-stop v2 gives Stopp button. Quiet stays vibration. Revert: mv fp5-strong.json.bak-20261120-timer2 fp5-strong.json && kill -HUP $(pgrep -u fp5 -x feedbackd)"
+}

@@ -1,0 +1,20 @@
+[Unit]
+Description=Stop button for the Clocks timer sound (v2, monitor-only)
+# v2 watches the bus through a separate `busctl monitor` child (BecomeMonitor,
+# cannot send). It never eavesdrops on its own connection, so it cannot answer
+# or block TriggerFeedback. If it crashes, feedbackd is unaffected.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+ExecStart=/usr/bin/python3 /home/fp5/.local/bin/fp5-timer-sound-stop
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONWARNINGS=ignore::DeprecationWarning
+Environment=GDK_BACKEND=wayland
+Environment=LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgtk4-layer-shell.so.0
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
