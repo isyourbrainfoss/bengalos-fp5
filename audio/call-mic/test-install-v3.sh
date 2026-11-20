@@ -37,7 +37,7 @@ sleep 1
 # 3. B + UCM
 env $E sh $S/install-mic-v3.sh --ucm > $T/o3 2>&1; r=$?
 [ $r = 0 ] && ok "install B+UCM rc=0" || { bad "install B+UCM rc=$r"; cat $T/o3; }
-cmp -s $S/ucm/VoiceCall.conf $T/ucm/VoiceCall.conf && cmp -s $S/ucm/HiFi.conf $T/ucm/HiFi.conf && cmp -s $S/ucm/fp5.conf $T/ucm/fp5.conf && ok "UCM installed" || bad "UCM not installed"
+cmp -s $S/ucm/VoiceCall.conf $T/ucm/VoiceCall.conf && cmp -s $S/ucm/HiFi.conf $T/ucm/HiFi.conf && ok "UCM installed" || bad "UCM not installed"
 grep -q "WirePlumber restart: NEEDED" $T/o3 && ok "--ucm says WP restart needed (optional step)" || bad "--ucm WP text"
 grep -q "restart wireplumber" $T/sysd.log && bad "installer restarted wireplumber" || ok "installer did not restart wireplumber"
 env $E sh $S/rollback-mic-v3.sh > $T/o4 2>&1; r=$?

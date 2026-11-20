@@ -25,20 +25,17 @@ Both were ordinary CS calls, not VoLTE, using the phone's own mic and earpiece.
    0.5 s after that, too late for the open stream. The plus3 mixer state is identical between the
    failing calls and the working redials. The difference is only whether ADC1 was on when the
    backend opened.
-3. Who turns it off: PipeWire's ACP treats the switch of the UCM `CaptureMixerElem "ADC1"` as the
-   **hardware mute** of the mic.
-   - `pa_alsa_path_synthesize()` sets `switch_use = PA_ALSA_SWITCH_MUTE`.
-   - `setup_mixer()` → `pa_alsa_path_select(..., dev->muted)` writes it each time a UCM device is
-     enabled.
-   - After boot the kernel port is off, so ACP reads the mic as "muted". fp5-mic-kick logs
-     `ADC1 Switch was 'off'` on every boot (5 of 5 since 19.11).
-   - fp5-mic-kick then fixes the HiFi device, but the Voice Call device keeps the stale "muted"
-     until it is used once.
-   - On that first Voice Call activation, ACP writes ADC1 off right after the UCM EnableSequence
-     had set it on. The hostless TX stream opens just after that, with the port disabled.
-
-   Step 3 matches the code and all observations, but no trace proves it. Proof would need
-   WirePlumber debug logging, i.e. a restart.
+3. Who turns it off is not proven yet.
+   - The kernel starts with the port off at every boot. fp5-mic-kick logs `ADC1 Switch was 'off'`
+     on every boot (5 of 5 since 19.11) and turns it on.
+   - The only config writers of `ADC1 Switch 0` are the Mic1 DisableSequences in HiFi.conf and
+     VoiceCall.conf.
+   - On the first Voice Call activation after boot, ADC1 is off again by the time the call PCMs
+     open. On later calls it stays on.
+   - Checked and ruled out: PipeWire/ACP does **not** use ADC1 as hardware mute here (the Mic1
+     route has `route.hw-mute=false`, read with pw-dump), so ACP never writes it.
+   - Finding the exact writer would need WirePlumber/alsa-lib debug logging, i.e. a restart. B does
+     not depend on knowing it: it measures the mic and recovers.
 4. The UCM DisableSequences also switch `ADC1 Switch` off on every device disable.
 5. Stock Android (`mixer_paths_yupikqrd.xml`) never toggles a port switch mid-stream. It sets the
    downstream equivalent (`ADC1 ChMap`) as part of the path, **before** the stream opens. There is
@@ -67,14 +64,10 @@ Both were ordinary CS calls, not VoLTE, using the phone's own mic and earpiece.
   real binary is `pacat` (and imsd's `pw-record` is `pw-cat`). It now lists `pa:<source>` and
   `pw:<source>` and leaves out the probe.
 
-**A — UCM** (optional, needs a WirePlumber restart or a reboot):
-- `fp5.conf`: new remap control `FP5 Mic Capture Volume`, which is the volume only, an alias of
-  `ADC1 Volume`.
-- `HiFi.conf` and `VoiceCall.conf` Mic1:
-  - `CaptureMixer "default:${CardId}"`, `CaptureMixerElem "FP5 Mic"`,
-    `CaptureVolume "FP5 Mic Capture Volume"`. ACP keeps the same hardware mic gain but mutes in
-    software, and never writes `ADC1 Switch` again.
-  - The DisableSequences no longer contain `cset 'ADC1 Switch' 0`.
+**A — UCM** (optional, needs a WirePlumber restart or a reboot): `HiFi.conf` and `VoiceCall.conf`
+Mic1 DisableSequences no longer contain `cset 'ADC1 Switch' 0`. The EnableSequences still set it
+to 1. Once fp5-mic-kick (boot) or a call has turned it on, nothing in the config turns it off
+again. B does not need A; A removes one way the port can end up off.
 
 ### Files
 | File | Installed to | Note |
@@ -83,8 +76,8 @@ Both were ordinary CS calls, not VoLTE, using the phone's own mic and earpiece.
 | `fp5-mic-level` | `/var/lib/fp5-oot/bin/` | new, read-only level probe |
 | `fp5-call-audio-snap` | `/var/lib/fp5-oot/bin/` | rec= fix |
 | `fp5-call-mic.service` | `~fp5/.config/systemd/user/` | comment only |
-| `ucm/{fp5,HiFi,VoiceCall}.conf` | `/var/lib/fp5-oot/ucm2/Fairphone/fp5/` | part A, only with `--ucm` |
-| `ucm/orig/*` | – | the installed originals (sha d53af1bd / 4eccb3e6 / 727ab2b0) |
+| `ucm/{HiFi,VoiceCall}.conf` | `/var/lib/fp5-oot/ucm2/Fairphone/fp5/` | part A, only with `--ucm` |
+| `ucm/orig/*` | – | the installed originals (sha 4eccb3e6 / 727ab2b0) |
 | `v3-stage/*.sh` | `~/.local/share/fp5-mic-staging-v3/` | install / rollback / dry run |
 
 ### Install / rollback

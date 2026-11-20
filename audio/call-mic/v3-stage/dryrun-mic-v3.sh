@@ -23,7 +23,6 @@ chk "$B/fp5-call-mic" 4f11f769 "fp5-call-mic v2"
 chk "$B/fp5-call-audio-snap" ea65b081 "fp5-call-audio-snap v2"
 chk "$B/fp5-mic-level" - "fp5-mic-level"
 chk "$UNIT" e580ae58 "fp5-call-mic.service v2"
-chk "$U/fp5.conf" d53af1bd "UCM fp5.conf (only with --ucm)"
 chk "$U/HiFi.conf" 4eccb3e6 "UCM HiFi.conf (only with --ucm)"
 chk "$U/VoiceCall.conf" 727ab2b0 "UCM VoiceCall.conf (only with --ucm)"
 echo "== 3. state"
@@ -33,7 +32,7 @@ a=$(amixer -c F5 cget name='ADC1 Switch' 2>/dev/null | sed -n 's/.*: values=//p'
 echo "   ADC1 Switch now: ${a:-?} (read only)"
 echo "   call state: $(python3 "$S/fp5-call-audio-snap" --state 2>/dev/null)"
 echo "== 4. UCM syntax of staged files (alsa-lib parser, read-only)"
-python3 - "$S"/ucm/fp5.conf "$S"/ucm/HiFi.conf "$S"/ucm/VoiceCall.conf <<'PY' 2>&1 | sed 's/^/   /'
+python3 - "$S"/ucm/HiFi.conf "$S"/ucm/VoiceCall.conf <<'PY' 2>&1 | sed 's/^/   /'
 import ctypes, sys
 a = ctypes.CDLL("libasound.so.2")
 for f in sys.argv[1:]:

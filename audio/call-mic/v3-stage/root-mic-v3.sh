@@ -31,7 +31,6 @@ check_old "$B/fp5-call-mic"        4f11f7699e31d86c444261376234c2d7e67f178f5721d
 check_old "$B/fp5-call-audio-snap" ea65b08198c64367f4f972a1a50c80897397b7e0ddc5e6a9db06892b5c8bd8f2
 check_old "$UNIT"                  e580ae58315b9a432d381ebd16e81f0b2fbbfa35394f12bc0cd16d95c3fb3346
 if [ "$WHAT" = b+ucm ]; then
-    check_old "$U/fp5.conf"       d53af1bdb82f1a2420254590ee94f272e58469b6d52fa35fbec3ea969e6ace47
     check_old "$U/HiFi.conf"      4eccb3e6253894861de746b646d63ce418efa59ac768bfa69580f8baff96e2f1
     check_old "$U/VoiceCall.conf" 727ab2b0827b842d5ea9b2d85f7ea544d13edb6f9d004622225bce0c5276b122
 fi
@@ -49,7 +48,6 @@ keep "$B/fp5-call-audio-snap" fp5-call-audio-snap
 keep "$B/fp5-mic-level" fp5-mic-level
 keep "$UNIT" fp5-call-mic.service
 if [ "$WHAT" = b+ucm ]; then
-    keep "$U/fp5.conf" ucm-fp5.conf
     keep "$U/HiFi.conf" ucm-HiFi.conf
     keep "$U/VoiceCall.conf" ucm-VoiceCall.conf
     echo ucm > "$D/ucm-changed"
@@ -87,12 +85,11 @@ put 0755 "$OWNB" "$S/fp5-call-audio-snap" "$B/fp5-call-audio-snap"
 put 0755 "$OWNB" "$S/fp5-mic-level" "$B/fp5-mic-level"
 put 0644 "$OWNU" "$S/fp5-call-mic.service" "$UNIT"
 if [ "$WHAT" = b+ucm ]; then
-    put 0644 "$OWNB" "$S/ucm/fp5.conf" "$U/fp5.conf"
     put 0644 "$OWNB" "$S/ucm/HiFi.conf" "$U/HiFi.conf"
     put 0644 "$OWNB" "$S/ucm/VoiceCall.conf" "$U/VoiceCall.conf"
 fi
 inst="$B/fp5-call-mic $B/fp5-call-audio-snap $B/fp5-mic-level $UNIT"
-[ "$WHAT" = b+ucm ] && inst="$inst $U/fp5.conf $U/HiFi.conf $U/VoiceCall.conf"
+[ "$WHAT" = b+ucm ] && inst="$inst $U/HiFi.conf $U/VoiceCall.conf"
 sha256sum $inst > "$D/installed.sha256"
 date "+%F %T %Z installed v3 ($WHAT)" >> "$D/applied.log"
 echo "root part OK"

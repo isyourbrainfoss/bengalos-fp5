@@ -2,8 +2,8 @@
 # FP5 first-call dead mic fix (bengalos-fp5 fix/first-call-mic): installer.
 # Run as fp5 in a terminal, NOT during a call. One run0 password prompt.
 #   sh install-mic-v3.sh          -> part B: fp5-call-mic v3 (+ level probe, snapshot fix)
-#   sh install-mic-v3.sh --ucm    -> part B + part A (UCM: ADC1 no longer used as mute,
-#                                    not switched off on disable)
+#   sh install-mic-v3.sh --ucm    -> part B + part A (UCM: Mic1 DisableSequences no
+#                                    longer switch 'ADC1 Switch' off)
 # Backup: /var/lib/fp5-backup/<ts>-first-call-mic/ (with rollback.sh).
 # Restarts nothing. B is active from the next call. A needs a WirePlumber
 # restart (separate, optional step printed at the end) or the next boot.

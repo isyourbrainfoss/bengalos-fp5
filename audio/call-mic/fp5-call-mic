@@ -13,10 +13,9 @@
 #    (when the first PCM on it opens). Flipping it while the call stream is
 #    open changes nothing until every PCM on that backend closes and reopens.
 #  * On the first Voice Call of a boot the switch is OFF when the call PCMs
-#    open (PipeWire/ACP uses ADC1 as the hardware mute of the mic and the
-#    Voice Call device starts out "muted" after boot). v2 switched it on
-#    0.5 s later — too late for the open stream, so the mic stayed silent
-#    until a redial reopened everything.
+#    open (kernel default after boot; exact writer not proven, see
+#    CHANGES.md). v2 switched it on 0.5 s later — too late for the open
+#    stream, so the mic stayed silent until a redial reopened everything.
 #
 # v3:
 #  1. ADC1 on immediately (no 0.5 s sleep), log what it was;
