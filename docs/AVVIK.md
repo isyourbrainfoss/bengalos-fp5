@@ -1,13 +1,15 @@
 # FP5 BengalOS – avviksdokument (ikke-standard oppsett)
 
 Telefon: lab-FP5, maskin «phosh» (bruker fp5), BengalOS fra intern UFS (A/B via systemd-sysupdate fra isyourbrainfoss/bengalos-fp5 fp5-feed).
-Sist oppdatert: 20. nov 2026 kl. 13:00 (norsk tid). Nye avvik legges øverst i sin seksjon.
+Sist oppdatert: 20. nov 2026 kl. 16:30 (norsk tid). Nye avvik legges øverst i sin seksjon.
 Prinsipp: alt som avviker fra offisiell BengalOS står her med plassering, hvorfor og hvordan det fjernes.
 
 ## 1. Bil / Tesla (Bluetooth)
 
 | Avvik | Hvor | Hvorfor | Av / tilbake |
 |---|---|---|---|
+| **HFP-bro v3 – FORBEREDT, ikke installert** (20.11 16:21) | `~/.local/share/fp5-hfp-staging-v3/` (fp5_hfp_audio.py fab061b1…, fp5-hfp-modem-bridge 83fe4a29…), gren `feat/hfp-call-control` 769e81f, forhåndsutgivelse `hfp-v3-769e81f` | Funn etter testen 16:04: (1) bilens HFP-mikrofon sto på **0 % volum** (lagret i WirePlumber `default-routes`, `handsfree-input` = 0.0, ikke dempet) – derfor hørte motparten ingenting; v3 setter den til 100 % før oppringing og passer på under samtalen (maks 6 ganger). (2) gnome-calls 51.1 har en feil: når imsd-ofonod starter på nytt (skjer mange ganger om dagen, sist 15:59–16:02), beholder den et dødt modem, så VoLTE-anrop ikke vises på telefonen (16:04) eller calls-daemon krasjer (08:40, 09:15, 12:27). v3 starter calls-daemon på nytt 5 s etter at imsd-ofonod er tilbake, bare når ingen samtale pågår. (3) ekstra logging for legg-på fra bilen. | Installer (ett passord): `sh ~/.local/share/fp5-hfp-staging-v3/install-v3.sh`. Tilbake: `sh ~/.local/share/fp5-hfp-staging-v3/rollback-v3.sh` (v2 tilbake; mikrofonvolumet blir stående på 100 %). Slå av bare gnome-calls-omstarten: `FP5_CALLS_REFRESH=off` i tjenesten. Tørrkjøring: `python3 ~/.local/share/fp5-hfp-staging-v3/dryrun-v3.py`. |
+| **HFP-bro v2 (bilmikrofon)** (installert 20.11 16:03:54) | `/var/lib/fp5-oot/bin/fp5_hfp_audio.py` (af2b5369…) + `fp5-hfp-modem-bridge` (174359df…), gren `feat/hfp-call-control` 08c6789 | Motparten hørte ikke Kristian ved anrop fra bilen (12:27, 12:56): v1 fant ikke bilens mikrofon. v2 bytter bilen til HFP og gjør bilens høyttaler og mikrofon (WirePlumbers SCO-loopback) til standard **før** VoLTE-oppringingen, uten å flytte noe midt i samtalen. **Test 16:04 (VoLTE fra Tesla):** Kristian hørte motparten, men **motparten hørte ingenting**; legg på fungerte ikke (måtte legge på fra den andre telefonen; broen fikk ingen legg-på fra bilen); samtalen **vistes ikke på telefonen**, bare på bilskjermen. Årsaker og fiks: se v3 over. | Backup `/var/lib/fp5-backup/20261120-160349-hfp-bridge-v2`. Tilbake: `sh ~/.local/share/fp5-hfp-staging-v2/rollback-v2.sh` (gir 294e54f-versjonen). |
 | **Rattknapper venstre/høyre = spoling** (installert 20.11 12:50) | `~/.local/bin/fp5-car-seek` (sha db10f6b0…), `~/.config/systemd/user/fp5-car-seek.service` (aktivert) | GNOME Podcasts har ingen kø og ignorerer neste/forrige. Tjenesten lytter etter MPRIS Next/Previous til Podcasts og gjør om til Seek +30 s / −15 s (miljøvariabler `FP5_SEEK_FWD_US` / `FP5_SEEK_BACK_US`). Bare når Podcasts har CanGoNext=false. | `systemctl --user disable --now fp5-car-seek` og slett de to filene |
 | **Biltilkoblingsvakt for mediestyring** (installert 20.11 12:50) | `~/.local/bin/fp5-car-mpris-guard` (sha cae0a975…), `~/.config/systemd/user/fp5-car-mpris-guard.service` (aktivert) | Etter at bilen kobler til på nytt mister BlueZ den registrerte spilleren, slik at play/pause/neste fra bilen ikke virker (skjedde 20.11 morgen og 12:40). Vakten starter `mpris-proxy` (brukertjeneste) på nytt 4 s etter at MediaControl1 blir tilkoblet, maks én gang per 20 s. | `systemctl --user disable --now fp5-car-mpris-guard` og slett filene |
 | Play/pause fra bil | standard (mpris-proxy + gsd-media-keys) | Ingen endring – virker når spiller er registrert | – |
@@ -18,17 +20,18 @@ Prinsipp: alt som avviker fra offisiell BengalOS står her med plassering, hvorf
 | Waydroid lmkd-fiks | `ro.lmk.use_minfree_levels=false` i `/var/lib/waydroid/waydroid.cfg` og `waydroid_base.prop` | Hindrer at Android dreper Tesla-appen | `run0 sh /var/lib/fp5-backup/20261119-waydroid-lmk/rollback.sh` |
 | Frunk som hurtiginnstilling | `~/.local/bin/tesla-frunk` + Phosh-hurtiginnstilling | Ønsket fra låseskjermen | se FP5-siden |
 
-Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 20.11 10:05 og 12:43). calls-daemon krasjer ved oppringing fra bilen.
+Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 20.11 10:05 og 12:43). Bilmikrofon stille og anrop som ikke vises på telefonen (test 16:04): fiks forberedt i v3, ikke installert. calls-daemon-krasjene (08:40, 09:15, 12:27) har samme årsak som at anropet ikke vises (gnome-calls-feil etter imsd-ofonod-omstart). Om legg-på fra bilen virker er ikke bevist (broen fikk ingen forespørsel 16:05).
 
 ## 2. Samtaler og mikrofon
 
 | Avvik | Hvor | Av / tilbake |
 |---|---|---|
-| fp5-call-mic v2 (skrur på mikrofon ved samtale) + fp5-call-audio-snap | `~/.config/systemd/user/fp5-call-mic.service`, gren fix/call-mic-race | `/var/lib/fp5-backup/20261119-call-mic/rollback.sh` |
+| **fp5-call-mic v3 + fp5-mic-level** (installert 20.11 16:04:05, bare del B, ingen UCM-endring) – for stille telefonmikrofon i første samtale etter oppstart (09:04, 12:21) | `/var/lib/fp5-oot/bin/fp5-call-mic` (defd321e…), `/var/lib/fp5-oot/bin/fp5-mic-level` (20005206…, ny), `/var/lib/fp5-oot/bin/fp5-call-audio-snap` (ec5977cf…), `~/.config/systemd/user/fp5-call-mic.service` (deee1bb8…), gren `fix/first-call-mic` 730f310. Skrur på ADC1 med en gang, sjekker nivået (~1,5 s, bare nivå, ingen lyd lagres) og åpner mikrofonveien på nytt hvis den er flat; hopper over bilsamtaler. Kjørte ikke ved bilsamtalen 16:04 – som forventet (bilsamtaler bruker ikke telefonens mikrofon). Ikke testet på første samtale etter oppstart ennå. | Backup `/var/lib/fp5-backup/20261120-160401-first-call-mic`. Tilbake: `sh ~/.local/share/fp5-mic-staging-v3/rollback-mic-v3.sh` (ett passord, ingen omstart) |
+| fp5-call-mic v2 (erstattet av v3 20.11 16:04) + fp5-call-audio-snap | `~/.config/systemd/user/fp5-call-mic.service`, gren fix/call-mic-race | `/var/lib/fp5-backup/20261119-call-mic/rollback.sh` |
 | fp5-mic-kick ved oppstart | `~/.config/systemd/user/fp5-mic-kick.service` | `systemctl --user disable --now fp5-mic-kick` |
 | Egne UCM-filer | `/var/lib/fp5-oot/ucm2/` | – |
 | VoLTE (imsd/imsd-ofonod), IMS-grant-vekking | fp5-ims, egen vekker før IMS-grant utløper | se FP5-siden |
-| **Foreslått, ikke gjort:** ADC1-fiks (UCM + fp5-call-mic v3) for stille mikrofon i starten av samtaler | – | venter på ja |
+| **Foreslått, ikke gjort:** UCM-delen (del A) av ADC1-fiksen | – | venter på ja (trenger WirePlumber-omstart) |
 
 ## 3. Alarm, timer og vibrasjon
 
