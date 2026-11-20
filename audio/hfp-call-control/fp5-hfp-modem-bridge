@@ -1,0 +1,562 @@
+#!/usr/bin/python3
+# fp5-hfp-modem-bridge — let a Bluetooth car kit (HFP Hands-Free) dial, answer
+# and hang up VoLTE calls on the FP5 (BengalOS), and carry call audio over SCO.
+#
+# PipeWire's native HFP Audio Gateway only knows ModemManager's Voice API. On
+# the FP5, calls are made by imsd (userspace IMS) through imsd-ofonod, an
+# oFono-compatible VoiceCallManager; ModemManager never sees them. This daemon
+# owns its own bus name and exposes a ModemManager-shaped modem whose Voice /
+# Call objects mirror imsd-ofonod's calls. A patched libspa-bluez5 is pointed
+# at it with
+#   bluez5.hfphsp-backend-native-modem         = "fp5-imsd"
+#   bluez5.hfphsp-backend-native-modem-service = "io.github.isyourbrainfoss.Fp5HfpModem"
+# (an unpatched PipeWire ignores the service key and, since no real modem has
+# Device "fp5-imsd", links to nothing: same as today.)
+#
+# Car -> phone:  ATD -> Voice.CreateCall -> org.ofono VoiceCallManager.Dial
+#                ATA -> Call.Accept      -> VoiceCall.Answer
+#                AT+CHUP -> Call.Hangup  -> VoiceCall.Hangup
+#                AT+VTS  -> Call.SendDtmf -> VoiceCallManager.SendTones
+# Phone -> car:  oFono CallAdded/PropertyChanged/CallRemoved -> MM CallAdded /
+#                Call.StateChanged / CallDeleted (PipeWire turns those into
+#                +CIEV, RING/+CLIP and +CLCC).
+# Service/signal/operator/roaming indicators mirror the real ModemManager
+# (read-only). IMEI and own numbers are never exposed. Logs never contain
+# phone numbers.
+#
+# Optional audio routing (fp5_hfp_audio.py): while a call exists and a car is
+# connected, switch its card to the HFP profile and make its SCO nodes the
+# default sink/source (imsd-media plays with pw-play and records with
+# pw-record, so it follows the defaults); restore A2DP + defaults + unmute
+# afterwards, also after a crash.
+import argparse, os, re, signal, sys, syslog
+
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+SERVICE = "io.github.isyourbrainfoss.Fp5HfpModem"
+MM_ROOT = "/org/freedesktop/ModemManager1"
+MODEM_PATH = MM_ROOT + "/Modem/fp5imsd0"
+CALL_PREFIX = MM_ROOT + "/Call/fp5imsd"
+MODEM_DEVICE = "fp5-imsd"
+
+IF_MODEM = "org.freedesktop.ModemManager1.Modem"
+IF_3GPP = "org.freedesktop.ModemManager1.Modem.Modem3gpp"
+IF_VOICE = "org.freedesktop.ModemManager1.Modem.Voice"
+IF_CALL = "org.freedesktop.ModemManager1.Call"
+IF_PROPS = "org.freedesktop.DBus.Properties"
+IF_OM = "org.freedesktop.DBus.ObjectManager"
+ERR_FAILED = "org.freedesktop.ModemManager1.Error.Core.Failed"
+ERR_DENIED = "org.freedesktop.ModemManager1.Error.Core.Unauthorized"
+ERR_ARGS = "org.freedesktop.ModemManager1.Error.Core.InvalidArgs"
+
+# ModemManager enums
+MM_MODEM_STATE_ENABLED = 6
+MM_MODEM_STATE_REGISTERED = 8
+MM_CALL_STATE = {"dialing": 1, "alerting": 2, "incoming": 3, "active": 4,
+                 "held": 5, "waiting": 6, "disconnected": 7}
+MM_CALL_STATE_UNKNOWN = 0
+MM_CALL_STATE_TERMINATED = 7
+MM_DIR_INCOMING, MM_DIR_OUTGOING = 1, 2
+REASON_UNKNOWN, REASON_OUTGOING, REASON_INCOMING, REASON_ACCEPTED, REASON_TERMINATED = 0, 1, 2, 3, 4
+
+DIAL_RE = re.compile(r"^\+?[0-9*#ABC]{1,30}$")
+DTMF_RE = re.compile(r"^[0-9*#A-D]{1,32}$")
+
+INTROSPECTION = """
+<node>
+ <interface name="org.freedesktop.DBus.ObjectManager">
+  <method name="GetManagedObjects"><arg type="a{oa{sa{sv}}}" direction="out"/></method>
+  <signal name="InterfacesAdded"><arg type="o"/><arg type="a{sa{sv}}"/></signal>
+  <signal name="InterfacesRemoved"><arg type="o"/><arg type="as"/></signal>
+ </interface>
+ <interface name="org.freedesktop.ModemManager1.Modem">
+  <property name="Device" type="s" access="read"/>
+  <property name="Manufacturer" type="s" access="read"/>
+  <property name="Model" type="s" access="read"/>
+  <property name="State" type="i" access="read"/>
+  <property name="SignalQuality" type="(ub)" access="read"/>
+ </interface>
+ <interface name="org.freedesktop.ModemManager1.Modem.Modem3gpp">
+  <property name="OperatorName" type="s" access="read"/>
+  <property name="RegistrationState" type="u" access="read"/>
+ </interface>
+ <interface name="org.freedesktop.ModemManager1.Modem.Voice">
+  <method name="CreateCall"><arg name="properties" type="a{sv}" direction="in"/><arg name="path" type="o" direction="out"/></method>
+  <method name="HangupAll"/>
+  <signal name="CallAdded"><arg name="path" type="o"/></signal>
+  <signal name="CallDeleted"><arg name="path" type="o"/></signal>
+  <property name="Calls" type="ao" access="read"/>
+ </interface>
+ <interface name="org.freedesktop.ModemManager1.Call">
+  <method name="Start"/>
+  <method name="Accept"/>
+  <method name="Hangup"/>
+  <method name="SendDtmf"><arg name="dtmf" type="s" direction="in"/></method>
+  <signal name="StateChanged"><arg name="old" type="i"/><arg name="new" type="i"/><arg name="reason" type="u"/></signal>
+  <property name="State" type="i" access="read"/>
+  <property name="StateReason" type="i" access="read"/>
+  <property name="Direction" type="i" access="read"/>
+  <property name="Number" type="s" access="read"/>
+  <property name="Multiparty" type="b" access="read"/>
+ </interface>
+</node>
+"""
+NODE = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+IFACE = {i.name: i for i in NODE.interfaces}
+
+_print = False
+
+
+def log(msg, prio=syslog.LOG_INFO):
+    msg = redact(msg)
+    if _print:
+        print("fp5-hfp-modem-bridge: " + msg, file=sys.stderr, flush=True)
+    else:
+        syslog.syslog(prio, msg)
+
+
+def errname(e):
+    """Only the D-Bus error name: imsd error texts can carry SIP URIs/domains."""
+    return Gio.DBusError.get_remote_error(e) or "error %d" % e.code
+
+
+def redact(s):
+    s = re.sub(r"([0-9A-Fa-f]{2}[:_-]){5}[0-9A-Fa-f]{2}", "XX:XX", str(s))
+    return re.sub(r"\+?[0-9][0-9 ]{5,}[0-9]", "<num>", s)
+
+
+class Call:
+    def __init__(self, idx, ofono_path, props):
+        self.path = "%s%d" % (CALL_PREFIX, idx)
+        self.ofono_path = ofono_path
+        st = props.get("State", "dialing")
+        self.state = MM_CALL_STATE.get(st, MM_CALL_STATE_UNKNOWN)
+        self.direction = MM_DIR_INCOMING if st in ("incoming", "waiting") else MM_DIR_OUTGOING
+        self.reason = REASON_INCOMING if self.direction == MM_DIR_INCOMING else REASON_OUTGOING
+        self.number = props.get("LineIdentification", "") or ""
+        self.multiparty = bool(props.get("Multiparty", False))
+        self.reg_id = 0
+
+    def props(self):
+        return {"State": GLib.Variant("i", self.state),
+                "StateReason": GLib.Variant("i", self.reason),
+                "Direction": GLib.Variant("i", self.direction),
+                "Number": GLib.Variant("s", self.number),
+                "Multiparty": GLib.Variant("b", self.multiparty)}
+
+
+class Bridge:
+    def __init__(self, bus, ofono_bus, mm_bus, audio=None, allow_uids=None):
+        self.bus = bus
+        self.ofono_bus = ofono_bus
+        self.mm_bus = mm_bus
+        self.audio = audio
+        self.allow_uids = allow_uids if allow_uids is not None else {0, os.getuid()}
+        self.calls = {}          # ofono path -> Call
+        self.next_idx = 0
+        self.ofono_modem = None  # path
+        self.ofono_online = False
+        self.mm_state = 0
+        self.mm_modem = None
+        self.signal = (0, False)
+        self.operator = ""
+        self.regstate = 0
+        self.reg_ids = []
+        self.subs = []
+        self.uid_cache = {}
+
+    # ---------------- export ----------------
+    def export(self):
+        b = self.bus
+        self.reg_ids.append(b.register_object(MM_ROOT, IFACE[IF_OM], self._method, None, None))
+        for name in (IF_MODEM, IF_3GPP, IF_VOICE):
+            self.reg_ids.append(b.register_object(MODEM_PATH, IFACE[name], self._method,
+                                                  self._get_prop, None))
+
+    def modem_props(self, iface):
+        if iface == IF_MODEM:
+            return {"Device": GLib.Variant("s", MODEM_DEVICE),
+                    "Manufacturer": GLib.Variant("s", "Fairphone"),
+                    "Model": GLib.Variant("s", "FP5 imsd"),
+                    "State": GLib.Variant("i", self.state()),
+                    "SignalQuality": GLib.Variant("(ub)", self.signal)}
+        if iface == IF_3GPP:
+            return {"OperatorName": GLib.Variant("s", self.operator),
+                    "RegistrationState": GLib.Variant("u", self.regstate)}
+        if iface == IF_VOICE:
+            return {"Calls": GLib.Variant("ao", [c.path for c in self.calls.values()])}
+        return {}
+
+    def state(self):
+        # "has service" for the car == imsd can place a call right now.
+        if self.ofono_modem and self.ofono_online and (self.mm_bus is None or self.mm_state >= MM_MODEM_STATE_REGISTERED):
+            return MM_MODEM_STATE_REGISTERED
+        return MM_MODEM_STATE_ENABLED
+
+    def _get_prop(self, conn, sender, path, iface, prop):
+        if path == MODEM_PATH:
+            return self.modem_props(iface).get(prop)
+        for c in self.calls.values():
+            if c.path == path:
+                return c.props().get(prop)
+        return None
+
+    def _emit_props(self, path, iface, changed):
+        self.bus.emit_signal(None, path, IF_PROPS, "PropertiesChanged",
+                             GLib.Variant("(sa{sv}as)", (iface, changed, [])))
+
+    def _modem_changed(self, iface, *keys):
+        p = self.modem_props(iface)
+        self._emit_props(MODEM_PATH, iface, {k: p[k] for k in keys})
+
+    # ---------------- access control ----------------
+    def _uid_of(self, sender):
+        if sender in self.uid_cache:
+            return self.uid_cache[sender]
+        try:
+            r = self.bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                   "org.freedesktop.DBus", "GetConnectionUnixUser",
+                                   GLib.Variant("(s)", (sender,)), GLib.VariantType("(u)"),
+                                   Gio.DBusCallFlags.NONE, 2000, None)
+            uid = r.unpack()[0]
+        except GLib.Error:
+            uid = None
+        self.uid_cache[sender] = uid
+        return uid
+
+    # ---------------- method dispatch ----------------
+    def _method(self, conn, sender, path, iface, method, params, inv):
+        try:
+            if iface == IF_OM and method == "GetManagedObjects":
+                return inv.return_value(GLib.Variant("(a{oa{sa{sv}}})", (self.managed_objects(),)))
+            if self._uid_of(sender) not in self.allow_uids:
+                log("refused %s.%s from uid %s" % (iface.rsplit(".", 1)[-1], method, self._uid_of(sender)),
+                    syslog.LOG_WARNING)
+                return inv.return_dbus_error(ERR_DENIED, "not allowed")
+            if iface == IF_VOICE and method == "CreateCall":
+                return self.create_call(params.unpack()[0], inv)
+            if iface == IF_VOICE and method == "HangupAll":
+                return self._ofono_vcm("HangupAll", None, inv)
+            call = next((c for c in self.calls.values() if c.path == path), None)
+            if iface == IF_CALL:
+                if call is None:
+                    return inv.return_dbus_error(ERR_FAILED, "no such call")
+                if method == "Start":
+                    return inv.return_value(None)  # oFono Dial already started it
+                if method == "Accept":
+                    log("car: accept %s" % call.path.rsplit("/", 1)[-1])
+                    return self._ofono(call.ofono_path, "org.ofono.VoiceCall", "Answer", None, inv)
+                if method == "Hangup":
+                    log("car: hangup %s" % call.path.rsplit("/", 1)[-1])
+                    return self._ofono(call.ofono_path, "org.ofono.VoiceCall", "Hangup", None, inv)
+                if method == "SendDtmf":
+                    tones = params.unpack()[0]
+                    if not DTMF_RE.match(tones):
+                        return inv.return_dbus_error(ERR_ARGS, "invalid dtmf")
+                    return self._ofono_vcm("SendTones", GLib.Variant("(s)", (tones,)), inv)
+            inv.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
+        except Exception as e:  # never let a car command kill the daemon
+            log("method %s failed: %s" % (method, e), syslog.LOG_ERR)
+            inv.return_dbus_error(ERR_FAILED, "internal error")
+
+    def managed_objects(self):
+        objs = {MODEM_PATH: {i: self.modem_props(i) for i in (IF_MODEM, IF_3GPP, IF_VOICE)}}
+        for c in self.calls.values():
+            objs[c.path] = {IF_CALL: c.props()}
+        return objs
+
+    def create_call(self, props, inv):
+        number = props.get("number")
+        if not isinstance(number, str) or not DIAL_RE.match(number):
+            return inv.return_dbus_error(ERR_ARGS, "invalid number")
+        if not self.ofono_modem:
+            return inv.return_dbus_error(ERR_FAILED, "imsd not available")
+        log("car: dial request")
+
+        def done(src, res):
+            try:
+                opath = src.call_finish(res).unpack()[0]
+            except GLib.Error as e:
+                log("Dial failed: %s" % errname(e), syslog.LOG_WARNING)
+                return inv.return_dbus_error(ERR_FAILED, "dial failed")
+            call = self.calls.get(opath) or self._add_call(opath, {"State": "dialing"})
+            inv.return_value(GLib.Variant("(o)", (call.path,)))
+        self.ofono_bus.call("org.ofono", self.ofono_modem, "org.ofono.VoiceCallManager", "Dial",
+                            GLib.Variant("(ss)", (number, "")), GLib.VariantType("(o)"),
+                            Gio.DBusCallFlags.NONE, 30000, None, done)
+
+    def _ofono(self, path, iface, method, args, inv):
+        def done(src, res):
+            try:
+                src.call_finish(res)
+                inv.return_value(None)
+            except GLib.Error as e:
+                log("%s failed: %s" % (method, errname(e)), syslog.LOG_WARNING)
+                inv.return_dbus_error(ERR_FAILED, method + " failed")
+        self.ofono_bus.call("org.ofono", path, iface, method, args, None,
+                            Gio.DBusCallFlags.NONE, 15000, None, done)
+
+    def _ofono_vcm(self, method, args, inv):
+        if not self.ofono_modem:
+            return inv.return_dbus_error(ERR_FAILED, "imsd not available")
+        return self._ofono(self.ofono_modem, "org.ofono.VoiceCallManager", method, args, inv)
+
+    # ---------------- call mirror ----------------
+    def _add_call(self, opath, props):
+        if opath in self.calls:
+            return self.calls[opath]
+        call = Call(self.next_idx, opath, props)
+        self.next_idx += 1
+        self.calls[opath] = call
+        call.reg_id = self.bus.register_object(call.path, IFACE[IF_CALL], self._method, self._get_prop, None)
+        self.bus.emit_signal(None, MM_ROOT, IF_OM, "InterfacesAdded",
+                             GLib.Variant("(oa{sa{sv}})", (call.path, {IF_CALL: call.props()})))
+        self.bus.emit_signal(None, MODEM_PATH, IF_VOICE, "CallAdded", GLib.Variant("(o)", (call.path,)))
+        self._modem_changed(IF_VOICE, "Calls")
+        log("call %s added dir=%s state=%d" % (call.path.rsplit("/", 1)[-1],
+            "in" if call.direction == MM_DIR_INCOMING else "out", call.state))
+        self._audio()
+        return call
+
+    def _set_call_state(self, call, new, reason):
+        if new == call.state:
+            return
+        old, call.state, call.reason = call.state, new, reason
+        self.bus.emit_signal(None, call.path, IF_CALL, "StateChanged", GLib.Variant("(iiu)", (old, new, reason)))
+        self._emit_props(call.path, IF_CALL, {"State": GLib.Variant("i", new),
+                                              "StateReason": GLib.Variant("i", reason)})
+        log("call %s state %d -> %d" % (call.path.rsplit("/", 1)[-1], old, new))
+        self._audio()
+
+    def _remove_call(self, opath):
+        call = self.calls.get(opath)
+        if call is None:
+            return
+        self._set_call_state(call, MM_CALL_STATE_TERMINATED, REASON_TERMINATED)
+        del self.calls[opath]
+        self.bus.emit_signal(None, MODEM_PATH, IF_VOICE, "CallDeleted", GLib.Variant("(o)", (call.path,)))
+        self.bus.emit_signal(None, MM_ROOT, IF_OM, "InterfacesRemoved",
+                             GLib.Variant("(oas)", (call.path, [IF_CALL])))
+        self.bus.unregister_object(call.reg_id)
+        self._modem_changed(IF_VOICE, "Calls")
+        log("call %s removed" % call.path.rsplit("/", 1)[-1])
+        self._audio()
+
+    def _drop_all_calls(self):
+        for opath in list(self.calls):
+            self._remove_call(opath)
+
+    def _audio(self):
+        if self.audio:
+            live = [c for c in self.calls.values() if c.state != MM_CALL_STATE_TERMINATED]
+            self.audio.calls_changed(len(live))
+
+    # ---------------- oFono (imsd-ofonod) side ----------------
+    def watch_ofono(self):
+        sub = self.ofono_bus.signal_subscribe
+        self.subs.append(sub("org.ofono", "org.ofono.Manager", None, None, None,
+                             Gio.DBusSignalFlags.NONE, self._on_ofono_manager))
+        self.subs.append(sub("org.ofono", "org.ofono.Modem", "PropertyChanged", None, None,
+                             Gio.DBusSignalFlags.NONE, self._on_ofono_modem_prop))
+        self.subs.append(sub("org.ofono", "org.ofono.VoiceCallManager", None, None, None,
+                             Gio.DBusSignalFlags.NONE, self._on_vcm))
+        self.subs.append(sub("org.ofono", "org.ofono.VoiceCall", "PropertyChanged", None, None,
+                             Gio.DBusSignalFlags.NONE, self._on_call_prop))
+        Gio.bus_watch_name_on_connection(self.ofono_bus, "org.ofono", Gio.BusNameWatcherFlags.NONE,
+                                         self._ofono_appeared, self._ofono_vanished)
+
+    def _ofono_appeared(self, conn, name, owner):
+        log("imsd-ofonod appeared")
+        conn.call("org.ofono", "/", "org.ofono.Manager", "GetModems", None,
+                  GLib.VariantType("(a(oa{sv}))"), Gio.DBusCallFlags.NONE, 5000, None, self._got_modems)
+
+    def _got_modems(self, src, res):
+        try:
+            modems = src.call_finish(res).unpack()[0]
+        except GLib.Error as e:
+            log("GetModems failed: %s" % errname(e), syslog.LOG_WARNING)
+            return
+        for path, props in modems:
+            if "org.ofono.VoiceCallManager" in props.get("Interfaces", []) or len(modems) == 1:
+                self._use_modem(path, props)
+                break
+
+    def _use_modem(self, path, props):
+        self.ofono_modem = path
+        self.ofono_online = bool(props.get("Online", False))
+        self._modem_changed(IF_MODEM, "State")
+        self.ofono_bus.call("org.ofono", path, "org.ofono.VoiceCallManager", "GetCalls", None,
+                            GLib.VariantType("(a(oa{sv}))"), Gio.DBusCallFlags.NONE, 5000, None,
+                            self._got_calls)
+
+    def _got_calls(self, src, res):
+        try:
+            for opath, props in src.call_finish(res).unpack()[0]:
+                self._add_call(opath, props)
+        except GLib.Error as e:
+            log("GetCalls failed: %s" % errname(e), syslog.LOG_WARNING)
+
+    def _ofono_vanished(self, conn, name):
+        if self.ofono_modem:
+            log("imsd-ofonod vanished")
+        self.ofono_modem = None
+        self.ofono_online = False
+        self._drop_all_calls()
+        self._modem_changed(IF_MODEM, "State")
+
+    def _on_ofono_manager(self, conn, sender, path, iface, sig, params):
+        if sig == "ModemAdded" and not self.ofono_modem:
+            p, props = params.unpack()
+            self._use_modem(p, props)
+        elif sig == "ModemRemoved" and params.unpack()[0] == self.ofono_modem:
+            self._ofono_vanished(conn, "org.ofono")
+
+    def _on_ofono_modem_prop(self, conn, sender, path, iface, sig, params):
+        if path != self.ofono_modem:
+            return
+        name, value = params.unpack()
+        if name == "Online":
+            self.ofono_online = bool(value)
+            self._modem_changed(IF_MODEM, "State")
+        elif name == "Interfaces" and "org.ofono.VoiceCallManager" not in value:
+            self._drop_all_calls()
+
+    def _on_vcm(self, conn, sender, path, iface, sig, params):
+        if path != self.ofono_modem:
+            return
+        if sig == "CallAdded":
+            opath, props = params.unpack()
+            call = self.calls.get(opath)
+            if call is None:
+                self._add_call(opath, props)
+            elif "State" in props:
+                self._apply_ofono_state(call, props["State"])
+        elif sig == "CallRemoved":
+            self._remove_call(params.unpack()[0])
+
+    def _on_call_prop(self, conn, sender, path, iface, sig, params):
+        call = self.calls.get(path)
+        if call is None:
+            return
+        name, value = params.unpack()
+        if name == "State":
+            self._apply_ofono_state(call, value)
+        elif name == "LineIdentification":
+            call.number = value or ""
+            self._emit_props(call.path, IF_CALL, {"Number": GLib.Variant("s", call.number)})
+        elif name == "Multiparty":
+            call.multiparty = bool(value)
+            self._emit_props(call.path, IF_CALL, {"Multiparty": GLib.Variant("b", call.multiparty)})
+
+    def _apply_ofono_state(self, call, st):
+        new = MM_CALL_STATE.get(st, MM_CALL_STATE_UNKNOWN)
+        reason = {4: REASON_ACCEPTED, 7: REASON_TERMINATED}.get(new, call.reason)
+        self._set_call_state(call, new, reason)
+
+    # ---------------- real ModemManager (read-only mirror) ----------------
+    def watch_mm(self):
+        if self.mm_bus is None:
+            return
+        self.subs.append(self.mm_bus.signal_subscribe("org.freedesktop.ModemManager1", IF_PROPS,
+                         "PropertiesChanged", None, None, Gio.DBusSignalFlags.NONE, self._on_mm_props))
+        Gio.bus_watch_name_on_connection(self.mm_bus, "org.freedesktop.ModemManager1",
+                                         Gio.BusNameWatcherFlags.NONE, self._mm_appeared, self._mm_vanished)
+
+    def _mm_appeared(self, conn, name, owner):
+        conn.call("org.freedesktop.ModemManager1", MM_ROOT, IF_OM, "GetManagedObjects", None,
+                  GLib.VariantType("(a{oa{sa{sv}}})"), Gio.DBusCallFlags.NONE, 5000, None, self._got_mm)
+
+    def _got_mm(self, src, res):
+        try:
+            objs = src.call_finish(res).unpack()[0]
+        except GLib.Error as e:
+            log("ModemManager GetManagedObjects failed: %s" % errname(e), syslog.LOG_WARNING)
+            return
+        for path, ifaces in objs.items():
+            if IF_MODEM in ifaces:
+                self.mm_modem = path
+                self._mm_apply(IF_MODEM, ifaces[IF_MODEM])
+                if IF_3GPP in ifaces:
+                    self._mm_apply(IF_3GPP, ifaces[IF_3GPP])
+                break
+
+    def _mm_vanished(self, conn, name):
+        self.mm_modem, self.mm_state, self.signal = None, 0, (0, False)
+        self._modem_changed(IF_MODEM, "State", "SignalQuality")
+
+    def _on_mm_props(self, conn, sender, path, iface, sig, params):
+        if path != self.mm_modem:
+            return
+        iface, changed, _ = params.unpack()
+        self._mm_apply(iface, changed)
+
+    def _mm_apply(self, iface, p):
+        # Only these keys are copied: never IMEI, own numbers or operator code.
+        if iface == IF_MODEM:
+            keys = []
+            if "State" in p:
+                self.mm_state = int(p["State"]); keys.append("State")
+            if "SignalQuality" in p:
+                q = p["SignalQuality"]
+                self.signal = (int(q[0]), bool(q[1])); keys.append("SignalQuality")
+            if keys:
+                self._modem_changed(IF_MODEM, *keys)
+        elif iface == IF_3GPP:
+            keys = []
+            if "OperatorName" in p:
+                self.operator = str(p["OperatorName"]); keys.append("OperatorName")
+            if "RegistrationState" in p:
+                self.regstate = int(p["RegistrationState"]); keys.append("RegistrationState")
+            if keys:
+                self._modem_changed(IF_3GPP, *keys)
+
+
+def main(argv=None):
+    global _print
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bus", choices=("system", "session"), default="system",
+                    help="bus to own %s on (session only for tests)" % SERVICE)
+    ap.add_argument("--ofono-bus", choices=("system", "session"), default="system")
+    ap.add_argument("--mm-bus", choices=("system", "session", "none"), default="system")
+    ap.add_argument("--audio", choices=("on", "off", "dry"), default=os.environ.get("FP5_HFP_AUDIO", "on"))
+    ap.add_argument("--print", action="store_true", help="log to stderr instead of syslog")
+    a = ap.parse_args(argv)
+    _print = a.print
+    syslog.openlog("fp5-hfp-modem-bridge", 0, syslog.LOG_DAEMON)
+
+    def get(kind):
+        if kind == "none":
+            return None
+        return Gio.bus_get_sync(Gio.BusType.SYSTEM if kind == "system" else Gio.BusType.SESSION, None)
+
+    audio = None
+    if a.audio != "off":
+        import fp5_hfp_audio
+        audio = fp5_hfp_audio.AudioRouter(dry=(a.audio == "dry"), log=log)
+    bridge = Bridge(get(a.bus), get(a.ofono_bus), get(a.mm_bus), audio=audio)
+    bridge.export()
+    loop = GLib.MainLoop()
+
+    def lost(conn, name):
+        log("could not own %s (policy missing or already running)" % name, syslog.LOG_ERR)
+        loop.quit()
+    Gio.bus_own_name_on_connection(bridge.bus, SERVICE, Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
+                                   lambda c, n: log("ready on %s" % n), lost)
+    bridge.watch_ofono()
+    bridge.watch_mm()
+    if audio:
+        audio.startup_recover()
+    for s in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, s, lambda *x: (loop.quit(), False)[1])
+    loop.run()
+    if audio:
+        audio.calls_changed(0)  # leave the car on A2DP if we stop mid-call
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

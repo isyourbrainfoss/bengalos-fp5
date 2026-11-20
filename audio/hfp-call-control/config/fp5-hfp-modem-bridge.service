@@ -1,0 +1,17 @@
+# ~fp5/.config/systemd/user/fp5-hfp-modem-bridge.service
+[Unit]
+Description=FP5: car (Bluetooth HFP) call control + call audio for imsd VoLTE calls
+After=pipewire-pulse.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/var/lib/fp5-oot/bin/fp5-hfp-modem-bridge
+# FP5_HFP_AUDIO=off: call control only; dry: log the pactl steps only
+Environment=FP5_HFP_AUDIO=on
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

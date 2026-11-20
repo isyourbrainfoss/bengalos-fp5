@@ -1,0 +1,19 @@
+#!/bin/sh
+# Writes $XDG_RUNTIME_DIR/fp5-hfp-spa.env (SPA_PLUGIN_DIR=overlay) only if the
+# system libspa-bluez5.so is the exact stock build the patched copy was built
+# against. Otherwise removes the env file -> WirePlumber uses stock plugins.
+set -u
+OOT=${FP5_HFP_OOT:-/var/lib/fp5-oot/spa-hfp}
+ENV=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fp5-hfp-spa.env
+rm -f "$ENV"
+[ -r "$OOT/stock.sha256" ] && [ -d "$OOT/spa-0.2" ] || exit 0
+SYS=$(cat "$OOT/sysdir" 2>/dev/null) || exit 0
+want=$(cut -d' ' -f1 "$OOT/stock.sha256")
+have=$(sha256sum "$SYS/bluez5/libspa-bluez5.so" 2>/dev/null | cut -d' ' -f1)
+if [ -n "$have" ] && [ "$have" = "$want" ]; then
+    echo "SPA_PLUGIN_DIR=$OOT/spa-0.2" > "$ENV"
+    logger -t fp5-hfp-spa "patched libspa-bluez5 enabled"
+else
+    logger -t fp5-hfp-spa "stock libspa-bluez5 changed: patched copy disabled (rebuild needed)"
+fi
+exit 0

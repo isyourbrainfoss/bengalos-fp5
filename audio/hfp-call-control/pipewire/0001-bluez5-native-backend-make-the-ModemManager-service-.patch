@@ -1,0 +1,212 @@
+From 1b80f997ae1cd3d3a8224f0e2d28685626bfe2c4 Mon Sep 17 00:00:00 2001
+From: "Grok Bot (for isyourbrainfoss)"
+ <isyourbrainfoss@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 11:51:41 +0100
+Subject: [PATCH] bluez5: native backend: make the ModemManager service name
+ configurable
+
+Add bluez5.hfphsp-backend-native-modem-service (default
+org.freedesktop.ModemManager1). The native HFP AG then sends its
+CreateCall/Accept/Hangup/SendDtmf calls and its signal matches to that
+name, so a phone whose calls are not handled by ModemManager (a
+userspace IMS stack) can expose a small ModemManager-shaped facade and
+let a car kit dial, answer, hang up and see call state.
+---
+ doc/dox/config/pipewire-props.7.md |  7 +++
+ spa/plugins/bluez5/modemmanager.c  | 77 +++++++++++++++++++-----------
+ 2 files changed, 56 insertions(+), 28 deletions(-)
+
+diff --git a/doc/dox/config/pipewire-props.7.md b/doc/dox/config/pipewire-props.7.md
+index 5555e34..edbf3ab 100644
+--- a/doc/dox/config/pipewire-props.7.md
++++ b/doc/dox/config/pipewire-props.7.md
+@@ -1139,6 +1139,13 @@ Default audio channels.
+ HFP/HSP backend (default: native). Available values: any, none, hsphfpd, ofono, native
+ 
+ @PAR@ monitor-prop  bluez5.hfphsp-backend-native-modem   # string
++ModemManager modem used by the native HFP Audio Gateway, matched against the modem's
++`Device` property. "none" (default) disables call control, "any" uses the first modem.
++
++@PAR@ monitor-prop  bluez5.hfphsp-backend-native-modem-service   # string
++D-Bus name of the ModemManager-compatible service the native HFP Audio Gateway talks to
++(default: org.freedesktop.ModemManager1). Lets a telephony stack that is not driven by
++ModemManager expose the same Modem, Modem3gpp, Voice and Call interfaces under its own name.
+ 
+ @PAR@ monitor-prop  bluez5.hfphsp-backend-native-pts   # boolean
+ Enable specific workarounds for Bluetooth qualification.
+diff --git a/spa/plugins/bluez5/modemmanager.c b/spa/plugins/bluez5/modemmanager.c
+index 4fa29b0..574c0aa 100644
+--- a/spa/plugins/bluez5/modemmanager.c
++++ b/spa/plugins/bluez5/modemmanager.c
+@@ -27,6 +27,11 @@ struct impl {
+ 	DBusConnection *conn;
+ 
+ 	char *allowed_modem_device;
++	/* D-Bus name of the ModemManager-compatible service to follow. Defaults to
++	 * MM_DBUS_SERVICE; bluez5.hfphsp-backend-native-modem-service overrides it
++	 * so a phone can point the HFP AG at a telephony stack that is not driven
++	 * by ModemManager (e.g. a userspace IMS stack behind a small facade). */
++	char *service;
+ 	bool filters_added;
+ 	DBusPendingCall *pending;
+ 	DBusPendingCall *voice_pending;
+@@ -420,7 +425,7 @@ static void mm_get_managed_objects_reply(DBusPendingCall *pending, void *user_da
+ 
+ static bool mm_get_managed_objects(struct impl *this)
+ {
+-	spa_autoptr(DBusMessage) m = dbus_message_new_method_call(MM_DBUS_SERVICE,
++	spa_autoptr(DBusMessage) m = dbus_message_new_method_call(this->service,
+ 								"/org/freedesktop/ModemManager1",
+ 								DBUS_INTERFACE_OBJECTMANAGER,
+ 								"GetManagedObjects");
+@@ -506,7 +511,7 @@ static DBusHandlerResult mm_filter_cb(DBusConnection *bus, DBusMessage *m, void
+ 			goto finish;
+ 		}
+ 
+-		if (spa_streq(name, MM_DBUS_SERVICE)) {
++		if (spa_streq(name, this->service)) {
+ 			if (old_owner && *old_owner) {
+ 				spa_log_debug(this->log, "ModemManager daemon disappeared (%s)", old_owner);
+ 				mm_clean_voice(this);
+@@ -620,7 +625,7 @@ static DBusHandlerResult mm_filter_cb(DBusConnection *bus, DBusMessage *m, void
+ 		call_object->path = strdup(path);
+ 		spa_list_append(&this->call_list, &call_object->link);
+ 
+-		m2 = dbus_message_new_method_call(MM_DBUS_SERVICE, path, DBUS_INTERFACE_PROPERTIES, "GetAll");
++		m2 = dbus_message_new_method_call(this->service, path, DBUS_INTERFACE_PROPERTIES, "GetAll");
+ 		if (m2 == NULL)
+ 			goto finish;
+ 		dbus_message_append_args(m2, DBUS_TYPE_STRING, &mm_call_interface, DBUS_TYPE_INVALID);
+@@ -710,28 +715,27 @@ static int add_filters(struct impl *this)
+ 	}
+ 
+ 	spa_auto(DBusError) err = DBUS_ERROR_INIT;
+-
+-	dbus_bus_add_match(this->conn,
++	char rule[512];
++	static const char * const signals[][2] = {
++		{ DBUS_INTERFACE_OBJECTMANAGER, DBUS_SIGNAL_INTERFACES_ADDED },
++		{ DBUS_INTERFACE_OBJECTMANAGER, DBUS_SIGNAL_INTERFACES_REMOVED },
++		{ DBUS_INTERFACE_PROPERTIES, DBUS_SIGNAL_PROPERTIES_CHANGED },
++		{ MM_DBUS_INTERFACE_MODEM_VOICE, MM_MODEM_VOICE_SIGNAL_CALLADDED },
++		{ MM_DBUS_INTERFACE_MODEM_VOICE, MM_MODEM_VOICE_SIGNAL_CALLDELETED },
++		{ MM_DBUS_INTERFACE_CALL, MM_CALL_SIGNAL_STATECHANGED },
++	};
++
++	spa_scnprintf(rule, sizeof(rule),
+ 			"type='signal',sender='org.freedesktop.DBus',"
+-			"interface='org.freedesktop.DBus',member='NameOwnerChanged'," "arg0='" MM_DBUS_SERVICE "'", &err);
+-	dbus_bus_add_match(this->conn,
+-			"type='signal',sender='" MM_DBUS_SERVICE "',"
+-			"interface='" DBUS_INTERFACE_OBJECTMANAGER "',member='" DBUS_SIGNAL_INTERFACES_ADDED "'", &err);
+-	dbus_bus_add_match(this->conn,
+-			"type='signal',sender='" MM_DBUS_SERVICE "',"
+-			"interface='" DBUS_INTERFACE_OBJECTMANAGER "',member='" DBUS_SIGNAL_INTERFACES_REMOVED "'", &err);
+-	dbus_bus_add_match(this->conn,
+-			"type='signal',sender='" MM_DBUS_SERVICE "',"
+-			"interface='" DBUS_INTERFACE_PROPERTIES "',member='" DBUS_SIGNAL_PROPERTIES_CHANGED "'", &err);
+-	dbus_bus_add_match(this->conn,
+-			"type='signal',sender='" MM_DBUS_SERVICE "',"
+-			"interface='" MM_DBUS_INTERFACE_MODEM_VOICE "',member='" MM_MODEM_VOICE_SIGNAL_CALLADDED "'", &err);
+-	dbus_bus_add_match(this->conn,
+-			"type='signal',sender='" MM_DBUS_SERVICE "',"
+-			"interface='" MM_DBUS_INTERFACE_MODEM_VOICE "',member='" MM_MODEM_VOICE_SIGNAL_CALLDELETED "'", &err);
+-	dbus_bus_add_match(this->conn,
+-			"type='signal',sender='" MM_DBUS_SERVICE "',"
+-			"interface='" MM_DBUS_INTERFACE_CALL "',member='" MM_CALL_SIGNAL_STATECHANGED "'", &err);
++			"interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='%s'",
++			this->service);
++	dbus_bus_add_match(this->conn, rule, &err);
++	for (size_t i = 0; i < SPA_N_ELEMENTS(signals); i++) {
++		spa_scnprintf(rule, sizeof(rule),
++				"type='signal',sender='%s',interface='%s',member='%s'",
++				this->service, signals[i][0], signals[i][1]);
++		dbus_bus_add_match(this->conn, rule, &err);
++	}
+ 
+ 	this->filters_added = true;
+ 
+@@ -843,7 +847,7 @@ bool mm_answer_call(void *modemmanager, void *user_data, enum cmee_error *error)
+ 	data->call = call_object;
+ 	data->user_data = user_data;
+ 
+-	m = dbus_message_new_method_call(MM_DBUS_SERVICE, call_object->path, MM_DBUS_INTERFACE_CALL, MM_CALL_METHOD_ACCEPT);
++	m = dbus_message_new_method_call(this->service, call_object->path, MM_DBUS_INTERFACE_CALL, MM_CALL_METHOD_ACCEPT);
+ 	if (m == NULL) {
+ 		if (error)
+ 			*error = CMEE_AG_FAILURE;
+@@ -902,7 +906,7 @@ bool mm_hangup_call(void *modemmanager, void *user_data, enum cmee_error *error)
+ 	data->call = call_object;
+ 	data->user_data = user_data;
+ 
+-	m = dbus_message_new_method_call(MM_DBUS_SERVICE, call_object->path, MM_DBUS_INTERFACE_CALL, MM_CALL_METHOD_HANGUP);
++	m = dbus_message_new_method_call(this->service, call_object->path, MM_DBUS_INTERFACE_CALL, MM_CALL_METHOD_HANGUP);
+ 	if (m == NULL) {
+ 		if (error)
+ 			*error = CMEE_AG_FAILURE;
+@@ -970,7 +974,7 @@ bool mm_do_call(void *modemmanager, const char* number, void *user_data, enum cm
+ 	data->this = this;
+ 	data->user_data = user_data;
+ 
+-	m = dbus_message_new_method_call(MM_DBUS_SERVICE, this->modem.path, MM_DBUS_INTERFACE_MODEM_VOICE, MM_MODEM_VOICE_METHOD_CREATECALL);
++	m = dbus_message_new_method_call(this->service, this->modem.path, MM_DBUS_INTERFACE_MODEM_VOICE, MM_MODEM_VOICE_METHOD_CREATECALL);
+ 	if (m == NULL) {
+ 		if (error)
+ 			*error = CMEE_AG_FAILURE;
+@@ -1034,7 +1038,7 @@ bool mm_send_dtmf(void *modemmanager, const char *dtmf, void *user_data, enum cm
+ 	data->call = call_object;
+ 	data->user_data = user_data;
+ 
+-	m = dbus_message_new_method_call(MM_DBUS_SERVICE, call_object->path, MM_DBUS_INTERFACE_CALL, MM_CALL_METHOD_SENDDTMF);
++	m = dbus_message_new_method_call(this->service, call_object->path, MM_DBUS_INTERFACE_CALL, MM_CALL_METHOD_SENDDTMF);
+ 	if (m == NULL) {
+ 		if (error)
+ 			*error = CMEE_AG_FAILURE;
+@@ -1086,6 +1090,7 @@ void *mm_register(struct spa_log *log, void *dbus_connection, const struct spa_d
+ 	const char *modem_device_str = NULL;
+ 	bool modem_device_found = false;
+ 	const char *pts_str = NULL;
++	const char *service_str = NULL;
+ 	bool pts = false;
+ 
+ 	spa_assert(log);
+@@ -1099,6 +1104,7 @@ void *mm_register(struct spa_log *log, void *dbus_connection, const struct spa_d
+ 		if ((pts_str = spa_dict_lookup(info, "bluez5.hfphsp-backend-native-pts")) != NULL) {
+ 			pts = spa_atob(pts_str);
+ 		}
++		service_str = spa_dict_lookup(info, "bluez5.hfphsp-backend-native-modem-service");
+ 	}
+ 	if (!modem_device_found) {
+ 		spa_log_info(log, "No modem allowed, doesn't link to ModemManager");
+@@ -1115,6 +1121,20 @@ void *mm_register(struct spa_log *log, void *dbus_connection, const struct spa_d
+ 	this->user_data = user_data;
+ 	if (modem_device_str && !spa_streq(modem_device_str, "any"))
+ 		this->allowed_modem_device = strdup(modem_device_str);
++	if (service_str == NULL || *service_str == '\0')
++		service_str = MM_DBUS_SERVICE;
++	if (!dbus_validate_bus_name(service_str, NULL)) {
++		spa_log_error(log, "Invalid bluez5.hfphsp-backend-native-modem-service: %s", service_str);
++		free(this->allowed_modem_device);
++		return NULL;
++	}
++	this->service = strdup(service_str);
++	if (this->service == NULL) {
++		free(this->allowed_modem_device);
++		return NULL;
++	}
++	if (!spa_streq(this->service, MM_DBUS_SERVICE))
++		spa_log_info(log, "Using ModemManager-compatible service %s", this->service);
+ 	spa_list_init(&this->call_list);
+ 	this->pts = pts;
+ 
+@@ -1144,6 +1164,7 @@ void mm_unregister(void *data)
+ 
+ 	if (this->allowed_modem_device)
+ 		free(this->allowed_modem_device);
++	free(this->service);
+ 
+ 	free(this);
+ }
+-- 
+2.47.3
+
