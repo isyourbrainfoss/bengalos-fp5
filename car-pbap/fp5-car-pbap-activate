@@ -1,0 +1,39 @@
+#!/bin/sh
+# D-Bus activation for org.bluez.obex.
+# The user service file has no SystemdService= line, so dbus runs this
+# program. While ~/.config/fp5-car-pbap.off exists, exec the distro obexd
+# (object push works, call history is the stock empty ebook backend).
+# Otherwise start fp5-car-pbap.service and leave once it owns the bus name.
+# Starting a Type=dbus unit returns only after the bus name is claimed.
+# A condition failure often still exits 0, so check is-active and fall back.
+set -eu
+
+config=${XDG_CONFIG_HOME:-$HOME/.config}
+off=$config/fp5-car-pbap.off
+
+distro=
+for candidate in /usr/libexec/bluetooth/obexd /usr/lib/bluetooth/obexd; do
+	if [ -x "$candidate" ]; then
+		distro=$candidate
+		break
+	fi
+done
+
+if [ -e "$off" ]; then
+	if [ -z "$distro" ]; then
+		echo "fp5-car-pbap: off switch set and distro obexd is missing" >&2
+		exit 1
+	fi
+	exec "$distro"
+fi
+
+systemctl --user start fp5-car-pbap.service || true
+if systemctl --user is-active --quiet fp5-car-pbap.service; then
+	exit 0
+fi
+
+if [ -z "$distro" ]; then
+	echo "fp5-car-pbap: PBAP service is not active and distro obexd is missing" >&2
+	exit 1
+fi
+exec "$distro"

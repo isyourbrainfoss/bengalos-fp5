@@ -1,0 +1,16 @@
+[Unit]
+Description=Fairphone car PBAP server (EDS contacts, gnome-calls history)
+ConditionPathExists=!%h/.config/fp5-car-pbap.off
+
+[Service]
+Type=dbus
+BusName=org.bluez.obex
+ExecStart=%h/.local/libexec/fp5-car-pbap/obexd --plugin=bluetooth,pbap --nodetach
+Restart=on-failure
+RestartSec=3s
+StartLimitIntervalSec=120
+StartLimitBurst=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
