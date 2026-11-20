@@ -1,0 +1,12 @@
+[Unit]
+Description=FP5 Start mpris-proxy på nytt når bilen kobler til AVRCP
+After=graphical-session.target mpris-proxy.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/fp5-car-mpris-guard
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

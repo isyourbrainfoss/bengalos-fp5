@@ -1,0 +1,12 @@
+[Unit]
+Description=FP5 Bilknapper: neste/forrige blir spoling i Podcasts
+After=graphical-session.target mpris-proxy.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/fp5-car-seek
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

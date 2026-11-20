@@ -1,0 +1,17 @@
+#!/bin/bash
+# FP5 avvik: bilens neste/forrige (AVRCP -> gsd-media-keys/mpris-proxy -> MPRIS Next/Previous)
+# blir til spoling i GNOME Podcasts, som ikke støtter Next/Previous.
+FWD=${FP5_SEEK_FWD_US:-30000000}; BACK=${FP5_SEEK_BACK_US:--15000000}
+P=org.mpris.MediaPlayer2.org.gnome.Podcasts; O=/org/mpris/MediaPlayer2; I=org.mpris.MediaPlayer2.Player
+dbus-monitor --session "type='method_call',interface='$I',member='Next'" "type='method_call',interface='$I',member='Previous'" 2>/dev/null |
+while read -r line; do
+  case "$line" in
+    *"member=Next"*) off=$FWD ;;
+    *"member=Previous"*) off=$BACK ;;
+    *) continue ;;
+  esac
+  owner=$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetNameOwner s $P 2>/dev/null | awk '{print $2}' | tr -d '"')
+  [[ "$line" == *"destination=$P "* ]] || { [ -n "$owner" ] && [[ "$line" == *"destination=$owner "* ]]; } || continue
+  [ "$(busctl --user get-property $P $O $I CanGoNext 2>/dev/null)" = "b false" ] || continue
+  busctl --user call -- $P $O $I Seek x "$off" && echo "seek $off"
+done

@@ -1,0 +1,24 @@
+#!/usr/bin/python3
+# FP5 avvik: når en BT-enhet får mediestyring (AVRCP) tilkoblet, start mpris-proxy på nytt
+# slik at aktiv spiller (Podcasts osv.) meldes inn hos BlueZ igjen.
+import subprocess, time, dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+DBusGMainLoop(set_as_default=True)
+last = [0.0]
+def restart():
+    subprocess.run(["systemctl", "--user", "restart", "mpris-proxy"])
+    print("mpris-proxy restarted", flush=True)
+    return False
+def changed(iface, props, inval, path=None):
+    if iface != "org.bluez.MediaControl1" or not props.get("Connected", False):
+        return
+    now = time.monotonic()
+    if now - last[0] < 20:
+        return
+    last[0] = now
+    GLib.timeout_add_seconds(4, restart)
+bus = dbus.SystemBus()
+bus.add_signal_receiver(changed, signal_name="PropertiesChanged",
+    dbus_interface="org.freedesktop.DBus.Properties", path_keyword="path")
+GLib.MainLoop().run()
