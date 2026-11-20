@@ -1,0 +1,10 @@
+# arm64 binaries staged in ~/.local/share/fp5-coverart-staging/
+# Debian bluez 5.88-1 + Debian patches + 0001 + 0002, forky 2026-11-20.
+# Not the files themselves. sha256sum of each name as installed beside install.sh.
+7d87d63745eab16af8a5302896782b58f6ed9f610be3ec7798e09149d6da495c  bluetoothd
+9c407eef3275ae93c3014ebc0c6f14b1b80c5fbca9f50756cfbfc25302c5de44  obexd
+11268d10d1b8689f7101fc7bf91ac51352cab30c7b44a063630793090e0cc557  fp5-coverart-prepare
+b7b7194250577086a9b0516fb3a0dcf98ac77d0122f5a76e3f32b9a39d849569  fp5-coverart-bluetooth.conf
+3754bac64cbf5849c633f167550de7ff7e9b1a942ff4d0ea3a853924795daafb  fp5-coverart-obex.conf
+9dcbcd9d6ee33e789ad38e6f878ec401ca2838c512025b2593111c84c4d387ad  install.sh
+612b4054e3bf5c8d1bbb3951065335ca9447ca2420a0b49567a18473ff3603e0  rollback.sh
