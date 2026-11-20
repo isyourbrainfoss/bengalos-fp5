@@ -1,0 +1,192 @@
+From: bengalos-fp5 cover art
+Subject: [PATCH] cover art: 200x200 JPEG helper, empty URL, BIP '*' pixels
+
+On top of the Brummer AVRCP target cover-art series. The image-handle
+formula is unchanged. fp5-coverart-prepare is optional at runtime;
+without it a file:// URI is served as the upstream plugin did.
+
+--- a/profiles/audio/media.c
++++ b/profiles/audio/media.c
+@@ -2611,6 +2611,15 @@
+ 
+ 	dbus_message_iter_get_basic(iter, &url);
+ 
++	/*
++	 * An empty art URL is not a cover. Omitting ImgHandle makes
++	 * GetElementAttributes skip attribute 0x08. An empty handle makes
++	 * some head units stop asking for cover art for the rest of the
++	 * session.
++	 */
++	if (url == NULL || url[0] == '\0')
++		return TRUE;
++
+ 	snprintf(handle, sizeof(handle), "%07u",
+ 					g_str_hash(url) % 10000000);
+ 
+--- a/obexd/src/obex.c
++++ b/obexd/src/obex.c
+@@ -133,6 +133,10 @@
+ 		g_free(os->name);
+ 		os->name = NULL;
+ 	}
++	if (os->img_handle) {
++		g_free(os->img_handle);
++		os->img_handle = NULL;
++	}
+ 	if (os->type) {
+ 		g_free(os->type);
+ 		os->type = NULL;
+--- a/obexd/plugins/bip-avrcp.c
++++ b/obexd/plugins/bip-avrcp.c
+@@ -20,6 +20,7 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <sys/stat.h>
++#include <sys/wait.h>
+ 
+ #include <glib.h>
+ #include <dbus/dbus.h>
+@@ -201,6 +202,71 @@
+ }
+ 
+ /*
++ * Phone-side helper. It is not part of upstream BlueZ: obexd must not
++ * link an image decoder, and bluetoothd's unit has ProtectHome=true.
++ * The helper accepts file:// and http(s) URLs and prints the absolute
++ * path of a cached 200x200 baseline JPEG.
++ */
++#define COVER_ART_PREPARE_DEFAULT "/var/lib/fp5-oot/coverart/fp5-coverart-prepare"
++
++/*
++ * missing is set when the helper binary is not installed. A helper that
++ * runs and fails must not fall back to sending the raw file: that file
++ * may be a non-JPEG or not an image at all.
++ */
++static char *cover_art_prepare(const char *url, gboolean *missing)
++{
++	const char *bin = g_getenv("FP5_COVERART_PREPARE");
++	gchar *argv[3];
++	gchar *stdout_buf = NULL;
++	gint status = 0;
++	GError *err = NULL;
++
++	if (missing != NULL)
++		*missing = FALSE;
++
++	if (url == NULL || url[0] == '\0')
++		return NULL;
++
++	if (bin == NULL || bin[0] == '\0')
++		bin = COVER_ART_PREPARE_DEFAULT;
++
++	if (!g_file_test(bin, G_FILE_TEST_IS_EXECUTABLE)) {
++		if (missing != NULL)
++			*missing = TRUE;
++		return NULL;
++	}
++
++	argv[0] = (gchar *) bin;
++	argv[1] = (gchar *) url;
++	argv[2] = NULL;
++
++	if (!g_spawn_sync(NULL, argv, NULL, 0, NULL, NULL,
++					&stdout_buf, NULL, &status, &err)) {
++		DBG("cover art prepare failed to start: %s",
++					err ? err->message : "unknown");
++		g_clear_error(&err);
++		g_free(stdout_buf);
++		return NULL;
++	}
++
++	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
++						stdout_buf == NULL) {
++		g_free(stdout_buf);
++		return NULL;
++	}
++
++	g_strstrip(stdout_buf);
++	if (stdout_buf[0] != '/' ||
++			!g_file_test(stdout_buf, G_FILE_TEST_IS_REGULAR)) {
++		g_free(stdout_buf);
++		return NULL;
++	}
++
++	return stdout_buf;
++}
++
++/*
+  * Find the file a handle refers to by asking every MPRIS player on the bus
+  * for its current art URL and hashing it. Players are few and the lookup
+  * only happens when a controller actually fetches an image.
+@@ -245,6 +311,7 @@
+ 		const char *name;
+ 		char *url;
+ 		char h[8];
++		gboolean helper_missing;
+ 
+ 		dbus_message_iter_get_basic(&array, &name);
+ 		dbus_message_iter_next(&array);
+@@ -259,7 +326,17 @@
+ 		cover_art_handle(url, h, sizeof(h));
+ 
+ 		if (g_str_equal(h, handle)) {
+-			filename = g_filename_from_uri(url, NULL, NULL);
++			/*
++			 * fp5-coverart-prepare turns file:// and http(s)
++			 * art into a cached 200x200 JPEG. AVRCP/BIP
++			 * GetLinkedThumbnail is that thumbnail. If the
++			 * helper is not installed, fall back to a local
++			 * file URI (upstream behaviour).
++			 */
++			helper_missing = FALSE;
++			filename = cover_art_prepare(url, &helper_missing);
++			if (filename == NULL && helper_missing)
++				filename = g_filename_from_uri(url, NULL, NULL);
+ 
+ 			if (filename != NULL)
+ 				cover_art_cache_add(handle, filename);
+@@ -397,9 +474,18 @@
+ 
+ 	props = g_string_new("<image-properties version=\"1.0\" handle=\"");
+ 	g_string_append_printf(props, "%s\">\n", name);
++	/*
++	 * BIP uses '*' between pixel dimensions (not 'x'). Advertise the
++	 * thumbnail as both native and variant so a controller that asks
++	 * GetImage for 200*200 JPEG and one that only calls
++	 * GetLinkedThumbnail receive the same bytes.
++	 */
+ 	g_string_append_printf(props,
+-		"<native encoding=\"JPEG\" pixel=\"%ux%u\" size=\"%zu\"/>\n",
++		"<native encoding=\"JPEG\" pixel=\"%u*%u\" size=\"%zu\"/>\n",
+ 		width, height, obj->size);
++	g_string_append_printf(props,
++		"<variant encoding=\"JPEG\" pixel=\"%u*%u\"/>\n",
++		width, height);
+ 	g_string_append(props, "</image-properties>\n");
+ 
+ 	close(obj->fd);
+@@ -470,6 +556,10 @@
+ 	const char *type = obex_get_type(os);
+ 	const char *handle = obex_get_img_handle(os);
+ 
++	/* Some controllers put the handle in Name instead of Img-Handle. */
++	if (handle == NULL)
++		handle = obex_get_name(os);
++
+ 	DBG("type %s handle %s", type ? type : "(none)",
+ 					handle ? handle : "(none)");
+ 
+@@ -499,9 +589,10 @@
+ };
+ 
+ /*
+- * The linked thumbnail is served in the image's native encoding rather
+- * than the 200x200 JPEG the specification describes: scaling would mean
+- * decoding images inside obexd. Controllers seen so far accept it.
++ * GetLinkedThumbnail (x-bt/img-thm) and GetImage (x-bt/img-img) both
++ * serve the JPEG written by fp5-coverart-prepare: 200x200, encoding
++ * JPEG, which is the thumbnail AVRCP 1.6 / BIP require. Decoding stays
++ * out of obexd. Without the helper, a local file is served unchanged.
+  */
+ static const struct obex_mime_type_driver thumbnail = {
+ 	.target = COVER_ART_TARGET,
