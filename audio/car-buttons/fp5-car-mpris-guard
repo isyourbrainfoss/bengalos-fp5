@@ -83,8 +83,9 @@ class Guard:
     """Decisions only; everything outside is injected (tests use fakes)."""
     def __init__(self, list_json, pactl_set, restart_proxy, call_active, log=print,
                  clock=time.monotonic, state_path=None, default_vol=35, off=lambda: (False, False),
-                 schedule=None):
+                 schedule=None, car_connected=lambda: True):
         self.list_json, self.pactl_set = list_json, pactl_set
+        self.car_connected = car_connected  # -> bool: a car (bluez card) is connected now
         self.restart_proxy, self.call_active = restart_proxy, call_active
         self.log, self.clock = log, clock
         self.state_path = state_path
@@ -237,6 +238,15 @@ class Guard:
             return self.want_proxy(reason)
         self.proxy_times = [t for t in self.proxy_times if now - t < PROXY_WINDOW]
         self.proxy_pending = None
+        try:
+            connected = self.car_connected()
+        except Exception:
+            connected = True
+        if not connected:
+            # nothing to register with right now; do not spend the 10-min budget:
+            # the reconnect itself (AVRCP / A2DP transport) triggers a restart
+            self.log("mpris-proxy restart not needed (%s): car not connected; waiting for it to reconnect" % reason)
+            return
         if len(self.proxy_times) >= PROXY_MAX:
             self.log("mpris-proxy restart skipped (%s): %d in 10 min already" % (reason, PROXY_MAX))
             return
@@ -328,8 +338,9 @@ def main():
 
     g = Guard(pactl_json, pactl_set, restart_proxy, call_active, log=log,
               state_path=os.path.join(home, ".local", "state", "fp5-car-guard", "volumes.json"),
-              default_vol=int(os.environ.get("FP5_CAR_DEFAULT_VOL", "35")), off=off, schedule=schedule)
-    log("fp5-car-mpris-guard v2 running (audio %s, buttons %s)"
+              default_vol=int(os.environ.get("FP5_CAR_DEFAULT_VOL", "35")), off=off, schedule=schedule,
+              car_connected=lambda: any(c.get("name", "").startswith("bluez_card.") for c in pactl_json("cards")))
+    log("fp5-car-mpris-guard v2.1 running (audio %s, buttons %s)"
         % ("on" if not off()[0] else "off", "on" if not off()[1] else "off"))
 
     # BlueZ: AVRCP connected, A2DP transport (re)appears

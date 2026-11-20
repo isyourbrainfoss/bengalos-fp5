@@ -215,6 +215,22 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(self.ph.restarts, G.PROXY_MAX)
         self.assertTrue(any("skipped" in l for l in self.logs))
 
+    def test_proxy_skips_without_car_and_keeps_budget(self):
+        q, conn = [], [False]
+        g = G.Guard(self.ph.list_json, self.ph.pactl_set, self.ph.restart, lambda: self.ph.call,
+                    log=self.logs.append, clock=lambda: self.ph.t,
+                    state_path=os.path.join(self.tmp.name, "c.json"), off=lambda: tuple(self.offs),
+                    schedule=lambda s, fn: q.append((s, fn)), car_connected=lambda: conn[0])
+        for i in range(6):                       # car gone: disconnect triggers
+            g.want_proxy("mpris-proxy saw a device disconnect")
+            s, fn = q.pop(); self.ph.t += s; fn()
+        self.assertEqual(self.ph.restarts, 0)
+        self.assertTrue(any("car not connected" in l for l in self.logs))
+        conn[0] = True                           # car back: budget still there
+        g.want_proxy("car AVRCP connected")
+        s, fn = q.pop(); self.ph.t += s; fn()
+        self.assertEqual(self.ph.restarts, 1)
+
     def test_proxy_off(self):
         self.offs[1] = True
         self.g.want_proxy("x")
