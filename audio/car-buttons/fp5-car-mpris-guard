@@ -1,24 +1,433 @@
 #!/usr/bin/python3
-# FP5 avvik: når en BT-enhet får mediestyring (AVRCP) tilkoblet, start mpris-proxy på nytt
-# slik at aktiv spiller (Podcasts osv.) meldes inn hos BlueZ igjen.
-import subprocess, time, dbus
-from dbus.mainloop.glib import DBusGMainLoop
-from gi.repository import GLib
-DBusGMainLoop(set_as_default=True)
-last = [0.0]
-def restart():
-    subprocess.run(["systemctl", "--user", "restart", "mpris-proxy"])
-    print("mpris-proxy restarted", flush=True)
-    return False
-def changed(iface, props, inval, path=None):
-    if iface != "org.bluez.MediaControl1" or not props.get("Connected", False):
-        return
-    now = time.monotonic()
-    if now - last[0] < 20:
-        return
-    last[0] = now
-    GLib.timeout_add_seconds(4, restart)
-bus = dbus.SystemBus()
-bus.add_signal_receiver(changed, signal_name="PropertiesChanged",
-    dbus_interface="org.freedesktop.DBus.Properties", path_keyword="path")
-GLib.MainLoop().run()
+# fp5-car-mpris-guard v2 (FP5 BengalOS avvik, 2026-11-20): keep the car's
+# Bluetooth audio usable after calls and after Tesla's own voice assistant.
+#
+# Why (20.11): after a car call and after holding the steering-wheel mic
+# button (Tesla Grok), play from the car stopped working: the car's A2DP sink
+# was muted at 0% (BlueZ transport Volume 0, i.e. the car set AVRCP volume 0)
+# and the car buttons were dead until mpris-proxy was restarted. v1 only
+# restarted mpris-proxy when AVRCP (MediaControl1) connected; it stayed
+# connected, so v1 never fired.
+#
+# 1. Car audio guard: while no call is active (no ModemManager call, no imsd
+#    call, car card not in an HFP profile, no fp5-hfp-modem-bridge routing
+#    state), an A2DP car sink that is muted or below 5% is unmuted and set
+#    back to its last good volume (>= 5%, remembered per sink in
+#    ~/.local/state/fp5-car-guard/volumes.json; default 35%, the level seen
+#    on 20.11; FP5_CAR_DEFAULT_VOL). The car uses AVRCP absolute volume, so
+#    the phone volume is the car's media volume: we never jump to 100%.
+#    Triggers: pactl subscribe (sink/card), call end, every 10 s. Debounced
+#    1 s; at most 10 restores per sink per 10 min.
+# 2. Car button guard: restart mpris-proxy (it re-registers the MPRIS player
+#    with BlueZ) 4 s after: AVRCP connected, a call ended, the A2DP
+#    transport reappeared, mpris-proxy logged a device disconnect, or an
+#    MPRIS player (org.mpris.MediaPlayer2.*, not mpris-proxy's own) came or
+#    went. Never during a call (deferred to its end), >= 20 s apart, at most
+#    4 per 10 min. (MediaControl1.Player is NOT used: the Tesla never has
+#    one, even when everything works.)
+# Off: touch ~/.config/fp5-car-guard.off (both parts, takes effect at once),
+#      FP5_CAR_AUDIO_GUARD=off / FP5_CAR_PLAYER_GUARD=off in the unit, or
+#      systemctl --user disable --now fp5-car-mpris-guard.
+# Logs never contain Bluetooth addresses, node names or player names.
+import hashlib, json, os, re, subprocess, sys, time
+
+MIN_PCT = 5
+DEBOUNCE_MS = 1000
+PERIOD_S = 10
+AUDIO_MAX, AUDIO_WINDOW = 10, 600
+PROXY_DELAY_S, PROXY_GAP_S = 4, 20
+PROXY_MAX, PROXY_WINDOW = 4, 600
+HFP_PREFIX = "headset"
+
+
+def vol_pct(item):
+    vol = item.get("volume")
+    if not isinstance(vol, dict) or not vol:
+        return None
+    out = []
+    for ch in vol.values():
+        if not isinstance(ch, dict):
+            continue
+        if "value" in ch:
+            try:
+                out.append(int(ch["value"]) * 100.0 / 65536)
+                continue
+            except (TypeError, ValueError):
+                pass
+        m = re.match(r"\s*(\d+)%", str(ch.get("value_percent", "")))
+        if m:
+            out.append(float(m.group(1)))
+    return max(out) if out else None
+
+
+def car_a2dp_sinks(sinks):
+    out = []
+    for s in sinks:
+        p = s.get("properties", {}) or {}
+        if not s.get("name", "").startswith("bluez_output.") or s.get("name", "").endswith(".monitor"):
+            continue
+        if not str(p.get("device.name", "")).startswith("bluez_card."):
+            continue
+        prof = str(p.get("api.bluez5.profile", ""))
+        if prof.startswith(HFP_PREFIX) or str(p.get("api.bluez5.codec", "")) in ("cvsd", "msbc"):
+            continue
+        out.append(s)
+    return out
+
+
+def key(name):
+    return hashlib.sha256(name.encode()).hexdigest()[:16]  # no address on disk
+
+
+class Guard:
+    """Decisions only; everything outside is injected (tests use fakes)."""
+    def __init__(self, list_json, pactl_set, restart_proxy, call_active, log=print,
+                 clock=time.monotonic, state_path=None, default_vol=35, off=lambda: (False, False),
+                 schedule=None):
+        self.list_json, self.pactl_set = list_json, pactl_set
+        self.restart_proxy, self.call_active = restart_proxy, call_active
+        self.log, self.clock = log, clock
+        self.state_path = state_path
+        self.default_vol = default_vol
+        self.off = off                    # -> (audio_off, player_off)
+        self.schedule = schedule          # schedule(seconds, fn) or None (tests: run now)
+        self.good = self._load()
+        self.restores = {}                # sink key -> [times]
+        self.proxy_times = []
+        self.last_proxy = -1e9
+        self.proxy_pending = None         # reason waiting for its timer / call end
+        self.proxy_timer = False
+        self.in_call = False
+        self.check_pending = False
+        self.limit_logged = set()
+
+    # ---- state ----
+    def _load(self):
+        try:
+            with open(self.state_path) as f:
+                d = json.load(f)
+            return {k: float(v) for k, v in d.items()}
+        except (OSError, ValueError, TypeError, AttributeError):
+            return {}
+
+    def _save(self):
+        if not self.state_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.good, f)
+            os.replace(tmp, self.state_path)
+        except OSError:
+            pass
+
+    def _later(self, s, fn):
+        if self.schedule is None:
+            fn()
+        else:
+            self.schedule(s, fn)
+
+    # ---- calls ----
+    def _call_state(self):
+        """True/False; None = could not tell (then do nothing this round)."""
+        try:
+            return bool(self.call_active())
+        except Exception:
+            return None
+
+    def _update_call(self):
+        c = self._call_state()
+        if c is None:
+            return None
+        if self.in_call and not c:
+            self.in_call = False
+            self.log("call ended: checking car audio and car buttons")
+            self._later(2, self.check)
+            self._later(5, self.check)
+            self.want_proxy("call ended")
+        elif c and not self.in_call:
+            self.in_call = True
+        return c
+
+    # ---- 1. audio ----
+    def event(self):
+        """pactl subscribe sink/card event: coalesced check after 1 s."""
+        if self.check_pending:
+            return
+        self.check_pending = True
+
+        def run():
+            self.check_pending = False
+            self.check()
+        self._later(DEBOUNCE_MS / 1000.0, run)
+
+    def check(self):
+        c = self._update_call()
+        if c is None or c:
+            return
+        if self.off()[0]:
+            return
+        try:
+            sinks = car_a2dp_sinks(self.list_json("sinks"))
+        except Exception:
+            return
+        changed = False
+        for s in sinks:
+            k, v, muted = key(s["name"]), vol_pct(s), bool(s.get("mute"))
+            if v is None:
+                continue
+            if not muted and v >= MIN_PCT:
+                if abs(self.good.get(k, -1) - v) >= 1:
+                    self.good[k] = round(v)
+                    changed = True
+                continue
+            now = self.clock()
+            times = [t for t in self.restores.get(k, []) if now - t < AUDIO_WINDOW]
+            if len(times) >= AUDIO_MAX:
+                if k not in self.limit_logged:
+                    self.limit_logged.add(k)
+                    self.log("car sink keeps going silent (%s, %d%%): %d restores in 10 min, pausing"
+                             % ("muted" if muted else "not muted", round(v), AUDIO_MAX))
+                self.restores[k] = times
+                continue
+            self.limit_logged.discard(k)
+            target = int(self.good.get(k, self.default_vol))
+            target = max(MIN_PCT, min(100, target))
+            ok = True
+            if muted:
+                ok &= bool(self.pactl_set("set-sink-mute", s["name"], "0"))
+            if v < MIN_PCT:
+                ok &= bool(self.pactl_set("set-sink-volume", s["name"], "%d%%" % target))
+            times.append(now)
+            self.restores[k] = times
+            self.log("car sink was %s at %d%% -> unmuted, %d%%%s"
+                     % ("muted" if muted else "not muted", round(v),
+                        target if v < MIN_PCT else round(v), "" if ok else " (pactl FAILED)"))
+        if changed:
+            self._save()
+
+    # ---- 2. player / buttons ----
+    def want_proxy(self, reason):
+        if self.off()[1]:
+            return
+        if self.proxy_pending is None:
+            self.proxy_pending = reason
+        if self.proxy_timer:
+            return
+        wait = max(PROXY_DELAY_S, self.last_proxy + PROXY_GAP_S - self.clock())
+        self.proxy_timer = True
+
+        def run():
+            self.proxy_timer = False
+            self._proxy_fire()
+        self._later(wait, run)
+
+    def _proxy_fire(self):
+        reason = self.proxy_pending
+        if reason is None or self.off()[1]:
+            self.proxy_pending = None
+            return
+        c = self._update_call()
+        if c is None or c:
+            return  # kept pending; call end (or the next trigger) fires it
+        now = self.clock()
+        if now - self.last_proxy < PROXY_GAP_S:
+            self.proxy_pending = None
+            return self.want_proxy(reason)
+        self.proxy_times = [t for t in self.proxy_times if now - t < PROXY_WINDOW]
+        self.proxy_pending = None
+        if len(self.proxy_times) >= PROXY_MAX:
+            self.log("mpris-proxy restart skipped (%s): %d in 10 min already" % (reason, PROXY_MAX))
+            return
+        ok = self.restart_proxy()
+        self.last_proxy = now
+        self.proxy_times.append(now)
+        self.log("mpris-proxy restarted (%s)%s" % (reason, "" if ok else " FAILED"))
+
+
+# ---------------- phone side (Gio, subprocess) ----------------
+def main():
+    from gi.repository import Gio, GLib
+    home = os.path.expanduser("~")
+    off_file = os.path.join(home, ".config", "fp5-car-guard.off")
+    env_audio = os.environ.get("FP5_CAR_AUDIO_GUARD", "on") != "off"
+    env_player = os.environ.get("FP5_CAR_PLAYER_GUARD", "on") != "off"
+    rt = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    log = lambda m: print(m, flush=True)
+
+    def off():
+        f = os.path.exists(off_file)
+        return (f or not env_audio, f or not env_player)
+
+    def pactl_json(what):
+        r = subprocess.run(["pactl", "-f", "json", "list", what], capture_output=True, text=True, timeout=5)
+        if r.returncode:
+            raise RuntimeError("pactl")
+        return json.loads(r.stdout or "[]")
+
+    def pactl_set(*a):
+        try:
+            return subprocess.run(["pactl", *a], capture_output=True, timeout=5).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def restart_proxy():
+        try:
+            return subprocess.run(["systemctl", "--user", "restart", "mpris-proxy.service"],
+                                  capture_output=True, timeout=30).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    sysbus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    sesbus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+    def dcall(bus, name, path, iface, method, args=None, sig=None):
+        return bus.call_sync(name, path, iface, method, args, GLib.VariantType(sig) if sig else None,
+                             Gio.DBusCallFlags.NONE, 2000, None).unpack()
+
+    def has_owner(bus, name):
+        return dcall(bus, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                     "NameHasOwner", GLib.Variant("(s)", (name,)), "(b)")[0]
+
+    def call_active():
+        if os.path.exists(os.path.join(rt, "fp5-hfp-audio.json")):
+            return True  # the HFP bridge has the car routed for a call
+        for c in pactl_json("cards"):
+            if c.get("name", "").startswith("bluez_card.") and \
+                    str(c.get("active_profile", "")).startswith(HFP_PREFIX):
+                return True
+        if has_owner(sysbus, "org.freedesktop.ModemManager1"):
+            objs = dcall(sysbus, "org.freedesktop.ModemManager1", "/org/freedesktop/ModemManager1",
+                         "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", None,
+                         "(a{oa{sa{sv}}})")[0]
+            for ifs in objs.values():
+                v = ifs.get("org.freedesktop.ModemManager1.Modem.Voice")
+                if v and v.get("Calls"):
+                    for cp in v["Calls"]:
+                        try:
+                            st = dcall(sysbus, "org.freedesktop.ModemManager1", cp,
+                                       "org.freedesktop.DBus.Properties", "Get",
+                                       GLib.Variant("(ss)", ("org.freedesktop.ModemManager1.Call", "State")),
+                                       "(v)")[0]
+                        except GLib.Error:
+                            continue
+                        if int(st) != 7:  # not TERMINATED
+                            return True
+        if has_owner(sysbus, "org.ofono"):
+            for path, props in dcall(sysbus, "org.ofono", "/", "org.ofono.Manager", "GetModems",
+                                     None, "(a(oa{sv}))")[0]:
+                if "org.ofono.VoiceCallManager" in props.get("Interfaces", []):
+                    if dcall(sysbus, "org.ofono", path, "org.ofono.VoiceCallManager", "GetCalls",
+                             None, "(a(oa{sv}))")[0]:
+                        return True
+        return False
+
+    def schedule(s, fn):
+        GLib.timeout_add(int(s * 1000), lambda: (fn(), False)[1])
+
+    g = Guard(pactl_json, pactl_set, restart_proxy, call_active, log=log,
+              state_path=os.path.join(home, ".local", "state", "fp5-car-guard", "volumes.json"),
+              default_vol=int(os.environ.get("FP5_CAR_DEFAULT_VOL", "35")), off=off, schedule=schedule)
+    log("fp5-car-mpris-guard v2 running (audio %s, buttons %s)"
+        % ("on" if not off()[0] else "off", "on" if not off()[1] else "off"))
+
+    # BlueZ: AVRCP connected, A2DP transport (re)appears
+    def bluez_props(conn, sender, path, iface, sig, params):
+        i, changed, _ = params.unpack()
+        if i == "org.bluez.MediaControl1" and changed.get("Connected") is True:
+            g.want_proxy("car AVRCP connected")
+        elif i == "org.bluez.MediaTransport1":
+            g.event()
+
+    def bluez_added(conn, sender, path, iface, sig, params):
+        _, ifs = params.unpack()
+        if "org.bluez.MediaTransport1" in ifs:
+            uuid = str(ifs["org.bluez.MediaTransport1"].get("UUID", "")).lower()
+            if uuid.startswith("0000110a") or uuid.startswith("0000110b"):
+                g.want_proxy("car A2DP transport back")
+                g.event()
+    sysbus.signal_subscribe("org.bluez", "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                            None, None, Gio.DBusSignalFlags.NONE, bluez_props)
+    sysbus.signal_subscribe("org.bluez", "org.freedesktop.DBus.ObjectManager", "InterfacesAdded",
+                            None, None, Gio.DBusSignalFlags.NONE, bluez_added)
+
+    # MPRIS players coming/going (not mpris-proxy's own names)
+    def proxy_pid():
+        try:
+            r = subprocess.run(["systemctl", "--user", "show", "-p", "MainPID", "--value", "mpris-proxy.service"],
+                               capture_output=True, text=True, timeout=5)
+            return int(r.stdout.strip() or 0)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return 0
+
+    def owner_pid(unique):
+        try:
+            return int(dcall(sesbus, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                             "GetConnectionUnixProcessID", GLib.Variant("(s)", (unique,)), "(u)")[0])
+        except GLib.Error:
+            return -1
+
+    def noc(conn, sender, path, iface, sig, params):
+        name, old, new = params.unpack()
+        if not name.startswith("org.mpris.MediaPlayer2."):
+            return
+        if g.clock() - g.last_proxy < 10:
+            return  # our own restart
+        if new and owner_pid(new) == proxy_pid():
+            return
+        g.want_proxy("media player %s" % ("appeared" if new else "gone"))
+    sesbus.signal_subscribe("org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+                            "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE, noc)
+
+    # line-reading subprocesses (pactl subscribe, mpris-proxy journal), respawned
+    def follow(argv, on_line, what):
+        def start():
+            try:
+                p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            except OSError:
+                GLib.timeout_add_seconds(10, lambda: (start(), False)[1])
+                return
+            ch = GLib.IOChannel.unix_new(p.stdout.fileno())
+
+            def readable(_c, cond):
+                if cond & GLib.IO_IN:
+                    line = p.stdout.readline()
+                    if line:
+                        on_line(line)
+                        return True
+                p.wait()
+                log("%s ended; restarting it in 5 s" % what)
+                GLib.timeout_add_seconds(5, lambda: (start(), False)[1])
+                return False
+            GLib.io_add_watch(ch, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, readable)
+        start()
+
+    def pa_line(line):
+        if " on sink #" in line or " on card #" in line:
+            g.event()
+    follow(["pactl", "subscribe"], pa_line, "pactl subscribe")
+
+    def mp_line(line):
+        if line.startswith("Bluetooth Device ") and line.rstrip().endswith(" disconnected"):
+            g.want_proxy("mpris-proxy saw a device disconnect")
+    follow(["journalctl", "--user", "-u", "mpris-proxy.service", "-f", "-n", "0", "-o", "cat"], mp_line,
+           "mpris-proxy log follower")
+
+    GLib.timeout_add_seconds(PERIOD_S, lambda: (g.check(), True)[1])
+    GLib.idle_add(lambda: (g.check(), False)[1])
+    loop = GLib.MainLoop()
+    try:
+        from gi.repository import GLibUnix
+        add = GLibUnix.signal_add
+    except (ImportError, AttributeError):
+        add = GLib.unix_signal_add
+    import signal
+    for s in (signal.SIGTERM, signal.SIGINT):
+        add(GLib.PRIORITY_DEFAULT, s, lambda *a: (loop.quit(), False)[1])
+    loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,10 +1,16 @@
+# fp5-car-mpris-guard v2 (FP5 avvik 2026-11-20): car audio unmute/volume guard
+# + mpris-proxy re-register guard. See ~/.local/bin/fp5-car-mpris-guard.
+# Off at once without stopping: touch ~/.config/fp5-car-guard.off
 [Unit]
-Description=FP5 Start mpris-proxy på nytt når bilen kobler til AVRCP
-After=graphical-session.target mpris-proxy.service
+Description=FP5: keep car audio unmuted and car buttons registered (after calls, Tesla Grok, reconnects)
+After=graphical-session.target mpris-proxy.service pipewire-pulse.service
 PartOf=graphical-session.target
 
 [Service]
 ExecStart=%h/.local/bin/fp5-car-mpris-guard
+Environment=FP5_CAR_AUDIO_GUARD=on
+Environment=FP5_CAR_PLAYER_GUARD=on
+Environment=FP5_CAR_DEFAULT_VOL=35
 Restart=on-failure
 RestartSec=5
 
