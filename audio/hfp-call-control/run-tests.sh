@@ -23,3 +23,5 @@ cc -O1 -g -Wall -Wno-unused-parameter \
    tests/mm_harness.c "$B/modemmanager.c" -o "$OUT" \
    $(pkg-config --libs dbus-1) -lm
 dbus-run-session -- sh "$HERE/tests/harness-session.sh" "$OUT"
+echo "=== harness again with car audio on (fake pactl)"
+AUDIO=on dbus-run-session -- sh "$HERE/tests/harness-session.sh" "$OUT"

@@ -1,6 +1,7 @@
 # Car call control over Bluetooth HFP (FP5, BengalOS 0.26.1118.1)
 
-Status: **staged, offline tests only. Nothing installed on the phone.**
+Status: 294e54f installed 2026-11-20 12:26; v1 (32365cc) tested 12:56 and rolled back;
+**v2 staged, not installed** (offline tests + on-phone dry run).
 aarch64 plugin built from Debian pipewire 1.6.9-2 (= the phone's build), see `build/`.
 Needs Kristian's yes for install, the WirePlumber restart and the first car test.
 
@@ -56,34 +57,39 @@ phone. It does not help when we are the AG.
    `libspa-bluez5.so` sha256 matches the build it was made for. After a BengalOS update to
    PipeWire, it turns itself off and everything runs stock. No sysext and no
    `systemd-sysext refresh`.
-5. **Call audio over SCO** (`fp5_hfp_audio.py`, inside the bridge):
-   - imsd-media plays with `pw-play` and records with `pw-record`, so it uses the default
-     sink/source.
-   - callaudiod moves those to the earpiece/mic. WirePlumber's voice-call profile switch only
-     reacts to ModemManager calls.
-   - At call start (after 0.8 s, re-asserted at 2, 3.5 and 6 s and then every 4 s while a call
-     is live), the bridge switches the car card to `headset-head-unit` and makes its SCO nodes
-     the defaults.
-   - It also moves imsd-media's `pw-record` (source-output) and `pw-play` (sink-input) streams
-     onto the car's SCO source/sink. imsd-media starts `pw-record` when it dials, before
-     the car's HFP nodes exist. A stream that is already linked does not follow a later
-     default change, so in the first car test (2026-11-20) the far end could not hear the car.
-     fp5-call-mic's `parecord` is left alone. Re-asserting covers callaudiod changing the
-     defaults and `pw-play` respawns.
-   - At call end, it restores the old profile (a2dp-sink) and defaults, and unmutes the car sink.
-   - A state file in `$XDG_RUNTIME_DIR` lets it recover after a crash. That covers the "muted
-     Tesla A2DP after calls" case.
+5. **Call audio over SCO** (`fp5_hfp_audio.py`, inside the bridge), v2 (2026-11-20):
+   - imsd-media plays with `pw-play` and records with `pw-record` (`MIC_BACKEND=pw`, set by
+     fp5-imsd's `transaction.py`), with no target: they open on the default sink/source at
+     media start (SDP answer). A linked stream does not follow a later default change.
+   - **Root cause of "the far end hears nothing" (car tests 12:27 and 12:56):** in HFP the car's
+     SCO source `bluez_input.<addr>.0` is `Audio/Source/Internal`, which pactl does not list.
+     The only car source pactl shows is WirePlumber's loopback `bluez_input.<addr>`
+     (`bluez5.loopback=true`, `device.id` = card, **no `device.name`**). 294e54f and v1 looked
+     for car sources by `device.name`, found none, and never set the default source or moved
+     `pw-record`: the uplink stayed on the phone mic. (v1 logged no move at all.)
+   - WirePlumber's autoswitch keeps a BT device in HFP only while a capture stream is linked
+     to that loopback, so the loopback is also the right target.
+   - **Car dials (ATD):** the bridge switches the card to `headset-head-unit`, waits (≤ 2.5 s,
+     250 ms polls) for the SCO sink (`api.bluez5.profile=headset-*`, not the stale A2DP sink
+     of the same name) and the loopback, makes them the defaults, and only then calls imsd
+     `Dial`. If the nodes do not come, it dials anyway. If the dial fails, it restores.
+   - **Incoming / phone-dialled while the car is connected:** the same, at once when the call
+     object appears (no 0.8 s delay), ≤ 4 s. Media starts later (answer / SDP answer).
+   - **No mid-call re-assert** (v1 re-asserted every 4 s; the SCO link failed 1 s after answer
+     at 12:57:06, at one of those ticks). After the defaults are set, the bridge looks for
+     imsd-media's streams every 1 s (≤ 90 s) and checks each stream once. Only a stream that
+     is not on the car gets **one** move. Unmute only if muted.
+   - Logs (no node names): codec (`msbc`/`cvsd`), loopback or plain source, time to ready, and
+     per stream `pw-record 16000Hz is on car|phone`.
+   - At call end it restores the old profile (a2dp-sink) and defaults, and unmutes the car sink.
+     A call that starts within 1 s of the last one keeps the original baseline.
+   - A state file in `$XDG_RUNTIME_DIR` lets it recover after a crash or a stop mid-prepare.
    - When idle: if WirePlumber restarts (or the bridge starts), the default sink can fall
      back to the speaker. If the car's A2DP sink was the default before, the bridge sets it
-     back once the sink reappears (90 s window). A sink the user picks outside that window
-     becomes the new preference (`$XDG_RUNTIME_DIR/fp5-hfp-audio-sinkpref`).
-   - Logs never contain node names, since they carry the car's BT address.
+     back once the sink reappears (90 s window).
    - `FP5_HFP_AUDIO=off|dry`.
-   - Side note: the stock `qcom-call-audio-idle-suspend-workaround.sh` listens for
-     `org.freedesktop.ModemManager1.Call.StateChanged` from any sender, so it now also sees
-     the bridge's call signals. On an incoming call (state 3) it starts two `pw-loopback`
-     nodes, and it kills them at state 7. Both are harmless to the routing above, because the
-     defaults and streams are re-asserted.
+   - Side note: the stock `qcom-call-audio-idle-suspend-workaround.sh` reacts to the bridge's
+     call signals (two `pw-loopback`s on incoming calls); they do not touch the defaults.
 
 Not covered: `AT+BLDN` (redial from the car) stays ERROR outside PTS mode (upstream behaviour).
 Three-way calling (`AT+CHLD`) is not supported by the native AG either.
@@ -101,8 +107,10 @@ Hashes: `build/SHA256SUMS`.
 
 ## Tests (offline)
     ./run-tests.sh /path/to/pipewire-1.6.9+patch
-- Unit tests: audio router (engage/restore/second call/no car/crash recovery/car leaves,
-  imsd stream moves, re-assert, no GLib source warning, car sink back after WP restart),
+- Unit tests: audio router on a fake pactl shaped like the phone's (internal SCO source
+  unlisted, loopback without device.name, late SCO nodes, stale A2DP sink): pre-dial routing,
+  dial not blocked, abort/crash/shutdown restore, one move at most, no re-assert, back-to-back
+  calls, unmute only if muted, GLib timers; bridge dial order (prepare before imsd Dial),
   number checks, redaction, no IMEI/own number. Plus the guard test.
 - Integration: PipeWire's real patched `modemmanager.c` (tests/mm_harness.c) ↔ bridge ↔ mock
   imsd-ofonod on a private bus. Covers:
@@ -120,6 +128,8 @@ Hashes: `build/SHA256SUMS`.
   - CS incoming → RING/+CLIP → ATA → ModemManager Accept → remote hangup;
   - IMS + CS down → service 0; back → 1;
   - no number/IMEI/own number/operator code in bridge log or towards PipeWire.
+- Harness again with `AUDIO=on` and `tests/fake-pactl`: HFP + defaults before imsd Dial,
+  everything restored, no moves, no node names in the log.
 - `tests/test_install.sh`: install.sh on a fake root (dry run touches nothing; apply layout;
   refuses foreign stock plugin / bad bundle hash).
 

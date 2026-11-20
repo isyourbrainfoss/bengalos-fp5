@@ -34,10 +34,12 @@
 # phone numbers.
 #
 # Optional audio routing (fp5_hfp_audio.py): while a call exists and a car is
-# connected, switch its card to the HFP profile and make its SCO nodes the
-# default sink/source (imsd-media plays with pw-play and records with
-# pw-record, so it follows the defaults); restore A2DP + defaults + unmute
-# afterwards, also after a crash.
+# connected, switch its card to the HFP profile and make its SCO sink and
+# WirePlumber's SCO loopback source the defaults (imsd-media plays with pw-play
+# and records with pw-record when media starts, so it opens on them). For a
+# car-dialled call this happens BEFORE imsd Dial. No mid-call re-assert; one
+# move at most for a stream found off the car. Restore A2DP + defaults +
+# unmute afterwards, also after a crash.
 import argparse, os, re, signal, sys, syslog
 
 import gi
@@ -318,14 +320,28 @@ class Bridge:
             return inv.return_dbus_error(ERR_ARGS, "invalid number")
         if self.ims_ok():
             log("car: dial request via VoLTE")
-            return self._dial_ims(number, inv)
+            return self._prepare_audio(lambda: self._dial_ims(number, inv))
         if self.cs_ok():
             log("car: dial request via CS (IMS not available)")
-            return self._dial_cs(number, inv)
+            return self._prepare_audio(lambda: self._dial_cs(number, inv))
         log("car: dial request refused: no VoLTE and no CS", syslog.LOG_WARNING)
         return inv.return_dbus_error(ERR_FAILED, "no service")
 
+    def _prepare_audio(self, dial):
+        """Car audio to HFP + car defaults BEFORE dialling, so imsd-media's
+        pw-play/pw-record (spawned at media start) open on the car directly."""
+        if not self.audio:
+            return dial()
+        self.audio.prepare(dial)
+
+    def _audio_abort(self):
+        if self.audio and not any(c.state != MM_CALL_STATE_TERMINATED for c in self.calls.values()):
+            self.audio.abort_prepare()
+
     def _dial_ims(self, number, inv):
+        if not self.ofono_modem:  # imsd went away while car audio was prepared
+            self._audio_abort()
+            return inv.return_dbus_error(ERR_FAILED, "imsd not available")
         t0 = GLib.get_monotonic_time()
         seen0 = self.ims_added
 
@@ -341,6 +357,7 @@ class Bridge:
                 if took < FAST_FAIL_S and not new_ims and self.cs_ok():
                     log("falling back to CS")
                     return self._dial_cs(number, inv)
+                self._audio_abort()
                 return inv.return_dbus_error(ERR_FAILED, "dial failed")
             call = self.calls.get(opath) or self._add_call(opath, {"State": "dialing"})
             inv.return_value(GLib.Variant("(o)", (call.path,)))
@@ -354,6 +371,7 @@ class Bridge:
                 mpath = src.call_finish(res).unpack()[0]
             except GLib.Error as e:
                 log("CS CreateCall failed: %s" % errname(e), syslog.LOG_WARNING)
+                self._audio_abort()
                 return inv.return_dbus_error(ERR_FAILED, "dial failed")
             self._add_cs_call(mpath, lambda call: start(call))
 
@@ -366,9 +384,11 @@ class Bridge:
                     self.mm_bus.call(MM_SERVICE, self.mm_modem, IF_VOICE, "DeleteCall",
                                      GLib.Variant("(o)", (mpath,)), None, Gio.DBusCallFlags.NONE,
                                      5000, None, None)
+                    self._audio_abort()
                     return inv.return_dbus_error(ERR_FAILED, "dial failed")
                 inv.return_value(GLib.Variant("(o)", (call.path,)))
             if call is None:
+                self._audio_abort()
                 return inv.return_dbus_error(ERR_FAILED, "dial failed")
             mpath = call.backend_path
             self.mm_bus.call(MM_SERVICE, mpath, IF_CALL, "Start", None, None,
@@ -754,7 +774,7 @@ def main(argv=None):
         sig_add(GLib.PRIORITY_DEFAULT, s, lambda *x: (loop.quit(), False)[1])
     loop.run()
     if audio:
-        audio.calls_changed(0)  # leave the car on A2DP if we stop mid-call
+        audio.shutdown()  # leave the car on A2DP if we stop mid-call or mid-prepare
     return 0
 
 

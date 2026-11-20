@@ -1,0 +1,62 @@
+#!/usr/bin/python3
+# Fake pactl for the bridge harness (audio on): what pactl shows on the FP5 with
+# the car connected (PipeWire 1.6.9 / WirePlumber 0.5.19). State in
+# $FAKE_PACTL_STATE (json), every command appended to $FAKE_PACTL_STATE.log.
+# The SCO sink appears 2 'list sinks' after set-card-profile; the car's source
+# is WirePlumber's loopback (device.id, bluez5.loopback, no device.name).
+import json, os, sys, time
+
+P = os.environ["FAKE_PACTL_STATE"]
+CAR, IDX, SINK, LOOP = "bluez_card.AA_BB_CC_DD_EE_FF", 7, "bluez_output.AA_BB_CC_DD_EE_FF.1", "bluez_input.AA:BB:CC:DD:EE:FF"
+try:
+    st = json.load(open(P))
+except (OSError, ValueError):
+    st = {"profile": "a2dp-sink", "sink": SINK, "source": "alsa_input.mic", "wait": 0, "sco": False,
+          "mute": {SINK: True}}
+a = sys.argv[1:]
+with open(P + ".log", "a") as f:
+    f.write("%.3f %s\n" % (time.monotonic(), " ".join(a)))
+
+
+def sinks():
+    hs = st["profile"].startswith("headset")
+    prof = "headset-head-unit" if hs and st["sco"] else "a2dp-sink"
+    return [{"index": 1, "name": "alsa_output.speaker", "mute": False, "properties": {}},
+            {"index": 2, "name": SINK, "mute": st["mute"].get(SINK, False),
+             "properties": {"device.name": CAR, "device.id": str(IDX), "api.bluez5.profile": prof,
+                            "api.bluez5.codec": "msbc" if prof != "a2dp-sink" else "sbc"}}]
+
+
+out = None
+if a[:3] == ["-f", "json", "list"]:
+    w = a[3]
+    if w == "cards":
+        out = [{"index": 3, "name": "alsa_card.platform-sound", "active_profile": "HiFi", "profiles": {"HiFi": {}}},
+               {"index": IDX, "name": CAR, "active_profile": st["profile"],
+                "profiles": {"a2dp-sink": {"available": True}, "headset-head-unit": {"available": True}}}]
+    elif w == "sinks":
+        if st["profile"].startswith("headset") and not st["sco"]:
+            st["wait"] -= 1
+            if st["wait"] < 0:
+                st["sco"] = True
+        out = sinks()
+    elif w == "sources":
+        out = [{"index": 10, "name": "alsa_input.mic", "mute": False, "properties": {}},
+               {"index": 11, "name": LOOP, "mute": False,
+                "properties": {"device.id": str(IDX), "bluez5.loopback": "true"}}]
+    else:
+        out = []
+    print(json.dumps(out))
+elif a and a[0].startswith("get-default-"):
+    print(st[a[0][len("get-default-"):]])
+elif a and a[0] == "set-card-profile":
+    st["profile"], st["sco"], st["wait"] = a[2], False, 2
+elif a and a[0] in ("set-default-sink", "set-default-source"):
+    st[a[0].rsplit("-", 1)[1]] = a[1]
+elif a and a[0] == "set-sink-mute":
+    st["mute"][a[1]] = a[2] == "1"
+elif a and a[0].startswith(("move-", "set-source-mute")):
+    pass
+else:
+    sys.exit(1)
+json.dump(st, open(P, "w"))

@@ -10,50 +10,98 @@ bridge = importlib.util.module_from_spec(_s)
 _l.exec_module(bridge)
 
 CAR = "bluez_card.XX_XX"
+CAR_IDX = 7
+SINK = "bluez_output.XX.1"      # A2DP and SCO sink share the name (device node id 1)
+LOOP = "bluez_input.XX"         # WirePlumber's loopback of the internal SCO source
 
 
 class FakePactl:
-    """Indices: sinks speaker=1 car=2; sources mic=10 car=11.
-    Streams: imsd-media pw-record/pw-play (started before the car HFP nodes
-    exist, so on the phone mic/speaker) and fp5-call-mic's parecord."""
-    def __init__(self, profile="a2dp-sink", sink="bluez_output.XX.1", source="alsa_input.mic"):
+    """What pactl really shows on the FP5 (PipeWire 1.6.9, WirePlumber 0.5.19):
+    - the car's SCO source bluez_input.<addr>.0 is Audio/Source/Internal and is
+      NOT listed; WirePlumber's loopback bluez_input.<addr> is, with
+      bluez5.loopback=true and device.id = the card index but no device.name;
+    - after set-card-profile the SCO nodes appear a few polls later
+      (node_delay), and the stale A2DP sink can still be listed meanwhile;
+    - imsd-media's pw-record/pw-play exist only after spawn() (media start)
+      and open on the defaults at that moment. fp5-call-mic's parecord is
+      on the phone mic all along.
+    Indices: sinks speaker=1 car=2; sources mic=10 car loopback=11."""
+    def __init__(self, profile="a2dp-sink", sink=SINK, source="alsa_input.mic", node_delay=0,
+                 sco_ever=True, muted=True):
         self.profile, self.default_sink, self.default_source = profile, sink, source
-        self.calls, self.muted = [], {"bluez_output.XX.1": True}
+        self.calls, self.muted = [], {SINK: muted}
         self.card_gone = False
-        self.outputs = [{"index": 50, "source": 10, "properties": {"application.name": "pw-record",
-                                                                  "application.process.binary": "pw-record"}},
-                        {"index": 51, "source": 10, "properties": {"application.name": "parecord",
+        self.node_delay, self.sco_ever = node_delay, sco_ever
+        self.wait = 0
+        self.sco_up = profile.startswith("headset")
+        self.outputs = [{"index": 51, "source": 10, "properties": {"application.name": "parecord",
                                                                   "application.process.binary": "parecord"}}]
-        self.inputs = [{"index": 60, "sink": 1, "properties": {"application.name": "pw-play"}}]
-        self.streams = True
+        self.inputs = []
+
+    def spawn(self, rate=16000):
+        """imsd-media at media start: pw-record + pw-play on the current defaults."""
+        src = {s["name"]: s["index"] for s in self.json("sources")}.get(self.default_source, 10)
+        snk = {s["name"]: s["index"] for s in self._sinks()}.get(self.default_sink, 1)
+        spec = "s16le 1ch %dHz" % rate
+        self.outputs.append({"index": 50, "source": src, "sample_specification": spec,
+                             "properties": {"application.name": "pw-record",
+                                            "application.process.binary": "pw-record"}})
+        self.inputs.append({"index": 60, "sink": snk, "sample_specification": spec,
+                            "properties": {"application.name": "pw-play",
+                                           "application.process.binary": "pw-play"}})
+
+    def _tick(self):
+        if self.profile.startswith("headset") and not self.sco_up and self.sco_ever:
+            if self.wait <= 0:
+                self.sco_up = True
+            self.wait -= 1
+        if not self.profile.startswith("headset"):
+            self.sco_up = False
 
     def _sinks(self):
-        spk = {"index": 1, "name": "alsa_output.speaker", "properties": {}}
+        spk = {"index": 1, "name": "alsa_output.speaker", "properties": {}, "mute": False}
         if self.card_gone:
             return [spk]
-        car = {"index": 2, "name": "bluez_output.XX.1", "properties": {"device.name": CAR}}
+        if self.profile.startswith("headset") and not self.sco_up:
+            # stale A2DP sink still listed right after the switch
+            car = {"index": 2, "name": SINK, "mute": self.muted.get(SINK, False),
+                   "properties": {"device.name": CAR, "device.id": str(CAR_IDX),
+                                  "api.bluez5.profile": "a2dp-sink", "api.bluez5.codec": "sbc"}}
+        elif self.profile.startswith("headset"):
+            car = {"index": 2, "name": SINK, "mute": self.muted.get(SINK, False),
+                   "properties": {"device.name": CAR, "device.id": str(CAR_IDX),
+                                  "api.bluez5.profile": "headset-head-unit", "api.bluez5.codec": "msbc"}}
+        else:
+            car = {"index": 2, "name": SINK, "mute": self.muted.get(SINK, False),
+                   "properties": {"device.name": CAR, "device.id": str(CAR_IDX),
+                                  "api.bluez5.profile": "a2dp-sink", "api.bluez5.codec": "sbc"}}
         return [spk, car]
 
     def json(self, what):
         if what == "cards":
-            cards = [{"name": "alsa_card.platform-sound", "profiles": {"HiFi": {}}, "active_profile": "HiFi"}]
+            cards = [{"index": 3, "name": "alsa_card.platform-sound", "profiles": {"HiFi": {}},
+                      "active_profile": "HiFi"}]
             if not self.card_gone:
-                cards.append({"name": CAR, "active_profile": self.profile,
+                cards.append({"index": CAR_IDX, "name": CAR, "active_profile": self.profile,
                               "profiles": {"a2dp-sink": {"available": True},
                                            "headset-head-unit": {"available": True}, "off": {}}})
             return cards
         if what == "sinks":
+            self._tick()
             return self._sinks()
         if what == "sources":
-            s = [{"index": 10, "name": "alsa_input.mic", "properties": {}}]
-            if self.profile.startswith("headset") and not self.card_gone:
-                s.append({"index": 11, "name": "bluez_input.XX.0", "properties": {"device.name": CAR}})
-                s.append({"index": 12, "name": "bluez_output.XX.1.monitor", "properties": {"device.name": CAR}})
+            s = [{"index": 10, "name": "alsa_input.mic", "properties": {}, "mute": False}]
+            if not self.card_gone:
+                s.append({"index": 11, "name": LOOP, "mute": False,
+                          "properties": {"device.id": str(CAR_IDX), "bluez5.loopback": "true",
+                                         "media.class": "Audio/Source"}})
+                s.append({"index": 12, "name": SINK + ".monitor", "mute": False,
+                          "properties": {"device.name": CAR, "device.id": str(CAR_IDX)}})
             return s
         if what == "source-outputs":
-            return self.outputs if self.streams else []
+            return self.outputs
         if what == "sink-inputs":
-            return self.inputs if self.streams else []
+            return self.inputs
         return []
 
     def get(self, what):
@@ -63,6 +111,8 @@ class FakePactl:
         self.calls.append(a)
         if a[0] == "set-card-profile":
             self.profile = a[2]
+            self.sco_up = False
+            self.wait = self.node_delay
         elif a[0] == "set-default-sink":
             self.default_sink = a[1]
         elif a[0] == "set-default-source":
@@ -81,34 +131,136 @@ class FakePactl:
     def stream(self, lst, app):
         return next(s for s in lst if s["properties"]["application.name"] == app)
 
+    def acts(self, *kinds):
+        return [c for c in self.calls if c[0].startswith(kinds)]
+
 
 class AudioRouterTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.p = FakePactl()
-        self.r = A.AudioRouter(pactl=self.p, log=lambda m: None, timers=False,
-                               state_path=os.path.join(self.tmp.name, "s.json"))
+        self.logs = []
+        self.r = self.router(self.p)
+
+    def router(self, p, name="s.json", timers=False):
+        return A.AudioRouter(pactl=p, log=self.logs.append, timers=timers,
+                             state_path=os.path.join(self.tmp.name, name))
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_call_moves_audio_to_car_and_back(self):
-        self.r.calls_changed(1)
-        self.assertEqual(self.p.profile, "headset-head-unit")
-        self.assertEqual(self.p.default_sink, "bluez_output.XX.1")
-        self.assertEqual(self.p.default_source, "bluez_input.XX.0")
-        self.assertTrue(os.path.exists(self.r.state_path))
+    # ---- root cause of 2026-11-20 12:27 / 12:56 ----
+    def test_v1_lookup_never_found_the_car_source(self):
+        """294e54f/32365cc matched car sources by device.name only: the loopback
+        has none, the SCO source is internal (unlisted) -> phone mic stayed."""
+        self.p.set("set-card-profile", CAR, "headset-head-unit")
+        self.assertEqual(A.nodes_of(CAR, self.p.json("sources")), [], "v1 lookup")
+        src = A.car_source(CAR, str(CAR_IDX), self.p.json("sources"))
+        self.assertEqual(src["name"], LOOP)
+
+    # ---- car dials: profile + defaults before imsd Dial ----
+    def test_prepare_routes_before_dial_and_streams_land_on_car(self):
+        order = []
+        self.r.prepare(lambda: order.append(("dial", self.p.profile, self.p.default_sink, self.p.default_source)))
+        self.assertEqual(order, [("dial", "headset-head-unit", SINK, LOOP)])
+        self.r.calls_changed(1)      # imsd call object appears
+        self.p.spawn()               # media start: helpers open on the defaults
+        self.r._watch_step()
+        self.assertEqual(self.p.stream(self.p.outputs, "pw-record")["source"], 11)
+        self.assertEqual(self.p.stream(self.p.inputs, "pw-play")["sink"], 2)
+        self.assertEqual(self.p.acts("move-"), [], "no mid-call move needed")
+        self.assertEqual(self.p.stream(self.p.outputs, "parecord")["source"], 10, "fp5-call-mic untouched")
         self.r.calls_changed(0)
-        self.assertEqual(self.p.profile, "a2dp-sink")
-        self.assertEqual(self.p.default_sink, "bluez_output.XX.1")
-        self.assertEqual(self.p.default_source, "alsa_input.mic")
-        self.assertFalse(self.p.muted["bluez_output.XX.1"], "car sink left muted")
+        self.assertEqual((self.p.profile, self.p.default_sink, self.p.default_source),
+                         ("a2dp-sink", SINK, "alsa_input.mic"))
+        self.assertFalse(self.p.muted[SINK], "car sink left muted")
         self.assertFalse(os.path.exists(self.r.state_path))
+
+    def test_profile_switch_requested_once_while_nodes_come_up(self):
+        self.p.node_delay = 5
+        done = []
+        self.r.prepare(lambda: done.append(1))
+        self.assertEqual(done, [1])
+        self.assertEqual(len(self.p.acts("set-card-profile")), 1)
+        self.assertEqual(self.p.default_source, LOOP)
+
+    def test_stale_a2dp_sink_is_not_taken(self):
+        self.p.node_delay = 2
+        self.p.default_sink = "alsa_output.speaker"
+        seen = []
+        orig = self.p.set
+
+        def spy(*a):
+            if a[0] == "set-default-sink":
+                seen.append(self.p._sinks()[1]["properties"]["api.bluez5.profile"])
+            return orig(*a)
+        self.p.set = spy
+        self.r.prepare(lambda: None)
+        self.assertEqual(seen, ["headset-head-unit"])
+
+    def test_nodes_never_come_dial_anyway_then_abort_restores(self):
+        self.p.sco_ever = False
+        done = []
+        self.r.prepare(lambda: done.append(1))
+        self.assertEqual(done, [1], "dial must not be blocked")
+        self.assertTrue(any("not ready" in m for m in self.logs))
+        self.r.abort_prepare()       # imsd Dial failed, no call
+        self.assertEqual(self.p.profile, "a2dp-sink")
+        self.assertFalse(os.path.exists(self.r.state_path))
+
+    def test_prepare_without_car_dials_at_once(self):
+        self.p.card_gone = True
+        done = []
+        self.r.prepare(lambda: done.append(1))
+        self.assertEqual(done, [1])
+        self.assertEqual(self.p.calls, [])
+
+    def test_prepare_exception_still_dials(self):
+        def boom(what):
+            raise RuntimeError("x")
+        self.p.json = boom
+        done = []
+        self.r.prepare(lambda: done.append(1))
+        self.assertEqual(done, [1])
+
+    # ---- phone-dialled / incoming: engage at once on the first live call ----
+    def test_incoming_or_phone_dialled_engages_before_media(self):
+        self.r.calls_changed(1)
+        self.assertEqual((self.p.profile, self.p.default_sink, self.p.default_source),
+                         ("headset-head-unit", SINK, LOOP))
+        self.p.spawn(8000)
+        self.r._watch_step()
+        self.assertEqual(self.p.acts("move-"), [])
+        self.assertTrue(any("is on car" in m for m in self.logs))
+
+    def test_stream_off_car_gets_exactly_one_move(self):
+        self.r.calls_changed(1)
+        # something (callaudiod) puts the phone mic back as default before media
+        self.p.default_source = "alsa_input.mic"
+        self.p.spawn()
+        self.r._watch_step()
+        self.assertEqual(self.p.acts("move-"), [("move-source-output", "50", LOOP)])
+        self.p.stream(self.p.outputs, "pw-record")["source"] = 10  # moved away again
+        for _ in range(5):
+            self.r._watch_step()
+        self.assertEqual(len(self.p.acts("move-")), 1, "never re-asserted")
+
+    def test_no_periodic_reassert(self):
+        self.r.calls_changed(1)
+        self.p.spawn()
+        self.assertTrue(self.r._watch_step(), "watch ends once both streams are checked")
+        n = len(self.p.calls)
+        self.r.calls_changed(2)      # second call: nothing re-done
+        self.assertEqual(self.p.calls[n:], [])
+
+    def test_unmute_only_when_muted(self):
+        self.p.muted[SINK] = False
+        self.r.calls_changed(1)
+        self.assertEqual(self.p.acts("set-sink-mute", "set-source-mute"), [])
 
     def test_second_call_does_not_overwrite_saved_state(self):
         self.r.calls_changed(1)
         self.r.calls_changed(2)
-        self.r.engage()  # re-assert
         self.r.calls_changed(0)
         self.assertEqual(self.p.profile, "a2dp-sink")
 
@@ -119,11 +271,17 @@ class AudioRouterTest(unittest.TestCase):
         self.assertEqual(self.p.calls, [])
 
     def test_crash_recovery_restores(self):
-        self.r.calls_changed(1)
-        r2 = A.AudioRouter(pactl=self.p, log=lambda m: None, timers=False, state_path=self.r.state_path)
+        self.r.prepare(lambda: None)
+        r2 = self.router(self.p, name="s.json")
         r2.startup_recover()
         self.assertEqual(self.p.profile, "a2dp-sink")
+        self.assertEqual(self.p.default_source, "alsa_input.mic")
         self.assertFalse(os.path.exists(self.r.state_path))
+
+    def test_shutdown_mid_prepare_restores(self):
+        self.r.prepare(lambda: None)
+        self.r.shutdown()
+        self.assertEqual(self.p.profile, "a2dp-sink")
 
     def test_car_left_during_call(self):
         self.r.calls_changed(1)
@@ -134,36 +292,15 @@ class AudioRouterTest(unittest.TestCase):
     def test_bt_cards_filters(self):
         self.assertEqual(A.bt_cards(self.p.json("cards")), [(CAR, "a2dp-sink", "headset-head-unit")])
 
-    def test_imsd_streams_moved_to_car(self):
-        """12:27 car call: pw-record stayed on the phone mic (far end heard nothing)."""
-        self.r.calls_changed(1)
-        self.assertEqual(self.p.stream(self.p.outputs, "pw-record")["source"], 11)
-        self.assertEqual(self.p.stream(self.p.inputs, "pw-play")["sink"], 2)
-        self.assertEqual(self.p.stream(self.p.outputs, "parecord")["source"], 10, "fp5-call-mic moved")
-
-    def test_reassert_after_callaudiod_and_respawn(self):
-        self.r.calls_changed(1)
-        n = len(self.p.calls)
-        self.r.engage()  # nothing changed: no moves, no default churn
-        moves = [c for c in self.p.calls[n:] if c[0].startswith(("move-", "set-default"))]
-        self.assertEqual(moves, [])
-        # callaudiod switches the default source back, pw-record reconnects to it
-        self.p.default_source = "alsa_input.mic"
-        self.p.stream(self.p.outputs, "pw-record")["source"] = 10
-        self.p.inputs.append({"index": 61, "sink": 1, "properties": {"application.name": "pw-play"}})
-        self.r.engage()
-        self.assertEqual(self.p.default_source, "bluez_input.XX.0")
-        self.assertEqual(self.p.stream(self.p.outputs, "pw-record")["source"], 11)
-        self.assertTrue(all(s["sink"] == 2 for s in self.p.inputs))
-
     def test_logs_never_carry_node_names(self):
-        logs = []
-        r = A.AudioRouter(pactl=self.p, log=logs.append, timers=False,
-                          state_path=os.path.join(self.tmp.name, "l.json"))
-        r.calls_changed(1)
-        r.calls_changed(0)
-        self.assertTrue(logs)
-        for m in logs:
+        self.r.prepare(lambda: None)
+        self.r.calls_changed(1)
+        self.p.default_source = "alsa_input.mic"
+        self.p.spawn()
+        self.r._watch_step()
+        self.r.calls_changed(0)
+        self.assertTrue(self.logs)
+        for m in self.logs:
             self.assertNotIn("bluez_", m)
             self.assertNotIn("XX", m)
 
@@ -172,21 +309,138 @@ class AudioRouterTest(unittest.TestCase):
         A.Pactl(dry=True, log=logs.append).set("set-default-sink", "bluez_output.AA_BB_CC_DD_EE_FF.1")
         self.assertNotIn("AA_BB", logs[0])
 
-    def test_no_glib_source_warning(self):
-        import warnings
+    # ---- real GLib timers ----
+    def _run(self, ms):
         from gi.repository import GLib
-        r = A.AudioRouter(pactl=self.p, log=lambda m: None, timers=True,
-                          state_path=os.path.join(self.tmp.name, "g.json"))
         loop = GLib.MainLoop()
-        r.calls_changed(1)
-        GLib.timeout_add(2300, lambda: (loop.quit(), False)[1])  # 0.8 s and 2 s one-shots fire
+        GLib.timeout_add(ms, lambda: (loop.quit(), False)[1])
         loop.run()
-        self.assertEqual(self.p.profile, "headset-head-unit")
+
+    def test_glib_prepare_waits_for_nodes_then_dials(self):
+        import warnings
+        self.p.node_delay = 3
+        r = self.router(self.p, name="g.json", timers=True)
+        done = []
+        r.prepare(lambda: done.append((self.p.default_sink, self.p.default_source)))
+        self.assertEqual(done, [], "dial held until nodes exist")
+        self._run(1600)
+        self.assertEqual(done, [(SINK, LOOP)])
+        r.calls_changed(1)
+        self.p.spawn()
+        self._run(1300)
+        self.assertEqual(self.p.acts("move-"), [])
+        self.assertTrue(any("pw-record 16000Hz) is on car" in m for m in self.logs), self.logs)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             r.calls_changed(0)
         self.assertEqual([str(x.message) for x in w], [])
         self.assertEqual(r.pending, set())
+        self._run(1200)  # deferred default restore
+        self.assertEqual(self.p.default_source, "alsa_input.mic")
+
+    def test_glib_back_to_back_call_keeps_original_defaults(self):
+        r = self.router(self.p, name="b.json", timers=True)
+        r.calls_changed(1)
+        r.calls_changed(0)           # defaults go back 1 s later...
+        r.calls_changed(1)           # ...but the next call comes first
+        self._run(500)
+        self.assertEqual(self.p.default_source, LOOP)
+        self._run(1000)
+        self.assertEqual(self.p.default_source, LOOP, "old restore must not hit the new call")
+        r.calls_changed(0)
+        self._run(1300)
+        self.assertEqual((self.p.profile, self.p.default_source), ("a2dp-sink", "alsa_input.mic"))
+        self.assertEqual(r.pending, set())
+
+    def test_glib_prepare_timeout_dials_anyway(self):
+        self.p.sco_ever = False
+        r = self.router(self.p, name="t.json", timers=True)
+        done = []
+        r.prepare(lambda: done.append(1))
+        self._run(A.PREPARE_TIMEOUT_MS + 600)
+        self.assertEqual(done, [1])
+        r.abort_prepare()
+        self.assertEqual(r.pending, set())
+
+
+class FakeAudio:
+    def __init__(self):
+        self.ev, self.cb = [], None
+
+    def prepare(self, done):
+        self.ev.append("prepare")
+        self.cb = done
+
+    def abort_prepare(self):
+        self.ev.append("abort")
+
+    def calls_changed(self, n):
+        self.ev.append("live=%d" % n)
+
+
+class FakeInv:
+    def __init__(self):
+        self.ret = None
+
+    def return_value(self, v):
+        self.ret = ("ok", v)
+
+    def return_dbus_error(self, name, msg):
+        self.ret = ("err", name)
+
+
+class FakeBus:
+    def __init__(self, fail=False):
+        self.fail, self.calls = fail, []
+
+    def call(self, name, path, iface, method, args, rtype, flags, timeout, cancel, cb):
+        from gi.repository import GLib
+        self.calls.append(method)
+        bus = self
+
+        class Res:
+            def call_finish(self_, res):
+                if bus.fail:
+                    raise GLib.Error("refused")
+                return GLib.Variant("(o)", ("/imsd/voicecall01",))
+        if cb:
+            cb(Res(), None)
+
+
+class BridgeDialOrderTest(unittest.TestCase):
+    def _bridge(self, fail=False):
+        a, ob = FakeAudio(), FakeBus(fail)
+        b = bridge.Bridge(None, ob, None, audio=a)
+        b.ofono_modem, b.ofono_online = "/imsd", True
+        b._add_call = lambda opath, props, origin="ims": type("C", (), {"path": "/c/0"})()
+        return a, ob, b
+
+    def test_dial_waits_for_car_audio(self):
+        a, ob, b = self._bridge()
+        inv = FakeInv()
+        b.create_call({"number": "12345678"}, inv)
+        self.assertEqual(a.ev, ["prepare"])
+        self.assertEqual(ob.calls, [], "imsd Dial only after the car is on HFP")
+        a.cb()
+        self.assertEqual(ob.calls, ["Dial"])
+        self.assertEqual(inv.ret[0], "ok")
+
+    def test_failed_dial_releases_car_audio(self):
+        a, ob, b = self._bridge(fail=True)
+        b.cs_ok = lambda: False
+        inv = FakeInv()
+        b.create_call({"number": "12345678"}, inv)
+        a.cb()
+        self.assertEqual(a.ev, ["prepare", "abort"])
+        self.assertEqual(inv.ret[0], "err")
+
+    def test_no_audio_dials_directly(self):
+        ob = FakeBus()
+        b = bridge.Bridge(None, ob, None, audio=None)
+        b.ofono_modem, b.ofono_online = "/imsd", True
+        b._add_call = lambda opath, props, origin="ims": type("C", (), {"path": "/c/0"})()
+        b.create_call({"number": "12345678"}, FakeInv())
+        self.assertEqual(ob.calls, ["Dial"])
 
 
 class SinkPrefTest(unittest.TestCase):
