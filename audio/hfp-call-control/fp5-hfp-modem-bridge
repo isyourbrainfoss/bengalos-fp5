@@ -744,8 +744,14 @@ def main(argv=None):
     bridge.watch_mm()
     if audio:
         audio.startup_recover()
+    try:  # PyGObject >= 3.52 moved it; the old name warns
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        sig_add = GLibUnix.signal_add
+    except (ImportError, ValueError, AttributeError):
+        sig_add = GLib.unix_signal_add
     for s in (signal.SIGTERM, signal.SIGINT):
-        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, s, lambda *x: (loop.quit(), False)[1])
+        sig_add(GLib.PRIORITY_DEFAULT, s, lambda *x: (loop.quit(), False)[1])
     loop.run()
     if audio:
         audio.calls_changed(0)  # leave the car on A2DP if we stop mid-call

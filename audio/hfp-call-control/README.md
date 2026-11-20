@@ -61,12 +61,29 @@ phone. It does not help when we are the AG.
      sink/source.
    - callaudiod moves those to the earpiece/mic. WirePlumber's voice-call profile switch only
      reacts to ModemManager calls.
-   - At call start (after 0.8 s, re-asserted at 3 s), the bridge switches the car card to
-     `headset-head-unit` and makes its SCO nodes the defaults.
+   - At call start (after 0.8 s, re-asserted at 2, 3.5 and 6 s and then every 4 s while a call
+     is live), the bridge switches the car card to `headset-head-unit` and makes its SCO nodes
+     the defaults.
+   - It also moves imsd-media's `pw-record` (source-output) and `pw-play` (sink-input) streams
+     onto the car's SCO source/sink. imsd-media starts `pw-record` when it dials, before
+     the car's HFP nodes exist. A stream that is already linked does not follow a later
+     default change, so in the first car test (2026-11-20) the far end could not hear the car.
+     fp5-call-mic's `parecord` is left alone. Re-asserting covers callaudiod changing the
+     defaults and `pw-play` respawns.
    - At call end, it restores the old profile (a2dp-sink) and defaults, and unmutes the car sink.
    - A state file in `$XDG_RUNTIME_DIR` lets it recover after a crash. That covers the "muted
      Tesla A2DP after calls" case.
+   - When idle: if WirePlumber restarts (or the bridge starts), the default sink can fall
+     back to the speaker. If the car's A2DP sink was the default before, the bridge sets it
+     back once the sink reappears (90 s window). A sink the user picks outside that window
+     becomes the new preference (`$XDG_RUNTIME_DIR/fp5-hfp-audio-sinkpref`).
+   - Logs never contain node names, since they carry the car's BT address.
    - `FP5_HFP_AUDIO=off|dry`.
+   - Side note: the stock `qcom-call-audio-idle-suspend-workaround.sh` listens for
+     `org.freedesktop.ModemManager1.Call.StateChanged` from any sender, so it now also sees
+     the bridge's call signals. On an incoming call (state 3) it starts two `pw-loopback`
+     nodes, and it kills them at state 7. Both are harmless to the routing above, because the
+     defaults and streams are re-asserted.
 
 Not covered: `AT+BLDN` (redial from the car) stays ERROR outside PTS mode (upstream behaviour).
 Three-way calling (`AT+CHLD`) is not supported by the native AG either.
@@ -84,7 +101,8 @@ Hashes: `build/SHA256SUMS`.
 
 ## Tests (offline)
     ./run-tests.sh /path/to/pipewire-1.6.9+patch
-- Unit tests: audio router (engage/restore/second call/no car/crash recovery/car leaves),
+- Unit tests: audio router (engage/restore/second call/no car/crash recovery/car leaves,
+  imsd stream moves, re-assert, no GLib source warning, car sink back after WP restart),
   number checks, redaction, no IMEI/own number. Plus the guard test.
 - Integration: PipeWire's real patched `modemmanager.c` (tests/mm_harness.c) ↔ bridge ↔ mock
   imsd-ofonod on a private bus. Covers:
