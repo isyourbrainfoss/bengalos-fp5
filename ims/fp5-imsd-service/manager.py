@@ -6,23 +6,77 @@ LD_PRELOAD makes CLOCK_MONOTONIC track boot time. If the bus or login1 is
 missing, the sleep thread exits and the schedule below is the historical one
 (ready poll 15 s, post-transaction backoff 15/60/300 s, 3 attempts per 30 min).
 """
-import os,sys,json,subprocess,time,signal,fcntl,threading
+import os,sys,json,subprocess,time,signal,fcntl,threading,re
 from pathlib import Path
 from gi.repository import Gio,GLib
-from ownership import supported_kernel,bearer_obstacle
+from ownership import supported_kernel,bearer_obstacle,ims_bearer
 BASE=Path('/var/lib/fp5-imsd');LIB=Path('/opt/fp5-imsd/service');stopping=False;child=None
 os.umask(0o077)
 FAST_WINDOW_S=600
 QUICK_ATTEMPTS=3
+LOG_INTERVAL=float(os.environ.get('FP5_IMS_LOG_INTERVAL','5'))
 attempts=[]
 fast_until=0.0
 quick_left=0
 resume_wake=threading.Event()
 _lock=threading.Lock()
+_log_seen={}
+_last_key=None
+last_bearer='unknown'
+# Journal via stderr (the unit's StandardError=journal). SyslogIdentifier=fp5-ims
+# is set by fp5-ims.service.d/10-syslog.conf; the prefix keeps the line readable
+# if that drop-in is not installed yet. Same state+why is emitted at most once
+# per LOG_INTERVAL unless the key changed or force=True (PrepareForSleep).
+_SECRET=re.compile(
+ r'(?i)(?:imsi|imei|iccid)[:\s=]*\d{6,}'
+ r'|(?:sips?|tel):\S+'
+ r'|\b(?:\d{1,3}\.){3}\d{1,3}\b'
+ r'|\b[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,7}\b'
+ r'|([0-9a-f]{2}[:\-]){5}[0-9a-f]{2}'
+ r'|\+?\d{7,16}'
+ r'|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
+def redact(s):
+ return _SECRET.sub('<redacted>',str(s))
+def emit(key,line,force=False):
+ """One journal line. Transitions always log. Repeats of the same key are limited."""
+ global _last_key
+ now=time.monotonic();line=redact(line)
+ if not force and key==_last_key:
+  prev=_log_seen.get(key)
+  if prev is not None and now-prev<LOG_INTERVAL:return
+ _log_seen[key]=now;_last_key=key
+ try:print(line,file=sys.stderr,flush=True)
+ except Exception:pass
+def bearer_presence(bearers):
+ """ims-bearer=up/down/absent/unknown. No addresses, DNS, gateway or interface."""
+ if bearers is None:return 'unknown'
+ saw=False;up=False;unknown=False
+ for b in bearers.values():
+  if b is None or not isinstance(b,dict):
+   unknown=True;continue
+  if not ims_bearer(b):continue
+  saw=True
+  if b.get('Connected'):up=True
+ if saw:return 'up' if up else 'down'
+ return 'unknown' if unknown else 'absent'
+def imsd_registered():
+ """Boolean from status.json only. Never copy controller-private.log or a URI."""
+ p=Path(os.environ.get('FP5_IMSD_STATUS','/var/lib/fp5-imsd/status.json'))
+ try:
+  q=json.loads(p.read_text())
+  return 'yes' if q.get('ims_registered') else 'no'
+ except Exception:
+  return 'unknown'
+def log_poll(ok,why):
+ reg=imsd_registered()
+ emit('poll:%s:%s:%s:%s'%(int(bool(ok)),why,last_bearer,reg),
+      'fp5-ims poll ok=%d why=%s ims-bearer=%s imsd_registered=%s'%(1 if ok else 0,why,last_bearer,reg))
 def state(name,**kw):
  q={'state':name,'epoch':time.time(),'bootid':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),**kw}
  with _lock:
   t=BASE/'supervisor.tmp';t.write_text(json.dumps(q));t.replace(BASE/'supervisor.json')
+ extra=' '.join('%s=%s'%(k,kw[k]) for k in sorted(kw))
+ emit('state:%s:%s'%(name,extra),('fp5-ims state=%s %s'%(name,extra)).strip())
 def stop(sig,frame):
  global stopping
  stopping=True
@@ -54,11 +108,13 @@ def on_prepare_for_sleep(sleeping):
  if sleeping:
   with _lock:
    attempts.clear();quick_left=0;fast_until=0.0
+  emit('sleep:true','fp5-ims PrepareForSleep=true fast_window=closed',force=True)
   state('prepare-for-sleep')
  else:
   with _lock:
    fast_until=time.monotonic()+FAST_WINDOW_S;quick_left=QUICK_ATTEMPTS
   resume_wake.set()
+  emit('sleep:false','fp5-ims PrepareForSleep=false fast_window=open',force=True)
   state('resumed',quick_attempts=QUICK_ATTEMPTS,fast_window_s=FAST_WINDOW_S)
 def _on_sleep_signal(conn,sender,path,iface,signal,params,*_):
  try:on_prepare_for_sleep(bool(params.unpack()[0]))
@@ -91,6 +147,8 @@ def start_sleep_watch():
  """Daemon thread. If the bus or login1 is missing the thread exits and scheduling stays historical."""
  threading.Thread(target=_sleep_thread,name='fp5-ims-sleep',daemon=True).start()
 def ready():
+ global last_bearer
+ last_bearer='unknown'
  try:
   c=Gio.bus_get_sync(Gio.BusType.SYSTEM,None)
   objects=c.call_sync('org.freedesktop.ModemManager1','/org/freedesktop/ModemManager1','org.freedesktop.DBus.ObjectManager','GetManagedObjects',None,None,Gio.DBusCallFlags.NONE,5000,None).unpack()[0]
@@ -104,6 +162,7 @@ def ready():
   for b in m['Bearers']:
    try:bearers[b]=c.call_sync('org.freedesktop.ModemManager1',b,'org.freedesktop.DBus.Properties','GetAll',GLib.Variant('(s)',('org.freedesktop.ModemManager1.Bearer',)),None,Gio.DBusCallFlags.NONE,5000,None).unpack()[0]
    except Exception:bearers[b]=None
+  last_bearer=bearer_presence(bearers)
   why=bearer_obstacle(bearers)
   if why:return False,why
   return True,'ready'
@@ -119,6 +178,7 @@ def main():
   if subprocess.run(['/usr/bin/python3',str(LIB/'recover.py')],stdout=subprocess.DEVNULL).returncode:
    state('blocked-owned-cleanup');pause(60);continue
   ok,why=ready()
+  log_poll(ok,why)
   if not ok:state(why);pause(ready_pause_s());continue
   now=time.clock_gettime(time.CLOCK_BOOTTIME)
   with _lock:
