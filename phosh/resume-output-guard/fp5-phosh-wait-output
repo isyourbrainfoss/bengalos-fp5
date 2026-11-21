@@ -1,0 +1,66 @@
+#!/bin/sh
+# fp5-phosh-wait-output — ExecStartPre for mobi.phosh.Shell.service
+#
+# Wait until the compositor has at least one enabled output, then return.
+# Bound to FP5_WAIT_OUTPUT_TIMEOUT seconds (default 20). If the output is
+# already there the first probe succeeds and this returns immediately.
+# On timeout, exit 0 anyway so phosh still starts; the unit's start limit
+# (80-fp5-resume-output-guard.conf) ends the session if phosh keeps dying.
+#
+# Probe: $FP5_WAIT_OUTPUT_PROBE (default: fp5-phosh-output-ready next to
+# this script, or on PATH). Exit 0 means ready. Exit 127 means the probe
+# could not be executed (missing python3); do not burn the timeout on
+# every login. Any other non-zero means "not yet".
+#
+# Test hooks: FP5_WAIT_OUTPUT_TIMEOUT, FP5_WAIT_OUTPUT_PROBE,
+# FP5_WAIT_OUTPUT_INTERVAL (seconds between probes, default 0.2).
+
+set -eu
+
+timeout=${FP5_WAIT_OUTPUT_TIMEOUT:-20}
+interval=${FP5_WAIT_OUTPUT_INTERVAL:-0.2}
+probe=${FP5_WAIT_OUTPUT_PROBE:-}
+
+log() {
+    printf 'fp5-phosh-wait-output: %s\n' "$*" >&2
+}
+
+if [ -z "$probe" ]; then
+    here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    if [ -x "$here/fp5-phosh-output-ready" ]; then
+        probe=$here/fp5-phosh-output-ready
+    else
+        probe=fp5-phosh-output-ready
+    fi
+fi
+
+case "$timeout" in
+    ''|*[!0-9]*)
+        log "bad timeout '$timeout', not waiting"
+        exit 0
+        ;;
+esac
+
+start=$(date +%s)
+end=$((start + timeout))
+
+while :; do
+    set +e
+    "$probe"
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+        log "enabled output present"
+        exit 0
+    fi
+    if [ "$rc" -eq 127 ]; then
+        log "probe '$probe' failed to execute, not waiting"
+        exit 0
+    fi
+    now=$(date +%s)
+    if [ "$now" -ge "$end" ]; then
+        log "no enabled output after ${timeout}s, starting phosh anyway"
+        exit 0
+    fi
+    sleep "$interval"
+done

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Test double. Records the argv. Fails if asked to start, stop, or restart.
+if [ -z "${SYSTEMCTL_LOG:-}" ]; then
+    printf 'fake-systemctl: SYSTEMCTL_LOG is not set\n' >&2
+    exit 1
+fi
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+case "$*" in
+    *restart*|*start*|*stop*|*kill*)
+        printf 'fake-systemctl: refusing to %s\n' "$*" >&2
+        exit 99
+        ;;
+esac
+exit 0

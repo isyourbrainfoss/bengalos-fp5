@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+# fp5-phosh-output-ready — exit 0 if phoc has an enabled wlr output head.
+#
+# Speaks Wayland on $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (default wayland-0)
+# using only the standard library. Binds zwlr_output_manager_v1 and treats
+# the head "enabled" event as the signal. A missing socket, a compositor
+# that does not advertise the manager yet, or a round where every head is
+# disabled exits 1 so fp5-phosh-wait-output retries.
+#
+# wl_output alone is not enough: wlroots keeps the global for a disabled
+# connector, and a resume can re-add DSI-1 before the modeset has enabled it.
+
+import os
+import socket
+import struct
+import sys
+
+WL_DISPLAY_GET_REGISTRY = 1
+WL_DISPLAY_SYNC = 0
+WL_DISPLAY_ERROR = 0
+WL_DISPLAY_DELETE_ID = 1
+WL_REGISTRY_GLOBAL = 0
+WL_REGISTRY_BIND = 0
+WL_CALLBACK_DONE = 0
+WLR_MANAGER_HEAD = 0
+WLR_MANAGER_DONE = 1
+WLR_HEAD_ENABLED = 4
+MANAGER_IFACE = "zwlr_output_manager_v1"
+MANAGER_VERSION = 4
+
+
+def pack_string(text):
+    raw = text.encode("utf-8") + b"\x00"
+    pad = (4 - (len(raw) % 4)) % 4
+    return struct.pack("<I", len(raw)) + raw + (b"\x00" * pad)
+
+
+def pack_msg(obj, opcode, payload):
+    size = 8 + len(payload)
+    if size % 4:
+        raise ValueError("wayland payload is not 4-byte aligned")
+    return struct.pack("<IHH", obj, opcode, size) + payload
+
+
+def read_exact(sock, size):
+    buf = b""
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
+        if not chunk:
+            raise EOFError("wayland socket closed")
+        buf += chunk
+    return buf
+
+
+def read_msg(sock):
+    header = read_exact(sock, 8)
+    obj, opcode, size = struct.unpack("<IHH", header)
+    if size < 8 or size % 4:
+        raise ValueError("bad wayland message size %s" % size)
+    payload = read_exact(sock, size - 8) if size > 8 else b""
+    return obj, opcode, payload
+
+
+def take_string(payload, offset):
+    (length,) = struct.unpack_from("<I", payload, offset)
+    start = offset + 4
+    if length < 1 or start + length > len(payload):
+        raise ValueError("truncated wayland string")
+    text = payload[start : start + length - 1].decode("utf-8", "replace")
+    consumed = (length + 3) & ~3
+    return text, start + consumed
+
+
+def socket_path():
+    display = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+    if display.startswith("/"):
+        return display
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not runtime:
+        return ""
+    return os.path.join(runtime, display)
+
+
+def enabled_head(path, probe_timeout):
+    """Return True if any head is enabled, False if the round says no."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(probe_timeout)
+    sock.connect(path)
+    registry_id = 2
+    callback_id = 3
+    next_id = 4
+    sock.sendall(pack_msg(1, WL_DISPLAY_GET_REGISTRY, struct.pack("<I", registry_id)))
+    sock.sendall(pack_msg(1, WL_DISPLAY_SYNC, struct.pack("<I", callback_id)))
+
+    manager_name = None
+    manager_version = MANAGER_VERSION
+    heads = {}
+
+    def handle(obj, opcode, payload):
+        nonlocal manager_name, manager_version
+        if obj == 1 and opcode == WL_DISPLAY_ERROR:
+            return "error"
+        if obj == registry_id and opcode == WL_REGISTRY_GLOBAL:
+            offset = 0
+            (_name,) = struct.unpack_from("<I", payload, offset)
+            offset = 4
+            iface, offset = take_string(payload, offset)
+            (version,) = struct.unpack_from("<I", payload, offset)
+            if iface == MANAGER_IFACE:
+                manager_name = _name
+                manager_version = min(version, MANAGER_VERSION)
+        elif obj in heads and opcode == WLR_HEAD_ENABLED:
+            (enabled,) = struct.unpack_from("<i", payload, 0)
+            heads[obj] = enabled != 0
+        return None
+
+    def until_callback(cb_id):
+        while True:
+            obj, opcode, payload = read_msg(sock)
+            if obj == cb_id and opcode == WL_CALLBACK_DONE:
+                return True
+            status = handle(obj, opcode, payload)
+            if status == "error":
+                return False
+
+    if not until_callback(callback_id):
+        sock.close()
+        return False
+    if manager_name is None:
+        sock.close()
+        return False
+
+    manager_id = next_id
+    next_id += 1
+    callback_id = next_id
+    bind = struct.pack("<I", manager_name) + pack_string(MANAGER_IFACE)
+    bind += struct.pack("<II", manager_version, manager_id)
+    sock.sendall(pack_msg(registry_id, WL_REGISTRY_BIND, bind))
+    sock.sendall(pack_msg(1, WL_DISPLAY_SYNC, struct.pack("<I", callback_id)))
+
+    def handle_after_bind(obj, opcode, payload):
+        if obj == manager_id and opcode == WLR_MANAGER_HEAD:
+            (head_id,) = struct.unpack_from("<I", payload, 0)
+            heads[head_id] = False
+            return None
+        return handle(obj, opcode, payload)
+
+    while True:
+        obj, opcode, payload = read_msg(sock)
+        if obj == callback_id and opcode == WL_CALLBACK_DONE:
+            break
+        status = handle_after_bind(obj, opcode, payload)
+        if status == "error":
+            sock.close()
+            return False
+    sock.close()
+    return any(heads.values())
+
+
+def main():
+    path = socket_path()
+    if not path or not os.path.exists(path):
+        print("fp5-phosh-output-ready: no wayland socket", file=sys.stderr)
+        return 1
+    try:
+        timeout = float(os.environ.get("FP5_OUTPUT_READY_PROBE_TIMEOUT", "2"))
+    except ValueError:
+        timeout = 2.0
+    try:
+        ready = enabled_head(path, timeout)
+    except (OSError, EOFError, ValueError, socket.timeout) as exc:
+        print("fp5-phosh-output-ready: %s" % exc, file=sys.stderr)
+        return 1
+    if ready:
+        print("fp5-phosh-output-ready: enabled head", file=sys.stderr)
+        return 0
+    print("fp5-phosh-output-ready: no enabled head", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
