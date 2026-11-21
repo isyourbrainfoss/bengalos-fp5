@@ -1,7 +1,7 @@
 # FP5 BengalOS – avviksdokument (ikke-standard oppsett)
 
 Telefon: lab-FP5, maskin «phosh» (bruker fp5), BengalOS fra intern UFS (A/B via systemd-sysupdate fra isyourbrainfoss/bengalos-fp5 fp5-feed).
-Sist oppdatert: 21. nov 2026 kl. 08:20 (norsk tid). Nye avvik legges øverst i sin seksjon.
+Sist oppdatert: 21. nov 2026 kl. 08:35 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
 Prinsipp: alt som avviker fra offisiell BengalOS står her med plassering, hvorfor og hvordan det fjernes.
 
 ## 1. Bil / Tesla (Bluetooth)
@@ -60,8 +60,12 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 
 ## 5. Oppdateringer
 
-- Egen sysupdate-feed: GitHub-utgivelsen `fp5-feed` i isyourbrainfoss/bengalos-fp5, med UKI, fire FP5-sysexts og fp5-waydroid-fix. Publiseres automatisk hver morgen kl. 08 (siste 0.26.1119.1). Telefonen oppdateres bare når Kristian sier fra.
-- Lokale tillegg skal være med i feeden automatisk fra neste oppdatering. **Merk:** filene under `~/.config` og `~/.local` i hjemmemappen (som bilknappene over) overlever oppdateringer, men er foreløpig ikke i feeden eller i git.
+- Egen sysupdate-feed: GitHub-utgivelsen `fp5-feed` i isyourbrainfoss/bengalos-fp5, med UKI, FP5-sysexts (device, qtee, ims-app, volte-modules, waydroid-fix) og fra 0.26.1120.1 også fp5-modemmanager og fp5-frunk-qs. Offisiell usr/UKI/waydroid kommer som før; lokale tillegg skal med automatisk når morgenjobben bruker grenen `feed/carry-local-sysexts`. Telefonen oppdateres bare når Kristian sier fra. Siste offisielle OS i feeden: 0.26.1120.1 (publisert 21.11 07:59 Europe/Oslo).
+- **fp5-modemmanager + fp5-frunk-qs for 0.26.1120.1: FORBEREDT 21.11 ~08:32, ikke installert.** Bygget på desk mot den offisielle 1120.1-usr (verity OK). Samme MM-daemon som 1115.1–1118.1 (sha256 e43649ed…, MM#1110 / 9317cbc4) og samme Frunk-plugin som 1118.1 (sha256 ce44d0dc…, frunk-link). Bare `VERSION_ID=0.26.1120.1` og README er nye. Frunk er nå en erofs-`.raw` (ikke katalog), så sysupdate kan hente den. Symboler mot 1120.1 `/usr`: ModemManager 2838 udefinerte / 0 uløste, plugin 54 / 0. Offisiell pakke: modemmanager fortsatt 1.25.95-1, phosh 0.59.0+nb20261120…; systemd er 262.2 (opp fra 262), men symbolene løste seg. Publisert i `fp5-feed` (SHA256SUMS bare utvidet; gamle linjer uendret):
+  - `fp5-modemmanager_0.26.1120.1.raw` 3163c1cb… / `.raw.xz` 5490c21b…
+  - `fp5-frunk-qs_0.26.1120.1.raw` 9bc49856… / `.raw.xz` 63120562…
+  Pakke på telefonen (bare under `~/fp5-carry-1120/`, ingenting skrevet til `/etc` eller `/var/lib/extensions` ennå). Ett passord, **før** GUI-oppdateringen: `run0 sh /home/fp5/fp5-carry-1120/install.sh` (legger transfer-filer i `/etc/sysupdate.d` og 1120.1-raws i `/var/lib/extensions`; 1118.1 beholdes). Tilbake: `run0 sh /var/lib/fp5-backup/20261121-carry-1120/rollback.sh`. Gren med skript og feed-auto: `feed/carry-local-sysexts` (allerede på origin) og `update/0.26.1120.1-carry` (1120.1-filene). **Merk:** den daglige morgenjobben på desk kjører fortsatt det gamle auto-skriptet uten carry; neste versjon får mm/frunk automatisk først når jobben bruker `feed/carry-local-sysexts`. 1119.1 i feeden har ikke disse to sysextene, så etter at transfer-filene er installert vil 1119.1 sannsynligvis ikke lenger vises som komplett «available»-versjon (1120.1 er kandidaten).
+- Filene under `~/.config` og `~/.local` i hjemmemappen (som bilknappene over) overlever oppdateringer, men er foreløpig ikke i feeden eller i git.
 - Home-guard-endringen i `waydroid-bt-session-restart.sh` og `waydroid-bt-attach-watchdog.sh` (under `/var/lib/waydroid-host-stack/sbin/`) skal med i oppdateringsfeedens lokale tillegg senere.
 
 ## 6. Ikke rørt (bevisst standard)
