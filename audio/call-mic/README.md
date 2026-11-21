@@ -1,5 +1,10 @@
 # FP5 call uplink race fix + per-call audio logging (2026-11-19)
 
+> **v4 (2026-11-21, branch `fix/call-mic-ring-adc1`)**: turns ADC1 on at ring/dial,
+> before Voice Call PCMs open, and reopens the TX backend immediately if a
+> capture was opened while ADC1 was off. The v3 flat-mic fallback stays.
+> Car/HFP is left untouched. UCM is not changed. See [CHANGES.md](CHANGES.md).
+
 > **v3 (2026-11-20, branch `fix/first-call-mic`)**: fixes the dead phone mic on the first call after a boot.
 > Root cause, fix, install and rollback are in [CHANGES.md](CHANGES.md).
 > Part B (`fp5-call-mic` v3 + `fp5-mic-level`) works without a restart.

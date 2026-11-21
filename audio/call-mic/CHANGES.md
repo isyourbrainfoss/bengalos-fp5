@@ -1,6 +1,72 @@
 # audio/call-mic — change log (what and why)
 
-Search tags: first-call-mic, ADC1, dead mic, stille mikrofon, fp5-call-mic v3, UCM, wcd938x
+Search tags: first-call-mic, ADC1, dead mic, stille mikrofon, fp5-call-mic v3, fp5-call-mic v4, UCM, wcd938x
+
+## v4 — 2026-11-21 — branch `fix/call-mic-ring-adc1` (prepared, NOT installed)
+
+### Problem
+v3 still lost the uplink on the first CS call after a long s2idle (21.11 18:26).
+The other party could not hear the phone. The redial, a few seconds later, worked.
+`fp5-call-mic` v3 is started by the UCM Voice Call exec, which is the same moment
+the call PCMs open. It turned `ADC1 Switch` on, then opened parecord, then waited
+for the ~1.5 s level probe and the answer check before reopening the backend.
+On that call the reopen landed about 9 s after answer (`peak=6360` at 18:27:07).
+The call ended at 18:27:13. The start probe had been digital silence (`peak=5`,
+`rms_dbfs=-96`).
+
+### Fix
+UCM is unchanged.
+
+`fp5-call-mic-early` is an always-on user service (`WantedBy=default.target`).
+It polls ModemManager, oFono and imsd call state (get-property / GetCalls only).
+At CS ringing-in, and at outgoing dialing or ringing-out, it turns ADC1 on
+before answer and before the Voice Call profile switch, and remembers the
+previous value. IMS/VoLTE incoming and outgoing may turn ADC1 on as well.
+The helper never reopens the TX backend.
+
+After every call has ended, `fp5-call-mic.service` has stopped, and no capture
+PCM is RUNNING or PREPARED, it restores the saved value. Restoring off is
+intentional: the next ring turns it on again before the next PCM open.
+It does not write ADC1 while the keeper is running or a capture PCM is open.
+
+`fp5-call-mic` (the UCM-started keeper) keeps the v3 flat-mic fallback
+(max 2 tries, same T-stop / suspend-source / T-start order). In addition, if
+ADC1 was off and a capture PCM is already open, it turns ADC1 on and reopens
+the backend immediately, before the long probe. If that reopen is still silent,
+the v3 check still runs.
+
+Car/HFP (`$XDG_RUNTIME_DIR/fp5-hfp-audio.json` or a `bluez_*` default source):
+neither program writes ADC1, reopens a backend, or probes.
+
+Dry run: `FP5_CALL_MIC_DRYRUN=1` (no mixer write, no state file).
+Logs: `journalctl --user -t fp5-call-mic -t fp5-call-mic-early`. Levels and
+source names only. Numbers and MACs are redacted.
+
+### Files
+| File | Installed to | Note |
+|---|---|---|
+| `fp5-call-mic` | `/var/lib/fp5-oot/bin/` | v4 keeper |
+| `fp5-call-mic-early` | `/var/lib/fp5-oot/bin/` | new, always on |
+| `fp5-call-mic-early.service` | `~fp5/.config/systemd/user/` | `WantedBy=default.target` |
+| `fp5-call-mic.service` | `~fp5/.config/systemd/user/` | comment only |
+| `v4-stage/*.sh` | `~/.local/share/fp5-mic-staging-v4/` | mic-only install |
+
+### Install / rollback
+    sh ~/.local/share/fp5-mic-staging-v4/install-mic-v4.sh
+    sh ~/.local/share/fp5-mic-staging-v4/rollback-mic-v4.sh
+
+The installer runs `systemctl --user daemon-reload` and
+`enable --now` / `restart` of `fp5-call-mic-early.service` only.
+It does not restart WirePlumber, callaudiod, fp5-ims, or ModemManager,
+and it does not install UCM.
+
+The desk bundle that also carries the IMS journal and the callaudiod
+watchdog is separate (`fp5-xfer-call-fixes`).
+
+### Tests
+`sh audio/call-mic/run-mock-tests.sh` keeps the v3 cases and adds ringing-in,
+dialing, ringing-out, immediate reopen, the v3 fallback after that reopen,
+HFP during ring, restore after the streams close, dry-run, and redaction.
 
 ## v3 — 2026-11-20 — branch `fix/first-call-mic` (prepared, NOT installed)
 

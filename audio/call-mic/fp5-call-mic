@@ -1,6 +1,15 @@
 #!/bin/sh
-# fp5-call-mic v3 — FP5 call uplink keeper (2026-11-20, branch fix/first-call-mic).
-# v2: 2026-11-19 (approved by Kristian t777s3033), branch fix/call-mic-race.
+# fp5-call-mic v4 — FP5 call uplink keeper (2026-11-21, branch fix/call-mic-ring-adc1).
+# v3: 2026-11-20, branch fix/first-call-mic. v2: 2026-11-19 (t777s3033).
+#
+# v4 keeps the v3 flat-mic fallback (max 2 reopens, same T-stop / suspend /
+# T-start order). Two additions, because v3 still reopened ~9 s after answer
+# on 21.11 (ADC1 was applied only once this UCM-started process ran, which is
+# the same moment the call PCMs open, and the flat probe waited 1.5 s):
+#  * fp5-call-mic-early turns ADC1 on at ring/dial, before this service.
+#  * If a capture PCM is already open and ADC1 was off, reopen the TX backend
+#    immediately after forcing ADC1 on. Do not wait for the answer check.
+# Car / HFP: do not touch ADC1, do not reopen, do not probe.
 #
 # The voice TX path is only powered while a mic capture stream is open, so a
 # parecord to /dev/null is held open for the whole call (as in v1/v2).
@@ -46,6 +55,9 @@ TRIES=${FP5_CALL_MIC_RECOVER_TRIES:-2}
 CHECK=${FP5_CALL_MIC_CHECK:-1}                      # 0 = v2 behaviour (no probe/recovery)
 TX_UNIT=${FP5_CALL_MIC_TX_UNIT:-dummystreamhack@Thw:$CARD,7.service}
 HFP_STATE=${FP5_HFP_STATE:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fp5-hfp-audio.json}
+PCM_ROOT=${FP5_CALL_MIC_PCM_ROOT:-/proc/asound}
+QUICK_S=${FP5_CALL_MIC_QUICK_S:-0.2}
+V4_USED=0
 SRC_RE=${FP5_CALL_MIC_SRC_RE:-'(Voice_?Call|VoiceCall|Voice-Call).*Mic'}
 
 red() { printf '%s' "$1" | sed -E 's/([0-9A-Fa-f]{2}[:_-]){5}[0-9A-Fa-f]{2}/<mac>/g; s/\+?[0-9]{7,15}/<num>/g'; }
@@ -101,6 +113,20 @@ car_call() {
     return 1
 }
 
+# A call capture PCM is already RUNNING or PREPARED (hw_params already ran).
+tx_pcm_open() {
+    [ -d "$PCM_ROOT" ] || return 1
+    found=0
+    for f in "$PCM_ROOT"/card*/pcm*c/sub*/status; do
+        [ -f "$f" ] || continue
+        if grep -qE 'state: (RUNNING|PREPARED)' "$f" 2>/dev/null; then
+            found=1
+            break
+        fi
+    done
+    [ "$found" = 1 ]
+}
+
 # level probe; sets LVL (text) and returns 0 live / 1 flat / 2 unknown
 probe() {
     LVL=$("$LEVEL" "$1" "$PROBE_S" 2>/dev/null); rc=$?
@@ -129,10 +155,22 @@ check_mic() {
     [ "$MODE" = named ] || [ "$MODE" = named-rewired ] || { log "$phase: level check skipped (no Voice Call source)"; return 0; }
     if car_call; then log "$phase: car call (HFP) - level check skipped"; return 0; fi
     if [ "$DRY" = 1 ]; then log "dry: $phase: would probe $(red "$DEV") for ${PROBE_S}s and reopen the TX backend if flat"; return 0; fi
-    probe "$DEV"; r=$?
+    # v4: ADC1 was off, so the open already missed the port mask. A short read
+    # is enough to tell "already live" from "flat"; do not spend the full probe
+    # before the first reopen. The answer phase keeps the v3 full probe.
+    if [ "$phase" = start ] && [ "$ADC1_START" != on ] && [ "$ADC1_START" != car ] && [ "$V4_USED" = 0 ]; then
+        _saved=$PROBE_S
+        PROBE_S=$QUICK_S
+        probe "$DEV"; r=$?
+        PROBE_S=$_saved
+    else
+        probe "$DEV"; r=$?
+    fi
     if [ "$r" = 0 ]; then log "$phase: mic live ($LVL)"; return 0; fi
     if [ "$r" = 2 ]; then log "$phase: level unknown ($LVL) - no action"; return 0; fi
     n=0
+    # The immediate reopen below already used one of the two start-phase tries.
+    [ "$phase" = start ] && n=$V4_USED
     while [ "$n" -lt "$TRIES" ]; do
         n=$((n + 1))
         adc1_on
@@ -153,9 +191,15 @@ check_mic() {
     return 1
 }
 
-# 1. ADC1 on before anything else
-adc1_on
-ADC1_START=$ADC1_WAS
+# 1. ADC1 on before anything else. Car audio never writes the codec switch:
+#    the phone mic is not on this path, and a write would fight HFP.
+if car_call; then
+    log "v4: car call (HFP) - ADC1 left untouched"
+    ADC1_START=car
+else
+    adc1_on
+    ADC1_START=$ADC1_WAS
+fi
 
 # 2. wait for the Voice Call mic
 i=0
@@ -164,13 +208,36 @@ while [ -z "$SRC" ] && [ "$i" -lt "$WAIT_STEPS" ]; do
     sleep 0.2; i=$((i + 1)); SRC=$(find_src)
 done
 if [ -n "$SRC" ]; then MODE=named; DEV=$SRC; else MODE=fallback; DEV=@DEFAULT_SOURCE@; fi
+
+# v4: capture already open while ADC1 was off. The mask was latched at
+# hw_params. Reopen now, before the hold stream and before the answer check.
+# Only on the phone Voice Call source (MODE=named), never for HFP.
+if [ "$CHECK" = 1 ] && [ "$MODE" = named ] && [ "$ADC1_START" != on ] && [ "$ADC1_START" != car ] && ! car_call && tx_pcm_open; then
+    if [ "$DRY" = 1 ]; then
+        log "dry: v4: would reopen TX backend now (ADC1 was $ADC1_START while capture already open)"
+    else
+        log "v4: ADC1 was $ADC1_START while capture open -> reopen backend now"
+        adc1_on
+        if car_call; then
+            log "v4: car call started - reopen skipped"
+        else
+            reopen_backend "$DEV"
+            V4_USED=1
+        fi
+    fi
+fi
+
 start_rec "$DEV"
-log "v3 mode=$MODE source=$(red "$DEV") waited_ms=$((i * 200)) adc1_at_start=$ADC1_START"
+log "v4 keeper v3 mode=$MODE source=$(red "$DEV") waited_ms=$((i * 200)) adc1_at_start=$ADC1_START"
 snap start &
 
 # 3. level check right away (the call is still dialing/ringing)
 check_mic start
-st=$(adc1_get); [ "$DRY" = 1 ] || [ "$st" = on ] || amixer -q -c "$CARD" cset name='ADC1 Switch' on 2>/dev/null
+# v3 re-asserted ADC1 after the probe. Skip that on a car call: HFP must not
+# write the handset codec switch.
+if [ "$ADC1_START" != car ] && ! car_call; then
+    st=$(adc1_get); [ "$DRY" = 1 ] || [ "$st" = on ] || amixer -q -c "$CARD" cset name='ADC1 Switch' on 2>/dev/null
+fi
 snap plus3 &
 
 # 4. wait for the call to be answered, then verify the stream
@@ -199,7 +266,7 @@ if [ "$ans" = 1 ]; then
     if [ -n "$reason" ]; then
         kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null
         if [ -n "$want" ]; then MODE=named-rewired; DEV=$want; else MODE=fallback-rewired; DEV=@DEFAULT_SOURCE@; fi
-        adc1_on
+        if ! car_call; then adc1_on; fi
         start_rec "$DEV"
         log "answer-check: $reason have=$(red "$have") -> restarted on $(red "$DEV")"
     else

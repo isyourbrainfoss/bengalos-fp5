@@ -8,7 +8,12 @@
 # v3 2026-11-20 (branch fix/first-call-mic): ADC1 on at once, ~1.5 s level
 # check (levels only, no audio kept) and, if the mic is flat, the TX backend
 # is reopened so the first call after boot is not silent. Skips car calls.
-# Rollback: sh ~/.local/share/fp5-mic-staging-v3/rollback-mic-v3.sh
+# v4 2026-11-21 (branch fix/call-mic-ring-adc1): fp5-call-mic-early turns ADC1
+# on at ring/dial, before this process starts. If a capture PCM is already
+# open and ADC1 was off, the TX backend is reopened immediately. The v3
+# flat-mic check is unchanged. Car/HFP still does not touch ADC1.
+# UCM files are not part of v4.
+# Rollback: sh ~/.local/share/fp5-mic-staging-v4/rollback-mic-v4.sh
 [Unit]
 Description=Keep mic capture open during voice calls
 [Service]

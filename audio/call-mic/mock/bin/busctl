@@ -1,8 +1,35 @@
 #!/bin/sh
-M=$MOCK; el=$(awk -v a="$(date +%s.%N)" -v b="$(cat $M/t0)" "BEGIN{print a-b}")
+# mock busctl. Legacy (no $MOCK/mm_state): Call/0 is dialing (1) until
+# elapsed >= $MOCK/active_at, then active (4); direction outgoing (2).
+# Optional files used by the v4 early-helper tests:
+#   mm_state       numeric MM call state (overrides the timeline)
+#   mm_dir         direction (1 in, 2 out)
+#   mm_calls_empty empty Calls list
+#   mm_number      Number property (the helper must redact it)
+#   ofono_state    oFono VoiceCall State string
+M=$MOCK
+el=$(awk -v a="$(date +%s.%N)" -v b="$(cat "$M/t0" 2>/dev/null || echo 0)" 'BEGIN{print a-b}')
+state_of() {
+    if [ -f "$M/mm_state" ]; then cat "$M/mm_state"; return; fi
+    t=0; [ -f "$M/active_at" ] && t=$(cat "$M/active_at")
+    if awk -v e="$el" -v t="$t" 'BEGIN{exit !(e>=t)}'; then echo 4; else echo 1; fi
+}
+dir_of() { if [ -f "$M/mm_dir" ]; then cat "$M/mm_dir"; else echo 2; fi; }
 case "$*" in
- *Modem/0*Calls*) echo '{"type":"ao","data":["/org/freedesktop/ModemManager1/Call/0"]}';;
- *Call/0*State*) if awk -v e="$el" -v t="$(cat $M/active_at)" "BEGIN{exit !(e>=t)}"; then echo '{"type":"i","data":4}'; else echo '{"type":"i","data":1}'; fi;;
- *Call/0*Direction*) echo '{"type":"i","data":2}';;
- *) exit 1;;
+    *org.ofono*|*VoiceCallManager*)
+        if [ ! -f "$M/ofono_state" ]; then exit 1; fi
+        st=$(cat "$M/ofono_state")
+        printf '%s\n' "{\"type\":\"a(oa{sv})\",\"data\":[[\"/imsd/call0\",{\"State\":{\"type\":\"s\",\"data\":\"$st\"}}]]}"
+        ;;
+    *Modem.Voice*Calls*|*Voice\ Calls*)
+        if [ -f "$M/mm_calls_empty" ]; then echo '{"type":"ao","data":[]}'; exit 0; fi
+        echo '{"type":"ao","data":["/org/freedesktop/ModemManager1/Call/0"]}'
+        ;;
+    *Number*)
+        if [ ! -f "$M/mm_number" ]; then exit 1; fi
+        printf '%s\n' "{\"type\":\"s\",\"data\":\"$(cat "$M/mm_number")\"}"
+        ;;
+    *State*) echo "{\"type\":\"i\",\"data\":$(state_of)}" ;;
+    *Direction*) echo "{\"type\":\"i\",\"data\":$(dir_of)}" ;;
+    *) exit 1 ;;
 esac

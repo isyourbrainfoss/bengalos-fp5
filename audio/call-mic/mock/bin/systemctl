@@ -1,9 +1,42 @@
 #!/bin/sh
-# mock systemctl --user for the dummystreamhack T unit; $MOCK/t_active = unit running
-[ "$1" = --user ] && shift
-case "$1" in
- is-active) [ -f $MOCK/t_active ];;
- stop) echo "SYSTEMCTL stop $2" >> $MOCK/actions; rm -f $MOCK/t_active;;
- start) echo "SYSTEMCTL start $2" >> $MOCK/actions; touch $MOCK/t_active;;
- *) echo "SYSTEMCTL $*" >> $MOCK/actions;;
+# mock systemctl --user. TX unit tracks $MOCK/t_active.
+# fp5-call-mic.service tracks $MOCK/mic_service_active (separate, so a test
+# can hold the keeper "active" without pretending the hostless TX unit is up).
+M=$MOCK
+cmd=""
+unit=""
+for a in "$@"; do
+    case "$a" in
+        --user|--quiet|--no-block) ;;
+        *)
+            if [ -z "$cmd" ]; then cmd=$a
+            elif [ -z "$unit" ]; then unit=$a
+            fi
+            ;;
+    esac
+done
+case "$cmd" in
+    is-active)
+        case "$unit" in
+            *fp5-call-mic*) [ -f "$M/mic_service_active" ] ;;
+            *) [ -f "$M/t_active" ] ;;
+        esac
+        ;;
+    stop)
+        echo "SYSTEMCTL stop $unit" >> "$M/actions"
+        case "$unit" in
+            *fp5-call-mic*) rm -f "$M/mic_service_active" ;;
+            *) rm -f "$M/t_active" ;;
+        esac
+        ;;
+    start)
+        echo "SYSTEMCTL start $unit" >> "$M/actions"
+        case "$unit" in
+            *fp5-call-mic*) touch "$M/mic_service_active" ;;
+            *) touch "$M/t_active" ;;
+        esac
+        ;;
+    *)
+        echo "SYSTEMCTL $*" >> "$M/actions"
+        ;;
 esac

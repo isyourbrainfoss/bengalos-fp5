@@ -1,0 +1,229 @@
+#!/bin/sh
+# fp5-call-mic-early v4 — turn ADC1 on at ring/dial, before Voice Call PCMs open.
+#
+# The UCM Voice Call profile starts fp5-call-mic at answer, which is the same
+# moment the call PCMs run hw_params. On mainline wcd938x the ADC1 Switch port
+# mask is applied only then. This helper watches call state over D-Bus (get
+# and signals are not required; polling get-property / GetCalls only, never
+# mmcli, never a state-changing call) and sets ADC1 on while the phone is
+# ringing or dialing, before that open.
+#
+# Restore the saved value only after every call has ended, fp5-call-mic has
+# stopped, and no capture PCM is still RUNNING/PREPARED. A saved "off" is
+# restored: the next ring turns it on again before the next PCM open.
+# Do not write ADC1 while a capture PCM is open or while the keeper is running
+# (that would fight a mid-call UCM sequence and would not apply until reopen).
+#
+# IMS/VoLTE (imsd status.json or oFono VoiceCall): ADC1 on is allowed when the
+# handset mic will be used. This process never reopens the TX backend.
+# HFP/car ($XDG_RUNTIME_DIR/fp5-hfp-audio.json or a bluez_* default source):
+# do not touch ADC1.
+#
+# Dry run (no mixer write, no state file): FP5_CALL_MIC_DRYRUN=1
+# One pass for tests: FP5_CALL_MIC_EARLY_ONCE=1
+# Logs: journalctl -t fp5-call-mic-early  (levels and state names only)
+set -u
+TAG=fp5-call-mic-early
+CARD=${FP5_CALL_MIC_CARD:-F5}
+DRY=${FP5_CALL_MIC_DRYRUN:-0}
+ONCE=${FP5_CALL_MIC_EARLY_ONCE:-0}
+INTERVAL=${FP5_CALL_MIC_EARLY_INTERVAL:-0.4}
+RT=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+HFP_STATE=${FP5_HFP_STATE:-$RT/fp5-hfp-audio.json}
+STATE=${FP5_CALL_MIC_EARLY_STATE:-$RT/fp5-call-mic-early.state}
+PCM_ROOT=${FP5_CALL_MIC_PCM_ROOT:-/proc/asound}
+IMSD_STATUS=${FP5_IMSD_STATUS:-/var/lib/fp5-imsd/status.json}
+MIC_UNIT=${FP5_CALL_MIC_UNIT:-fp5-call-mic.service}
+
+red() { printf '%s' "$1" | sed -E 's/([0-9A-Fa-f]{2}[:_-]){5}[0-9A-Fa-f]{2}/<mac>/g; s/(sips?|tel):[^ ]+/<uri>/g; s/\+?[0-9]{7,15}/<num>/g'; }
+log() { msg=$(red "$*"); if [ "$DRY" = 1 ]; then printf '%s: %s\n' "$TAG" "$msg"; else logger -t "$TAG" -- "$msg"; fi; }
+
+adc1_get() { amixer -c "$CARD" cget name='ADC1 Switch' 2>/dev/null | sed -n 's/.*: values=//p' | tail -1; }
+
+tx_pcm_open() {
+    [ -d "$PCM_ROOT" ] || return 1
+    found=0
+    for f in "$PCM_ROOT"/card*/pcm*c/sub*/status; do
+        [ -f "$f" ] || continue
+        if grep -qE 'state: (RUNNING|PREPARED)' "$f" 2>/dev/null; then found=1; break; fi
+    done
+    [ "$found" = 1 ]
+}
+
+mic_service_up() { systemctl --user is-active --quiet "$MIC_UNIT"; }
+
+# Print one TSV line per call: kind \t state \t direction \t redacted-number
+# Also "mm-unknown" / "ims-unknown" when that source cannot be read.
+list_calls() {
+    FP5_IMSD_STATUS="$IMSD_STATUS" python3 - <<'PY'
+import json, os, subprocess
+
+def red(s):
+    import re
+    s = "" if s is None else str(s)
+    s = re.sub(r"(?i)(sips?|tel):\S+", "<uri>", s)
+    s = re.sub(r"([0-9A-Fa-f]{2}[:_-]){5}[0-9A-Fa-f]{2}", "<mac>", s)
+    s = re.sub(r"\+?\d{7,15}", "<num>", s)
+    return s
+
+def bus(*args):
+    try:
+        r = subprocess.run(["busctl", "--system", "--json=short", *args],
+                           capture_output=True, text=True, timeout=2)
+    except Exception:
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    try:
+        return json.loads(r.stdout).get("data")
+    except Exception:
+        return None
+
+mm_ok = False
+for i in range(4):
+    calls = bus("get-property", "org.freedesktop.ModemManager1",
+                "/org/freedesktop/ModemManager1/Modem/%d" % i,
+                "org.freedesktop.ModemManager1.Modem.Voice", "Calls")
+    if calls is None:
+        continue
+    mm_ok = True
+    if not isinstance(calls, list):
+        continue
+    for path in calls:
+        st = bus("get-property", "org.freedesktop.ModemManager1", path,
+                 "org.freedesktop.ModemManager1.Call", "State")
+        dr = bus("get-property", "org.freedesktop.ModemManager1", path,
+                 "org.freedesktop.ModemManager1.Call", "Direction")
+        num = bus("get-property", "org.freedesktop.ModemManager1", path,
+                  "org.freedesktop.ModemManager1.Call", "Number")
+        print("mm\t%s\t%s\t%s" % ("" if st is None else st, "" if dr is None else dr, red(num or "")))
+if not mm_ok:
+    print("mm-unknown")
+
+try:
+    r = subprocess.run(["busctl", "--system", "--json=short", "call", "org.ofono",
+                        "/imsd", "org.ofono.VoiceCallManager", "GetCalls"],
+                       capture_output=True, text=True, timeout=2)
+    if r.returncode == 0 and r.stdout.strip():
+        data = json.loads(r.stdout).get("data") or []
+        rows = data
+        # busctl --json=short: {"data":[[path, {State:{data:...}}]]}
+        if rows and isinstance(rows[0], list) and rows[0] and not isinstance(rows[0][0], (list, dict)):
+            pass
+        for item in rows:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            props = item[1] if isinstance(item[1], dict) else {}
+            raw = props.get("State")
+            st = raw.get("data") if isinstance(raw, dict) else raw
+            print("ofono\t%s\t\t" % red(st or ""))
+except Exception:
+    pass
+
+path = os.environ.get("FP5_IMSD_STATUS", "")
+if path and os.path.exists(path):
+    try:
+        q = json.loads(open(path).read())
+        for c in q.get("calls") or []:
+            if isinstance(c, dict):
+                print("ims\t%s\t%s\t" % (red(c.get("state") or ""), red(c.get("direction") or "")))
+    except Exception:
+        print("ims-unknown")
+PY
+}
+
+tick() {
+    car=0
+    [ -e "$HFP_STATE" ] && car=1
+    src=$(pactl get-default-source 2>/dev/null || true)
+    case "$src" in bluez_*) car=1 ;; esac
+    if [ "$car" = 1 ]; then
+        log "v4: car call (HFP) - ADC1 left untouched source=$(red "$src")"
+        return 0
+    fi
+
+    tmp=$(mktemp)
+    list_calls > "$tmp" 2>/dev/null || true
+    unknown=0
+    grep -q '^mm-unknown' "$tmp" && unknown=1
+    grep -q '^ims-unknown' "$tmp" && unknown=1
+    want=""
+    num=""
+    while IFS=$(printf '\t') read -r kind st dir number; do
+        case "$kind" in
+            mm)
+                case "$st" in
+                    1) want=dialing ;;
+                    2) want=ringing-out ;;
+                    3) want=ringing-in ;;
+                    4|5|6) [ -n "$want" ] || want=call ;;
+                esac
+                [ -n "$number" ] && num=$number
+                ;;
+            ofono|ims)
+                case "$st" in
+                    ""|disconnected|terminated|end) ;;
+                    incoming|waiting) want=ringing-in ;;
+                    dialing) want=dialing ;;
+                    alerting|ringing-out) want=ringing-out ;;
+                    *) [ -n "$want" ] || want=call ;;
+                esac
+                ;;
+        esac
+    done < "$tmp"
+    rm -f "$tmp"
+
+    busy=0
+    mic_service_up && busy=1
+    tx_pcm_open && busy=1
+
+    if [ -n "$want" ]; then
+        # Capture already open: the keeper reopens if it must. Do not toggle.
+        [ "$busy" = 1 ] && return 0
+        was=$(adc1_get); [ -n "$was" ] || was=?
+        nbit=""
+        [ -n "$num" ] && nbit=" num=$num"
+        if [ ! -s "$STATE" ]; then
+            if [ "$DRY" = 1 ]; then
+                log "dry: v4: $want adc1_was=$was -> on$nbit"
+                return 0
+            fi
+            printf 'saved=%s\n' "$was" > "$STATE"
+            log "v4: $want adc1_was=$was -> on$nbit"
+        fi
+        if [ "$was" != on ]; then
+            if [ "$DRY" = 1 ]; then log "dry: v4: would set ADC1 on"; return 0; fi
+            amixer -q -c "$CARD" cset name='ADC1 Switch' on 2>/dev/null || log "v4: ADC1 set failed"
+        fi
+        return 0
+    fi
+
+    # No call visible. Unknown bus state, a live keeper, or an open PCM: hold.
+    [ "$unknown" = 1 ] && return 0
+    [ "$busy" = 1 ] && return 0
+    [ -s "$STATE" ] || return 0
+    saved=$(sed -n 's/^saved=//p' "$STATE" | head -1)
+    case "$saved" in
+        on|off) ;;
+        *) rm -f "$STATE"; return 0 ;;
+    esac
+    if [ "$DRY" = 1 ]; then
+        log "dry: v4: would restore ADC1 to $saved"
+        return 0
+    fi
+    cur=$(adc1_get)
+    if [ "$cur" != "$saved" ]; then
+        amixer -q -c "$CARD" cset name='ADC1 Switch' "$saved" 2>/dev/null || log "v4: ADC1 restore failed"
+    fi
+    rm -f "$STATE"
+    log "v4: calls ended, streams closed -> ADC1 restored to $saved"
+}
+
+if [ "$ONCE" = 1 ]; then
+    tick
+    exit 0
+fi
+while :; do
+    tick
+    sleep "$INTERVAL"
+done
