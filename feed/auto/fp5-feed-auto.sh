@@ -138,7 +138,7 @@ def w(x):
         for v in x: w(v)
 w(m); print(out.get(sys.argv[2],""))' "$D/BengalOS_$V.manifest" "$1"; }
 MMV=$(pkgv modemmanager); PHV=$(pkgv phosh)
-[ "$MMV" = "$CARRY_MM_PKG" ] || fail "carry: official modemmanager is now '$MMV' (pinned $CARRY_MM_PKG): check whether it contains 9317cbc4 (then drop fp5-modemmanager) or rebuild it"
+[ "$MMV" = "$CARRY_MM_PKG" ] || fail "carry: official modemmanager is now '$MMV' (pinned $CARRY_MM_PKG): rebase mm-fp5-keep-ims-bearer (+ 9317cbc4 if missing) onto it and rebuild; never just drop fp5-modemmanager (IMS spare)"
 [ "${PHV%%+*}" = "$CARRY_PHOSH_UPSTREAM" ] || fail "carry: official phosh is now '$PHV' (pinned $CARRY_PHOSH_UPSTREAM): rebuild the Frunk plugin against it"
 say "carry gates OK (modemmanager $MMV, phosh $PHV)"
 

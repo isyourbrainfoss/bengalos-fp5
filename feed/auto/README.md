@@ -37,7 +37,8 @@ Carry (2026-11-19): every run also builds `fp5-modemmanager_<V>` (MM#1110 daemon
 from `../sysext/carry/` (pinned, see PROVENANCE.md). These two used to be re-pinned by hand on the phone for every
 version. Fail closed, so the version is not published, if:
 - the inputs' sha256 do not match;
-- official modemmanager is not 1.25.95-1 (check for 9317cbc4 and drop the sysext);
+- official modemmanager is not 1.25.95-1 (rebase 9317cbc4 if still missing and mm-fp5-keep-ims-bearer onto the new
+  daemon and rebuild; do NOT just drop the sysext: the IMS spare is local and keeps VoLTE alive through suspend);
 - official phosh is not 0.59.0 (rebuild the plugin);
 - a carry raw is missing;
 - fsck, extension-release or xz==raw fails;
@@ -61,3 +62,15 @@ The lab identifiers for the secret audit live in the untracked `auto/lab-pattern
 
 Post-upload index compare: 6 tries with backoff (5..160 s, about 5 min), cache-busted, instead of a single `sleep 5`.
 This failed with ERROR on 15, 17, 18 and 19 Nov.
+
+IMS spare (merged 21 Nov 2026, Kristian): carry/ModemManager is now 1.25.95-1 + 9317cbc4 + mm-fp5-keep-ims-bearer
+(see ../sysext/carry/PROVENANCE.md). What the next daily run does:
+- The live run (`official-20261114/auto/fp5-feed-auto.sh`, Nov 15 copy) has no carry step at all: it publishes the
+  official parts + fp5-* base sysexts only. fp5-modemmanager_<V> / fp5-frunk-qs_<V> for 0.26.1119.1 and 0.26.1120.1 were
+  added by hand (image/carry-<V>). Until the live tree is updated from this branch, every new version needs that
+  manual carry step, now with the new carry/ModemManager (sha256 fc7239de...). Without it a phone with
+  35-fp5-modemmanager.transfer sees the new version as incomplete and does not update.
+- Once the live tree runs this branch's script: the first version built with the new daemon stops with CHECK_FAILED
+  in container-checks.sh ("payload differs from the previous version's carry build"), nothing is published. That is
+  expected: a human reviews (diff = the new ModemManager only, sha fc7239de...), then publishes that version by hand
+  or with a reviewed run. Later versions with the same binary pass automatically.
