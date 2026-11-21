@@ -23,9 +23,14 @@ write the modem and does not call mmcli.
 Journal (stderr, tag `fp5-ims` via `fp5-ims.service.d/10-syslog.conf`, which
 sets only `SyslogIdentifier`): state transitions, `PrepareForSleep` true/false,
 each `ready()` poll (`why`, `ims-bearer=up/down/absent/unknown`,
-`imsd_registered=yes/no/unknown`), and transaction start/exit. The same
+`imsd_registered=yes/no/unknown`, `rat=` as gsm/edge/umts/lte/nr), and
+transaction start/exit. When why, bearer, registration or RAT changes, the
+line also has `change was->now`, including while the phone is awake (the
+existing 15 s / 2 s ready() loop; no extra poll or timer). The same
 state+why is logged at most once every few seconds; a change of state and
-every PrepareForSleep edge is always logged. Bearer lines are a count word
+every PrepareForSleep edge is always logged. `emit()` never blocks the
+supervisor: it only queues a line (or drops it). A blocked or failing
+journal cannot delay or stop the loop. Bearer lines are a count word
 only (no address, DNS, gateway or interface). `imsd_registered` is the boolean
 in `status.json`. `controller-private.log` is not copied to the journal.
 Identifiers are redacted on every line. `supervisor.json` is still written.

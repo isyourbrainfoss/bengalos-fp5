@@ -6,7 +6,7 @@ LD_PRELOAD makes CLOCK_MONOTONIC track boot time. If the bus or login1 is
 missing, the sleep thread exits and the schedule below is the historical one
 (ready poll 15 s, post-transaction backoff 15/60/300 s, 3 attempts per 30 min).
 """
-import os,sys,json,subprocess,time,signal,fcntl,threading,re
+import os,sys,json,subprocess,time,signal,fcntl,threading,re,queue
 from pathlib import Path
 from gi.repository import Gio,GLib
 from ownership import supported_kernel,bearer_obstacle,ims_bearer
@@ -15,18 +15,27 @@ os.umask(0o077)
 FAST_WINDOW_S=600
 QUICK_ATTEMPTS=3
 LOG_INTERVAL=float(os.environ.get('FP5_IMS_LOG_INTERVAL','5'))
+LOG_QUEUE=64
 attempts=[]
 fast_until=0.0
 quick_left=0
 resume_wake=threading.Event()
 _lock=threading.Lock()
+_log_lock=threading.Lock()
 _log_seen={}
 _last_key=None
+_log_q=None
+_log_thread=None
 last_bearer='unknown'
-# Journal via stderr (the unit's StandardError=journal). SyslogIdentifier=fp5-ims
-# is set by fp5-ims.service.d/10-syslog.conf; the prefix keeps the line readable
-# if that drop-in is not installed yet. Same state+why is emitted at most once
-# per LOG_INTERVAL unless the key changed or force=True (PrepareForSleep).
+last_rat='unknown'
+_prev_poll=None
+# Journal must never stop or delay the supervisor: emit() only does redact,
+# rate-limit and a non-blocking queue put. A daemon writer thread (no timer,
+# no alarm, no extra poll) writes to stderr. A full queue or a blocked
+# journal drops the line. The whole path is in try/except.
+# SyslogIdentifier=fp5-ims is set by fp5-ims.service.d/10-syslog.conf.
+# Same state+why is emitted at most once per LOG_INTERVAL unless the key
+# changed or force=True (PrepareForSleep).
 _SECRET=re.compile(
  r'(?i)(?:imsi|imei|iccid)[:\s=]*\d{6,}'
  r'|(?:sips?|tel):\S+'
@@ -37,16 +46,66 @@ _SECRET=re.compile(
  r'|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
 def redact(s):
  return _SECRET.sub('<redacted>',str(s))
+def _write_line(line):
+ """Best-effort journal write. Never called on the supervisor thread."""
+ try:
+  print(line,file=sys.stderr,flush=True)
+ except Exception:
+  pass
+def _log_writer():
+ while True:
+  try:
+   item=_log_q.get()
+  except Exception:
+   continue
+  if item is None:
+   return
+  if isinstance(item,threading.Event):
+   try:item.set()
+   except Exception:pass
+   continue
+  _write_line(item)
+def _ensure_writer():
+ global _log_q,_log_thread
+ with _log_lock:
+  if _log_q is None:
+   _log_q=queue.Queue(maxsize=LOG_QUEUE)
+  if _log_thread is None or not _log_thread.is_alive():
+   _log_thread=threading.Thread(target=_log_writer,name='fp5-ims-log',daemon=True)
+   _log_thread.start()
+def log_sync(timeout=1.0):
+ """Tests only: wait until the writer has flushed earlier lines.
+ Uses perf_counter so tests may patch time.monotonic for rate-limits.
+ """
+ try:
+  _ensure_writer()
+  ev=threading.Event()
+  t=time.perf_counter()+timeout
+  while time.perf_counter()<t:
+   try:
+    _log_q.put(ev,timeout=max(0.0,t-time.perf_counter()))
+    ev.wait(max(0.0,t-time.perf_counter()))
+    return ev.is_set()
+   except queue.Full:
+    time.sleep(0.01)
+  return False
+ except Exception:
+  return False
 def emit(key,line,force=False):
- """One journal line. Transitions always log. Repeats of the same key are limited."""
- global _last_key
- now=time.monotonic();line=redact(line)
- if not force and key==_last_key:
-  prev=_log_seen.get(key)
-  if prev is not None and now-prev<LOG_INTERVAL:return
- _log_seen[key]=now;_last_key=key
- try:print(line,file=sys.stderr,flush=True)
- except Exception:pass
+ """Queue one journal line without blocking the caller. Failures are dropped."""
+ try:
+  global _last_key
+  now=time.monotonic();line=redact(line)
+  if not force and key==_last_key:
+   prev=_log_seen.get(key)
+   if prev is not None and now-prev<LOG_INTERVAL:return
+  _log_seen[key]=now;_last_key=key
+  _ensure_writer()
+  try:_log_q.put_nowait(line)
+  except queue.Full:
+   pass
+ except Exception:
+  pass
 def bearer_presence(bearers):
  """ims-bearer=up/down/absent/unknown. No addresses, DNS, gateway or interface."""
  if bearers is None:return 'unknown'
@@ -67,10 +126,38 @@ def imsd_registered():
   return 'yes' if q.get('ims_registered') else 'no'
  except Exception:
   return 'unknown'
+def rat_words(mask):
+ """Short RAT list from ModemManager AccessTechnologies. No operator identifiers."""
+ try:mask=int(mask)
+ except Exception:return 'unknown'
+ names=[]
+ if mask&(2|4|8):names.append('gsm')
+ if mask&16:names.append('edge')
+ if mask&(32|64|128|256|512):names.append('umts')
+ if mask&(16384|65536|131072):names.append('lte')
+ if mask&32768:names.append('nr')
+ if names:return ','.join(names)
+ return 'none' if mask==0 else 'other'
 def log_poll(ok,why):
- reg=imsd_registered()
- emit('poll:%s:%s:%s:%s'%(int(bool(ok)),why,last_bearer,reg),
-      'fp5-ims poll ok=%d why=%s ims-bearer=%s imsd_registered=%s'%(1 if ok else 0,why,last_bearer,reg))
+ """Log this ready() result. Transitions include was->now so a CS call while
+ awake has a journal trail of when IMS, the bearer or the RAT dropped."""
+ global _prev_poll
+ try:
+  reg=imsd_registered();bearer=last_bearer;rat=last_rat
+  line='fp5-ims poll ok=%d why=%s ims-bearer=%s imsd_registered=%s rat=%s'%(1 if ok else 0,why,bearer,reg,rat)
+  prev=_prev_poll
+  if prev is not None:
+   pok,pwhy,pb,preg,prat=prev
+   changed=[]
+   if pwhy!=why:changed.append('why=%s->%s'%(pwhy,why))
+   if pb!=bearer:changed.append('ims-bearer=%s->%s'%(pb,bearer))
+   if preg!=reg:changed.append('imsd_registered=%s->%s'%(preg,reg))
+   if prat!=rat:changed.append('rat=%s->%s'%(prat,rat))
+   if changed:line+=' change '+' '.join(changed)
+  _prev_poll=(ok,why,bearer,reg,rat)
+  emit('poll:%s:%s:%s:%s:%s'%(int(bool(ok)),why,bearer,reg,rat),line)
+ except Exception:
+  pass
 def state(name,**kw):
  q={'state':name,'epoch':time.time(),'bootid':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),**kw}
  with _lock:
@@ -147,14 +234,14 @@ def start_sleep_watch():
  """Daemon thread. If the bus or login1 is missing the thread exits and scheduling stays historical."""
  threading.Thread(target=_sleep_thread,name='fp5-ims-sleep',daemon=True).start()
 def ready():
- global last_bearer
- last_bearer='unknown'
+ global last_bearer,last_rat
  try:
   c=Gio.bus_get_sync(Gio.BusType.SYSTEM,None)
   objects=c.call_sync('org.freedesktop.ModemManager1','/org/freedesktop/ModemManager1','org.freedesktop.DBus.ObjectManager','GetManagedObjects',None,None,Gio.DBusCallFlags.NONE,5000,None).unpack()[0]
   mods=[(p,v['org.freedesktop.ModemManager1.Modem']) for p,v in objects.items() if 'org.freedesktop.ModemManager1.Modem' in v]
   if len(mods)!=1:return False,'waiting-unique-modem'
   p,m=mods[0]
+  last_rat=rat_words(m.get('AccessTechnologies',0))
   if int(m['UnlockRequired'])==2:return False,'waiting-normal-sim-unlock'
   if int(m['State'])<8:return False,'waiting-home-registration'
   if not int(m.get('AccessTechnologies',0)) & 16384:return False,'waiting-existing-lte-no-mode-change'
