@@ -75,6 +75,8 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 
 - 21.11 kl. 11:38: midlertidig dvalelogging for å fange hvor dvaledødsfallene skjer (warm reset fra PS_HOLD minutter inn i s2idle, sist 10:54 på 1120.1; krasjloggen viste ingen feil fordi loggnivået var lavt). Bare i minnet til neste omstart: `kernel.printk` 4→8, `printk.console_suspend` Y→N, `/sys/power/pm_debug_messages` 0→1, `/sys/power/pm_print_times` 0→1. Tilbake: skriv 4 / Y / 0 / 0 eller reboot. Merk: lignende cmdline-flagg 19.11 var mistenkt for Phosh-krasj ved oppvåkning. Krasjlogg-kopi: `/var/lib/fp5-suspend-guard/pstore/20261121-1058-console-ramoops-0`.
 
+- **21.11 15:26 – samtaler uten lyd, callaudiod startet på nytt (kun kjøretid).** Samtalene 14:55–14:57 og 15:25 hadde ingen lyd begge veier. Årsak: callaudiod (kjørt siden 11:00) svarte ikke på SelectMode, så kortet ble stående på HiFi og Voice Call-profilen (fp5-call-audio/fp5-call-mic) kjørte aldri. Ikke ADC1-feilen fra 20.11. Mobildata av/på 14:55:30 slo også ut IMS til 15:03:44, så samtalene gikk CS. Tiltak med Kristians ja: `pkill -x callaudiod` som fp5; den startes på nytt via D-Bus (sjekket: modus 0, ny prosess). Ingen fil endret, ingen tilbakerulling nødvendig. Nødløsning under stille samtale: `pactl set-card-profile alsa_card.platform-sound "Voice Call (Earpiece, Mic1)"`. Mulig utløser (ubevist): Tesla-HFP falt 14:48:24.
+
 ## 6. Ikke rørt (bevisst standard)
 
 Modem-NV/PDC/MBN, bootloader/firmware-partisjoner, krasj-/watchdog-funksjoner og mobildata-policy er ikke endret.
