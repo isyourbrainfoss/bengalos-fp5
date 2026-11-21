@@ -58,6 +58,7 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 | Automatisk dvale på batteri: 1 min (AC: aldri) | gsettings | endre i Innstillinger |
 | pstore plain-tillegg | – | se FP5-siden |
 | Flowlog kjører via XWayland (21.11 09:29): Flutter 3.50 Wayland-subsurface-renderer henger seg («Timed out waiting for subsurface frame», futex-deadlock, intet vindu; flutter#196529/#196663/#195822). Varig fiks: bygg Flowlog på Flutter 3.47.8 eller vent på upstream | `flatpak override --user --socket=x11 --env=GDK_BACKEND=x11 com.flowlog.flowlog` | `flatpak override --user --reset com.flowlog.flowlog` |
+| Samme X11-omvei for Navigation og Spectrogram (21.11 09:45, samme Flutter 3.50-renderer). Progressor og CakeWalletMobile er ikke berørt. Grok Bot bygger alle tre på nytt med Grok Build på desk; overridene fjernes når nye builds er verifisert | `flatpak override --user --socket=x11 --env=GDK_BACKEND=x11` på com.isyourbrainfoss.Navigation og com.isyourbrainfoss.Spectrogram | `flatpak override --user --reset <app-id>` |
 
 ## 5. Oppdateringer
 
