@@ -57,8 +57,6 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 | gsd-power idle-rearm etter oppvåkning | `fp5-gsd-power-idle-rearm.service` | disable tjenesten |
 | Automatisk dvale på batteri: 1 min (AC: aldri) | gsettings | endre i Innstillinger |
 | pstore plain-tillegg | – | se FP5-siden |
-| Flowlog kjører via XWayland (21.11 09:29): Flutter 3.50 Wayland-subsurface-renderer henger seg («Timed out waiting for subsurface frame», futex-deadlock, intet vindu; flutter#196529/#196663/#195822). Varig fiks: bygg Flowlog på Flutter 3.47.8 eller vent på upstream | `flatpak override --user --socket=x11 --env=GDK_BACKEND=x11 com.flowlog.flowlog` | `flatpak override --user --reset com.flowlog.flowlog` |
-| Samme X11-omvei for Navigation og Spectrogram (21.11 09:45, samme Flutter 3.50-renderer). Progressor og CakeWalletMobile er ikke berørt. Grok Bot bygger alle tre på nytt med Grok Build på desk; overridene fjernes når nye builds er verifisert | `flatpak override --user --socket=x11 --env=GDK_BACKEND=x11` på com.isyourbrainfoss.Navigation og com.isyourbrainfoss.Spectrogram | `flatpak override --user --reset <app-id>` |
 
 ## 5. Oppdateringer
 
@@ -72,6 +70,8 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
   - Etter reboot ~09:12 / sjekk 09:15: `VERSION_ID=0.26.1120.1`, boot-entry `BengalOS_0.26.1120.1_arm64.efi`, `boot-complete.target` aktiv siden 09:12:19. Alle åtte sysexts er 1120.1 (waydroid, fp5-device, frunk-qs, ims-app, modemmanager, qtee, volte-modules, waydroid-fix). `updatectl`: 1120.1 current, 1118.1 installed+incomplete (mangler `fp5-frunk-qs_0.26.1118.1.raw` i det nye transfer-mønsteret; 1118.1-frunk er fortsatt en katalog. Fallback-oppføringen 1118.1 og `fp5-fallback-bos1113-plain.efi` står). Ingen feilede system- eller brukerenheter. fp5-* brukertjenester kjører. waydroid-session aktiv 09:15:04 (Android ready 09:15:23). fp5-feedbackd-profile-sync aktiv 09:15:04; én tidlig `apply-failed` rc=4 kl. 09:15:04 før Waydroid var klar, ingen senere suksesslinje sett. ModemManager connected, SIM viser sim-pin2 (kjent merkelighet). fp5-ims aktiv, IMS registrert. Home-guard uendret (sha b3c47f5e… og 5bd73d99…). Grener: `feed/carry-local-sysexts`, `update/0.26.1120.1-carry`. Morgenjobben på desk bruker fortsatt det gamle auto-skriptet uten carry.
 - Filene under `~/.config` og `~/.local` i hjemmemappen (som bilknappene over) overlever oppdateringer, men er foreløpig ikke i feeden eller i git.
 - Home-guard-endringen i `waydroid-bt-session-restart.sh` og `waydroid-bt-attach-watchdog.sh` (under `/var/lib/waydroid-host-stack/sbin/`) skal med i oppdateringsfeedens lokale tillegg senere.
+
+- 21.11 ca. 09:43: X11-omveien (`flatpak override --user --socket=x11 --env=GDK_BACKEND=x11`) for Flowlog, Navigation og Spectrogram ble fjernet igjen etter Kristians ønske (`flatpak override --user --reset`). Grunn til omveien: Flutter 3.50 Wayland-subsurface-renderer deadlocker («Timed out waiting for subsurface frame», intet vindu; flutter#196529/#196663/#195822). Appene åpner ikke på Wayland før Grok Bot har bygd dem på nytt med Flutter 3.47.8 via Grok Build på desk.
 
 ## 6. Ikke rørt (bevisst standard)
 
