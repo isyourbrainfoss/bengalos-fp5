@@ -48,6 +48,13 @@ They are also covered by the ELF, python, unit and secret checks. They are publi
 The phone needs `../sysupdate.d/35-fp5-modemmanager.transfer` and `36-fp5-frunk-qs.transfer` in /etc/sysupdate.d.
 Install those only once the feed offers both for the candidate version.
 
+Lesson (21 Nov 2026): install only those transfer files. Never pre-place
+versioned sysext raws that match a transfer pattern (for example
+`/var/lib/extensions/fp5-modemmanager_<ver>.raw`). sysupdate then treats that
+version as already current (and incomplete if anything is missing), and the
+Phosh GUI says "Everything up to date". Let sysupdate fetch the raws itself.
+
+
 Review checkout: `FP5_FEED_O=<live official-20261114> FP5_FEED_LOGD=<scratch> bash feed/auto/fp5-feed-auto.sh --dry-run ...`.
 This uses this checkout's script, lib, build-sysexts.sh and carry, and the live uki/, sysext/src+out, baseline and waydroid.
 The lab identifiers for the secret audit live in the untracked `auto/lab-patterns.local` (name<TAB>regex).
