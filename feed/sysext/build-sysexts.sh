@@ -32,10 +32,10 @@ rel $d fp5-device 1; mk $d fp5-device
 # 5+6 carried local add-ons (2026-11-19; inputs in carry/, pinned by carry/SHA256SUMS; see carry/PROVENANCE.md)
 if [ -d carry ]; then
   (cd carry && sha256sum -c --quiet SHA256SUMS) || { echo "carry inputs do not match SHA256SUMS" >&2; exit 1; }
-  # 5 fp5-modemmanager: MM#1110 qmapmux use-after-free fix (daemon only)
+  # 5 fp5-modemmanager: MM#1110 qmapmux use-after-free fix, plus spare the IMS bearer on Simple.Disconnect("/") (daemon only)
   d=/tmp/st/mm; mkdir -p $d/usr/sbin $d/usr/share/doc/fp5-modemmanager
   install -m0755 carry/ModemManager $d/usr/sbin/ModemManager
-  install -m0644 carry/mm-9317cbc4.patch $d/usr/share/doc/fp5-modemmanager/mm-9317cbc4.patch
+  install -m0644 carry/mm-9317cbc4.patch carry/mm-fp5-keep-ims-bearer.patch $d/usr/share/doc/fp5-modemmanager/
   sed "s/@V@/$V/g" carry/README.fp5-modemmanager > $d/usr/share/doc/fp5-modemmanager/README; chmod 0644 $d/usr/share/doc/fp5-modemmanager/README
   rel $d fp5-modemmanager 0; mk $d fp5-modemmanager
   # 6 fp5-frunk-qs: Phosh "Frunk" quick setting (plugin dir is scanned at phosh start; no reload needed)

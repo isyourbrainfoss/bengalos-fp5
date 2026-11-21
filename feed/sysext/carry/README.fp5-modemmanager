@@ -1,7 +1,9 @@
 fp5-modemmanager @V@: /usr/sbin/ModemManager rebuilt from Debian modemmanager 1.25.95-1 (experimental source, same
-configure flags as debian/rules, built against the arm64 library versions of BengalOS 0.26.1115.1; re-pinned unchanged
-for each later BengalOS version by fp5-feed-auto, which checks the official modemmanager package is still 1.25.95-1 and
-every symbol resolves against that version's /usr) plus upstream commit
-9317cbc4 "netlink: fix use-after-free calling completion_fn on transaction completion" (MM issue 1110).
-Fixes the ModemManager SIGSEGV when a data bearer creates its qmapmux link. Only the daemon is replaced; plugins,
-libmm-glib, units and config stay official. Drop this sysext once BengalOS ships a ModemManager containing 9317cbc4.
+configure flags as debian/rules, built 21 Nov 2026; re-pinned for each BengalOS version by fp5-feed-auto, which checks
+the official modemmanager package is still 1.25.95-1 and every symbol resolves against that version's /usr) plus
+upstream commit 9317cbc4 "netlink: fix use-after-free calling completion_fn on transaction completion" (MM issue 1110)
+and local patch mm-fp5-keep-ims-bearer.
+9317cbc4 fixes the ModemManager SIGSEGV when a data bearer creates its qmapmux link. mm-fp5-keep-ims-bearer makes
+Simple.Disconnect of "/" skip a bearer whose apn-type includes IMS, whose APN is "ims", or whose profile-id is 2
+(the bearer fp5-imsd creates). Only the daemon is replaced; plugins, libmm-glib, units and config stay official.
+Do not drop this sysext merely because upstream contains 9317cbc4: the IMS spare is local.
