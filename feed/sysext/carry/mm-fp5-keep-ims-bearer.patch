@@ -1,0 +1,359 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: isyourbrainfoss <isyourbrainfoss@proton.me>
+Date: Sat, 21 Nov 2026 16:30:00 +0000
+Subject: [PATCH] simple: spare IMS bearers when disconnecting all
+
+NetworkManager sleeps the modem data connection by calling
+Simple.Disconnect with bearer path "/". That disconnects every bearer,
+including the IMS PDN fp5-imsd created, so VoLTE drops for suspend.
+
+On that path only, skip a bearer whose config has apn-type IMS, whose
+APN is "ims" (case-insensitive), or whose profile-id is 2. fp5-imsd
+CreateBearer sets only profile-id 2 and ip-type ipv6; ModemManager does
+not copy the stored profile APN back into the bearer config, so the
+profile id is what identifies that bearer.
+
+Explicit Simple.Disconnect(path), Bearer.Disconnect, DeleteBearer and
+modem disable still disconnect it. If the only bearers left are IMS,
+disconnect-all succeeds. One <msg> line names each spared bearer path.
+
+---
+--- a/src/mm-bearer-list.h
++++ b/src/mm-bearer-list.h
+@@ -83,6 +83,13 @@
+                                                    const gchar         *bearer_path,
+                                                    GAsyncReadyCallback  callback,
+                                                    gpointer             user_data);
++/* Disconnect every bearer except an IMS one. Used only by Simple.Disconnect
++ * of "/" (NetworkManager suspend). Modem disable uses disconnect_bearers().
++ * Hidden so the daemon's dynamic symbol set stays the same as 1.25.95. */
++G_GNUC_INTERNAL
++void     mm_bearer_list_disconnect_bearers_spare_ims (MMBearerList        *self,
++                                                      GAsyncReadyCallback  callback,
++                                                      gpointer             user_data);
+ gboolean mm_bearer_list_disconnect_bearers_finish (MMBearerList        *self,
+                                                    GAsyncResult        *res,
+                                                    GError             **error);
+--- a/src/mm-bearer-list.c
++++ b/src/mm-bearer-list.c
+@@ -27,6 +27,7 @@
+ #include <libmm-glib.h>
+ 
+ #include "mm-bearer-list.h"
++#include "mm-fp5-ims-bearer.h"
+ #include "mm-log.h"
+ 
+ G_DEFINE_TYPE (MMBearerList, mm_bearer_list, G_TYPE_OBJECT)
+@@ -193,8 +194,22 @@
+     gchar        *bearer_path;
+     GList        *pending_to_disconnect;
+     MMBaseBearer *current_to_disconnect;
++    gboolean      spare_ims;
+ } DisconnectBearersContext;
+ 
++static gboolean
++fp5_bearer_is_ims (MMBaseBearer *bearer)
++{
++    MMBearerProperties *config;
++
++    config = mm_base_bearer_peek_config (bearer);
++    if (mm_fp5_bearer_properties_are_ims (config))
++        return TRUE;
++    /* Connected profile id, filled from the connect result. Profile 2 is the
++     * IMS PDN; the config usually already carries it. */
++    return mm_base_bearer_get_profile_id (bearer) == MM_FP5_IMS_PROFILE_ID;
++}
++
+ static void
+ disconnect_bearers_context_free (DisconnectBearersContext *ctx)
+ {
+@@ -257,16 +272,25 @@
+ build_connected_bearer_list (MMBaseBearer             *bearer,
+                              DisconnectBearersContext *ctx)
+ {
++    /* Disconnect-all may spare IMS. A specific bearer path never does:
++     * Simple.Disconnect(path), and any caller that names a path, still
++     * disconnects it. Modem disable uses spare_ims=FALSE. */
++    if (!ctx->bearer_path && ctx->spare_ims && fp5_bearer_is_ims (bearer)) {
++        mm_obj_msg (bearer, "sparing IMS bearer %s", mm_base_bearer_get_path (bearer));
++        return;
++    }
++
+     if (!ctx->bearer_path ||
+         g_str_equal (ctx->bearer_path, mm_base_bearer_get_path (bearer)))
+         ctx->pending_to_disconnect = g_list_prepend (ctx->pending_to_disconnect, g_object_ref (bearer));
+ }
+ 
+-void
+-mm_bearer_list_disconnect_bearers (MMBearerList        *self,
+-                                   const gchar         *bearer_path,
+-                                   GAsyncReadyCallback  callback,
+-                                   gpointer             user_data)
++static void
++mm_bearer_list_disconnect_bearers_full (MMBearerList        *self,
++                                        const gchar         *bearer_path,
++                                        gboolean             spare_ims,
++                                        GAsyncReadyCallback  callback,
++                                        gpointer             user_data)
+ {
+     GTask                    *task;
+     DisconnectBearersContext *ctx;
+@@ -274,10 +298,13 @@
+     task = g_task_new (self, NULL, callback, user_data);
+     ctx = g_slice_new0 (DisconnectBearersContext);
+     ctx->bearer_path = g_strdup (bearer_path);  /* may be NULL if disconnecting all */
++    ctx->spare_ims = spare_ims;
+     g_task_set_task_data (task, ctx, (GDestroyNotify)disconnect_bearers_context_free);
+ 
+     /* If a given specific bearer is being disconnected, only add that one. Otherwise,
+-     * disconnect all. */
++     * disconnect all (optionally skipping IMS bearers). An empty list is success:
++     * NetworkManager expects Simple.Disconnect("/") to succeed when the only
++     * bearers left are ones we spared. */
+     mm_bearer_list_foreach (self, (MMBearerListForeachFunc)build_connected_bearer_list, ctx);
+ 
+     if (ctx->bearer_path && !ctx->pending_to_disconnect) {
+@@ -291,6 +318,23 @@
+     disconnect_bearers_next (task);
+ }
+ 
++void
++mm_bearer_list_disconnect_bearers (MMBearerList        *self,
++                                   const gchar         *bearer_path,
++                                   GAsyncReadyCallback  callback,
++                                   gpointer             user_data)
++{
++    mm_bearer_list_disconnect_bearers_full (self, bearer_path, FALSE, callback, user_data);
++}
++
++void
++mm_bearer_list_disconnect_bearers_spare_ims (MMBearerList        *self,
++                                             GAsyncReadyCallback  callback,
++                                             gpointer             user_data)
++{
++    mm_bearer_list_disconnect_bearers_full (self, NULL, TRUE, callback, user_data);
++}
++
+ /*****************************************************************************/
+ 
+ #if defined WITH_SUSPEND_RESUME
+--- a/src/mm-iface-modem-simple.c
++++ b/src/mm-iface-modem-simple.c
+@@ -1055,15 +1055,21 @@
+         return;
+     }
+ 
+-    if (ctx->bearer_path)
++    /* Only Simple.Disconnect("/") / empty path spares IMS. A path argument,
++     * Bearer.Disconnect and modem disable (which calls disconnect_bearers
++     * with a NULL path itself) still disconnect the IMS bearer. */
++    if (ctx->bearer_path) {
+         mm_obj_info (self, "processing user request to disconnect modem: bearer '%s'", ctx->bearer_path);
+-    else
++        mm_bearer_list_disconnect_bearers (list,
++                                           ctx->bearer_path,
++                                           (GAsyncReadyCallback)bearer_list_disconnect_bearers_ready,
++                                           ctx);
++    } else {
+         mm_obj_info (self, "processing user request to disconnect modem: all bearers");
+-
+-    mm_bearer_list_disconnect_bearers (list,
+-                                       ctx->bearer_path,
+-                                       (GAsyncReadyCallback)bearer_list_disconnect_bearers_ready,
+-                                       ctx);
++        mm_bearer_list_disconnect_bearers_spare_ims (list,
++                                                     (GAsyncReadyCallback)bearer_list_disconnect_bearers_ready,
++                                                     ctx);
++    }
+ }
+ 
+ static gboolean
+--- a/src/tests/meson.build
++++ b/src/tests/meson.build
+@@ -64,6 +64,17 @@
+ 
+ test('test-base-call', exe, suite: 'daemon', env: test_env)
+ 
++# FP5 IMS bearer predicate (header-only; no daemon objects)
++exe = executable(
++  'test-fp5-ims-bearer',
++  sources: 'test-fp5-ims-bearer.c',
++  include_directories: [top_inc, src_inc],
++  dependencies: libmm_glib_dep,
++  c_args: c_args,
++)
++
++test('test-fp5-ims-bearer', exe, suite: 'daemon', env: test_env)
++
+ 
+ if get_option('fuzzer')
+   fuzzer_tests = ['test-sms-part-3gpp-fuzzer',
+--- a/src/mm-fp5-ims-bearer.h
++++ b/src/mm-fp5-ims-bearer.h
+@@ -0,0 +1,53 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * FP5: identify an IMS bearer from its ModemManager config.
++ *
++ * Simple.Disconnect("/") is how NetworkManager sleeps the modem data
++ * connection. That path must not tear down the IMS PDN. fp5-imsd creates
++ * its bearer with only profile-id 2 and ip-type ipv6 (see transaction.py
++ * CreateBearer). ModemManager loads APN "ims" from the stored profile at
++ * connect time and does not copy it back into the bearer config, so the
++ * profile id is what identifies that bearer. An explicit APN "ims" or
++ * apn-type IMS is also spared, for a bearer configured that way directly.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef MM_FP5_IMS_BEARER_H
++#define MM_FP5_IMS_BEARER_H
++
++#include <glib.h>
++#include <ModemManager.h>
++#include <libmm-glib.h>
++
++/* MBN profile fp5-imsd binds with CreateBearer profile-id=2. */
++#define MM_FP5_IMS_PROFILE_ID 2
++
++static inline gboolean
++mm_fp5_bearer_properties_are_ims (MMBearerProperties *config)
++{
++    const gchar *apn;
++    MMBearerApnType apn_type;
++
++    if (!config)
++        return FALSE;
++
++    apn_type = mm_bearer_properties_get_apn_type (config);
++    if (apn_type & MM_BEARER_APN_TYPE_IMS)
++        return TRUE;
++
++    apn = mm_bearer_properties_get_apn (config);
++    if (apn && apn[0] && g_ascii_strcasecmp (apn, "ims") == 0)
++        return TRUE;
++
++    /* CreateBearer {profile-id: 2, ip-type: ipv6} has neither field above. */
++    if (mm_bearer_properties_get_profile_id (config) == MM_FP5_IMS_PROFILE_ID)
++        return TRUE;
++
++    return FALSE;
++}
++
++#endif /* MM_FP5_IMS_BEARER_H */
+--- a/src/tests/test-fp5-ims-bearer.c
++++ b/src/tests/test-fp5-ims-bearer.c
+@@ -0,0 +1,110 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * Predicate used by Simple.Disconnect("/") to spare the FP5 IMS bearer.
++ */
++
++#include <glib.h>
++#include <libmm-glib.h>
++
++#include "mm-fp5-ims-bearer.h"
++
++static MMBearerProperties *
++props (const gchar *apn,
++       MMBearerApnType apn_type,
++       gint profile_id,
++       MMBearerIpFamily ip_type)
++{
++    MMBearerProperties *config;
++
++    config = mm_bearer_properties_new ();
++    if (apn)
++        mm_bearer_properties_set_apn (config, apn);
++    if (apn_type != MM_BEARER_APN_TYPE_NONE)
++        mm_bearer_properties_set_apn_type (config, apn_type);
++    if (profile_id != MM_3GPP_PROFILE_ID_UNKNOWN)
++        mm_bearer_properties_set_profile_id (config, profile_id);
++    if (ip_type != MM_BEARER_IP_FAMILY_NONE)
++        mm_bearer_properties_set_ip_type (config, ip_type);
++    return config;
++}
++
++static void
++test_null_and_empty (void)
++{
++    g_autoptr(MMBearerProperties) empty = NULL;
++
++    g_assert_false (mm_fp5_bearer_properties_are_ims (NULL));
++    empty = props (NULL, MM_BEARER_APN_TYPE_NONE, MM_3GPP_PROFILE_ID_UNKNOWN, MM_BEARER_IP_FAMILY_NONE);
++    g_assert_false (mm_fp5_bearer_properties_are_ims (empty));
++}
++
++static void
++test_apn_ims (void)
++{
++    g_autoptr(MMBearerProperties) lower = NULL;
++    g_autoptr(MMBearerProperties) upper = NULL;
++    g_autoptr(MMBearerProperties) mixed = NULL;
++    g_autoptr(MMBearerProperties) prefix = NULL;
++    g_autoptr(MMBearerProperties) other = NULL;
++
++    lower = props ("ims", MM_BEARER_APN_TYPE_NONE, MM_3GPP_PROFILE_ID_UNKNOWN, MM_BEARER_IP_FAMILY_NONE);
++    upper = props ("IMS", MM_BEARER_APN_TYPE_NONE, MM_3GPP_PROFILE_ID_UNKNOWN, MM_BEARER_IP_FAMILY_NONE);
++    mixed = props ("Ims", MM_BEARER_APN_TYPE_NONE, MM_3GPP_PROFILE_ID_UNKNOWN, MM_BEARER_IP_FAMILY_NONE);
++    prefix = props ("ims.example", MM_BEARER_APN_TYPE_NONE, MM_3GPP_PROFILE_ID_UNKNOWN, MM_BEARER_IP_FAMILY_NONE);
++    other = props ("internet", MM_BEARER_APN_TYPE_NONE, MM_3GPP_PROFILE_ID_UNKNOWN, MM_BEARER_IP_FAMILY_NONE);
++
++    g_assert_true (mm_fp5_bearer_properties_are_ims (lower));
++    g_assert_true (mm_fp5_bearer_properties_are_ims (upper));
++    g_assert_true (mm_fp5_bearer_properties_are_ims (mixed));
++    g_assert_false (mm_fp5_bearer_properties_are_ims (prefix));
++    g_assert_false (mm_fp5_bearer_properties_are_ims (other));
++}
++
++static void
++test_apn_type (void)
++{
++    g_autoptr(MMBearerProperties) ims = NULL;
++    g_autoptr(MMBearerProperties) both = NULL;
++    g_autoptr(MMBearerProperties) internet = NULL;
++
++    ims = props (NULL, MM_BEARER_APN_TYPE_IMS, MM_3GPP_PROFILE_ID_UNKNOWN, MM_BEARER_IP_FAMILY_NONE);
++    both = props ("internet", MM_BEARER_APN_TYPE_IMS | MM_BEARER_APN_TYPE_DEFAULT, MM_3GPP_PROFILE_ID_UNKNOWN, MM_BEARER_IP_FAMILY_NONE);
++    internet = props (NULL, MM_BEARER_APN_TYPE_DEFAULT, MM_3GPP_PROFILE_ID_UNKNOWN, MM_BEARER_IP_FAMILY_NONE);
++
++    g_assert_true (mm_fp5_bearer_properties_are_ims (ims));
++    g_assert_true (mm_fp5_bearer_properties_are_ims (both));
++    g_assert_false (mm_fp5_bearer_properties_are_ims (internet));
++}
++
++static void
++test_supervisor_profile (void)
++{
++    g_autoptr(MMBearerProperties) supervisor = NULL;
++    g_autoptr(MMBearerProperties) data = NULL;
++    g_autoptr(MMBearerProperties) ipv6_only = NULL;
++
++    /* transaction.py CreateBearer: profile-id 2, ip-type ipv6 (value 2). */
++    supervisor = props (NULL, MM_BEARER_APN_TYPE_NONE, MM_FP5_IMS_PROFILE_ID, MM_BEARER_IP_FAMILY_IPV6);
++    g_assert_cmpuint (mm_bearer_properties_get_ip_type (supervisor), ==, 2);
++    g_assert_true (mm_fp5_bearer_properties_are_ims (supervisor));
++
++    data = props ("internet", MM_BEARER_APN_TYPE_DEFAULT, 1, MM_BEARER_IP_FAMILY_IPV4V6);
++    g_assert_false (mm_fp5_bearer_properties_are_ims (data));
++
++    /* IPv6 alone is not IMS; a data bearer can request it. */
++    ipv6_only = props (NULL, MM_BEARER_APN_TYPE_NONE, MM_3GPP_PROFILE_ID_UNKNOWN, MM_BEARER_IP_FAMILY_IPV6);
++    g_assert_false (mm_fp5_bearer_properties_are_ims (ipv6_only));
++}
++
++int
++main (int argc, char **argv)
++{
++    g_test_init (&argc, &argv, NULL);
++
++    g_test_add_func ("/fp5/ims-bearer/null-empty", test_null_and_empty);
++    g_test_add_func ("/fp5/ims-bearer/apn", test_apn_ims);
++    g_test_add_func ("/fp5/ims-bearer/apn-type", test_apn_type);
++    g_test_add_func ("/fp5/ims-bearer/supervisor-profile", test_supervisor_profile);
++
++    return g_test_run ();
++}
