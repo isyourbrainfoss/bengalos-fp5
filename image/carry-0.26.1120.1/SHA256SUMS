@@ -1,0 +1,4 @@
+3163c1cb0003a0946ea57f0fe2d3ddc969df39ff221997d8030a59b1ad6cec50  files/fp5-modemmanager_0.26.1120.1.raw
+9bc498565082185353f1fc4f58f2bca2cad19c03294a88fdeba27d3b416335ee  files/fp5-frunk-qs_0.26.1120.1.raw
+9135513dfd9668fb093c9fb9b4e767b44ffdd9ae798e8f9ca5d597c3344e0eb9  sysupdate.d/35-fp5-modemmanager.transfer
+a9499590ec775dcbc685cb43024f3a3583f53c743e30da49379091f310095c4a  sysupdate.d/36-fp5-frunk-qs.transfer
