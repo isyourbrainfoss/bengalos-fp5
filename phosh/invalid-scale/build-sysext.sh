@@ -17,7 +17,7 @@ SRC
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   build-essential meson ninja-build pkg-config python3 python3-packaging \
-  git ca-certificates erofs-utils xz-utils binutils \
+  git ca-certificates erofs-utils xz-utils binutils file \
   valac \
   gsettings-desktop-schemas-dev \
   libadwaita-1-dev \
@@ -83,7 +83,7 @@ mkdir -p "$OUT" /tmp/sx/usr/libexec /tmp/sx/usr/share/doc/fp5-phosh /tmp/sx/usr/
 aarch64-linux-gnu-objcopy --only-keep-debug /tmp/pbuild/src/phosh "$OUT/phosh.debug" 2>/dev/null \
   || objcopy --only-keep-debug /tmp/pbuild/src/phosh "$OUT/phosh.debug"
 objcopy --strip-unneeded --remove-section=.comment --remove-section=.note \
-  -o /tmp/sx/usr/libexec/phosh /tmp/pbuild/src/phosh
+  /tmp/pbuild/src/phosh /tmp/sx/usr/libexec/phosh
 chmod 0755 /tmp/sx/usr/libexec/phosh
 # verify it's arm64 ELF
 file /tmp/sx/usr/libexec/phosh

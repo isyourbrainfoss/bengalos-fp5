@@ -1,7 +1,7 @@
 # Phosh invalid-scale resume patch (staged 21 Nov 2026)
 
 Not installed on the phone. Does not change DES-4 kernel logging.
-Does not restart fp5-ims.
+Does not restart fp5-ims, phosh, phoc, or the session.
 
 ## Root cause
 
@@ -35,11 +35,46 @@ Valid scales (1, 1.25, 1.5, 2, …) are unchanged.
 
 Unit test `tests/test-output-scale.c` passed on desk (host amd64).
 
-## Systext
+## Sysext (built, staged, not installed)
 
-`build-sysext.sh` builds an arm64 `fp5-phosh_0.26.1120.1.raw` that
-replaces only `/usr/libexec/phosh`. When that image is ready, install
-is a later, approved step: copy to `/var/lib/extensions/`,
-`run0 systemd-sysext refresh`, and a user-session restart so the new
-binary is used. This tree does not install it and does not restart
-anything.
+`out/fp5-phosh_0.26.1120.1.raw` is an arm64 systemd-sysext that replaces
+only `/usr/libexec/phosh`. The image contains only `/usr`:
+
+- `/usr/libexec/phosh` (aarch64 PIE, stripped; Build ID
+  `0cb53d50ed974c04a9360085dba6cc3b6432b1fd`)
+- `/usr/lib/extension-release.d/extension-release.fp5-phosh_0.26.1120.1`
+  (`ID=bengalos`, `VERSION_ID=0.26.1120.1`, `ARCHITECTURE=arm64`,
+  `SYSEXT_SCOPE=system`)
+- `/usr/share/doc/fp5-phosh/` (the patch and a short README)
+
+Built in container `fp5-phosh-b` (debian:forky, linux/arm64) from the
+same upstream tip the 0.59.0 nightlies used (phone:
+`0.59.0+nb20261120.12181931`; the nightly repo later only kept
+`0.59.0+nb20261121.12189471`). `fsck.erofs` is clean. NEEDED (39
+libraries) and VERNEED (highest `GLIBC_2.39`) are identical to the
+official 20261121 arm64 `phosh` binary.
+
+SHA256 (also in `out/SHA256SUMS`):
+
+    b0198c36268f074514ee0f51c9c298c2e8d70fa27a25d55987b04b533b79bf2b  fp5-phosh_0.26.1120.1.raw
+    e2d3bf2a837277c4ff3ead4554e01955f708c60daa0781f303b7e28d31552596  fp5-phosh_0.26.1120.1.raw.xz
+    4d2f2027d5700a8e76fde1ce0c426bb0fb153745108341c7c2aab51dcb561557  phosh.debug
+
+Install is a later, approved step, as user fp5, after a dry run:
+
+    sh B-invalid-scale/install.sh --dry-run
+    sh B-invalid-scale/install.sh
+
+That uses one `run0` to copy the image to
+`/var/lib/extensions/fp5-phosh_0.26.1120.1.raw` and run
+`systemd-sysext refresh`. It does not restart fp5-ims, phosh, phoc, or
+the session. The new binary is used only after you log out and in, or
+reboot.
+
+Rollback (also not run here):
+
+    sh B-invalid-scale/rollback.sh --dry-run
+    sh B-invalid-scale/rollback.sh
+
+Same constraints: one `run0`, `systemd-sysext refresh`, no touch of
+fp5-ims, no session restart.
