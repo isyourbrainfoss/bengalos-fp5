@@ -1,0 +1,3 @@
+#!/bin/sh
+printf '%s\n' "$*" >> "${MOCK:?}/log"
+exit 0

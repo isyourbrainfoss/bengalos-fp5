@@ -1,0 +1,5 @@
+#!/bin/sh
+echo "$*" >> "${MOCK:?}/systemctl.log"
+if [ -f "$MOCK/systemctl_broken" ]; then exit 1; fi
+if [ -f "$MOCK/mic_active" ]; then exit 0; fi
+exit 3

@@ -1,0 +1,59 @@
+#!/bin/sh
+# Offline busctl for fp5-callaudiod-watch tests. Reads $MOCK.
+echo "$*" >> "${MOCK:?}/busctl.log"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --user|--system|--json=short) shift ;;
+        *) break ;;
+    esac
+done
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+    status)
+        [ -f "$MOCK/name_owned" ] || exit 1
+        exit 0
+        ;;
+    call)
+        if echo "$*" | grep -q SelectMode; then
+            if [ -f "$MOCK/probe_hang" ]; then
+                [ -f "$MOCK/probe_sets_call" ] && echo 1 > "$MOCK/mm_n"
+                sleep 30
+            fi
+            if [ -f "$MOCK/probe_fail" ]; then
+                echo "number +4712345678 sip:secret@example.com AA:BB:CC:DD:EE:FF 10.1.2.3" >&2
+                exit 1
+            fi
+            echo '{"type":"b","data":true}'
+            exit 0
+        fi
+        if echo "$*" | grep -q GetCalls; then
+            if [ -f "$MOCK/ofono_busy" ]; then
+                printf '%s\n' '{"data":[["/imsd/voicecall01",{"State":{"data":"active"}}]]}'
+                exit 0
+            fi
+            printf '%s\n' '{"data":[]}'
+            exit 0
+        fi
+        exit 1
+        ;;
+    get-property)
+        if echo "$*" | grep -q 'Modem.Voice' && echo "$*" | grep -q 'Calls'; then
+            [ -f "$MOCK/mm_unknown" ] && exit 1
+            if echo "$*" | grep -q '/Modem/0 '; then
+                n=$(cat "$MOCK/mm_n" 2>/dev/null || echo 0)
+                if [ "$n" != 0 ]; then
+                    printf '%s\n' '{"data":["/org/freedesktop/ModemManager1/Call/0"]}'
+                else
+                    printf '%s\n' '{"data":[]}'
+                fi
+                exit 0
+            fi
+            exit 1
+        fi
+        exit 1
+        ;;
+    *)
+        exit 1
+        ;;
+esac

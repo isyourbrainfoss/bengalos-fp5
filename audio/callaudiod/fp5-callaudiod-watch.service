@@ -1,0 +1,11 @@
+# ~/.config/systemd/user/fp5-callaudiod-watch.service
+# Restarts callaudiod only when SelectMode is wedged and no call is active.
+# Does not restart WirePlumber, PipeWire, ModemManager, or fp5-ims.
+[Unit]
+Description=Restart callaudiod when SelectMode is wedged and the phone is idle
+[Service]
+ExecStart=/var/lib/fp5-oot/bin/fp5-callaudiod-watch
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=default.target

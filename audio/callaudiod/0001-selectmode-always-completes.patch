@@ -1,0 +1,958 @@
+--- a/src/cad-pulse.c
++++ b/src/cad-pulse.c
+@@ -22,6 +22,11 @@
+ #include <stdio.h>
+ #include <stdint.h>
+ 
++#include "cad-selectmode-decide.h"
++
++#define CAD_SELECT_TIMEOUT_MS 2500
++#define CAD_SELECT_RETRY_MS   200
++
+ #define APPLICATION_NAME "CallAudio"
+ #define APPLICATION_ID   "org.mobian-project.CallAudio"
+ 
+@@ -61,6 +66,19 @@
+     CadPulse *pulse;
+     CadOperation *op;
+     guint value;
++    /* Zeroed by g_new0. SelectMode uses these so a missing port or a
++     * PulseAudio callback that never arrives still completes D-Bus. */
++    gboolean done;
++    gboolean async_started;
++    gboolean queued;
++    gboolean queued_success;
++    gboolean suppress_eol;
++    gboolean in_flight;
++    guint timeout_id;
++    guint retry_id;
++    int retries_left;
++    int query;              /* 0 = card profile, 1 = sink port */
++    gchar *profile_name;
+ } CadPulseOperation;
+ 
+ static void pulseaudio_cleanup(CadPulse *self);
+@@ -802,173 +820,399 @@
+  * or microphone status
+  ******************************************************************************/
+ 
+-static void operation_complete_cb(pa_context *ctx, int success, void *data)
++static void operation_complete_cb(pa_context *ctx, int success, void *data);
++static void set_card_profile(pa_context *ctx, const pa_card_info *info, int eol, void *data);
++static void set_output_port(pa_context *ctx, const pa_sink_info *info, int eol, void *data);
++
++static void cad_pulse_op_disarm(CadPulseOperation *operation)
++{
++    if (!operation)
++        return;
++    if (operation->timeout_id) {
++        g_source_remove(operation->timeout_id);
++        operation->timeout_id = 0;
++    }
++    if (operation->retry_id) {
++        g_source_remove(operation->retry_id);
++        operation->retry_id = 0;
++    }
++}
++
++/* Complete the D-Bus invocation with a failure.
++ * free_now is FALSE while a PulseAudio callback may still arrive: that
++ * callback frees the wrapper. Freeing it here would use-after-free.
++ * One CadPulseOperation can leak if Pulse never calls back after a timeout.
++ * The invocation is already completed, so the daemon is not wedged.
++ */
++static void cad_pulse_op_fail(CadPulseOperation *operation, gboolean free_now)
++{
++    if (!operation || operation->done)
++        return;
++    operation->done = TRUE;
++    cad_pulse_op_disarm(operation);
++    if (operation->op) {
++        operation->op->success = FALSE;
++        if (operation->op->callback)
++            operation->op->callback(operation->op);
++        free(operation->op);
++        operation->op = NULL;
++    }
++    if (free_now) {
++        g_free(operation->profile_name);
++        operation->profile_name = NULL;
++        free(operation);
++    }
++}
++
++static gboolean cad_pulse_op_timeout(gpointer data)
+ {
+     CadPulseOperation *operation = data;
+ 
+-    g_debug("operation returned %d", success);
++    operation->timeout_id = 0;
++    if (!operation->done) {
++        g_warning("SelectMode timed out after %d ms; completing with an error",
++                  CAD_SELECT_TIMEOUT_MS);
++        cad_pulse_op_fail(operation, !operation->in_flight);
++    }
++    return G_SOURCE_REMOVE;
++}
+ 
+-    if (operation) {
+-        if (operation->op) {
+-            operation->op->success = (gboolean)!!success;
+-            if (operation->op->callback)
+-                operation->op->callback(operation->op);
+-
+-            if (operation->op->success) {
+-                guint new_value = GPOINTER_TO_UINT(operation->value);
+-
+-                switch (operation->op->type) {
+-                case CAD_OPERATION_SELECT_MODE:
+-                    if (operation->pulse->audio_mode != new_value) {
+-                        operation->pulse->audio_mode = new_value;
+-                        g_object_set(operation->pulse->manager, "audio-mode", new_value, NULL);
+-                    }
+-                    break;
+-                case CAD_OPERATION_ENABLE_SPEAKER:
+-                    if (operation->pulse->speaker_state != new_value) {
+-                        operation->pulse->speaker_state = new_value;
+-                        g_object_set(operation->pulse->manager, "speaker-state", new_value, NULL);
+-                    }
+-                    break;
+-                case CAD_OPERATION_MUTE_MIC:
+-                    /*
+-                     * "Mute mic" operation's value is TRUE (1) for muting the mic,
+-                     * so ensure mic_state carries the right value.
+-                     */
+-                    new_value = new_value ? CALL_AUDIO_MIC_OFF : CALL_AUDIO_MIC_ON;
+-                    if (operation->pulse->mic_state != new_value) {
+-                        operation->pulse->mic_state = new_value;
+-                        g_object_set(operation->pulse->manager, "mic-state", new_value, NULL);
+-                    }
+-                    break;
+-                default:
+-                    break;
+-                }
+-            }
++static void cad_pulse_op_arm(CadPulseOperation *operation)
++{
++    if (!operation || operation->timeout_id || operation->done)
++        return;
++    operation->timeout_id = g_timeout_add(CAD_SELECT_TIMEOUT_MS,
++                                          cad_pulse_op_timeout, operation);
++}
+ 
+-            free(operation->op);
+-        }
++static int cad_profile_kind(const char *name)
++{
++    if (!name)
++        return CAD_ACTIVE_UNKNOWN;
++    if (g_str_has_prefix(name, SND_USE_CASE_VERB_VOICECALL))
++        return CAD_ACTIVE_VOICE;
++    if (g_str_has_prefix(name, SND_USE_CASE_VERB_HIFI))
++        return CAD_ACTIVE_HIFI;
++    return CAD_ACTIVE_OTHER;
++}
+ 
+-        free(operation);
++static const char *cad_best_profile(const pa_card_info *info, const char *verb)
++{
++    const char *best = NULL;
++    uint32_t prio = 0;
++    int i;
++
++    if (!info || !verb || !info->profiles2)
++        return NULL;
++    for (i = 0; i < info->n_profiles; i++) {
++        pa_card_profile_info2 *profile = info->profiles2[i];
++
++        if (!profile || !profile->name || !profile->available)
++            continue;
++        if (!g_str_has_prefix(profile->name, verb))
++            continue;
++        if (!best || profile->priority > prio) {
++            best = profile->name;
++            prio = profile->priority;
++        }
+     }
++    return best;
+ }
+ 
+-static void set_card_profile(pa_context *ctx, const pa_card_info *info, int eol, void *data)
++static gboolean cad_pulse_op_retry(gpointer data)
+ {
+     CadPulseOperation *operation = data;
+-    pa_card_profile_info2 *profile;
+     pa_operation *op = NULL;
+-    const char *target_verb = NULL;
+ 
+-    if (eol != 0)
+-        return;
++    operation->retry_id = 0;
++    if (operation->done)
++        return G_SOURCE_REMOVE;
+ 
+-    if (!info) {
+-        g_critical("PA returned no card info (eol=%d)", eol);
+-        return;
++    if (operation->query == 0) {
++        op = pa_context_get_card_info_by_index(operation->pulse->ctx,
++                                               operation->pulse->card_id,
++                                               set_card_profile, operation);
++    } else {
++        op = pa_context_get_sink_info_by_index(operation->pulse->ctx,
++                                              operation->pulse->sink_id,
++                                              set_output_port, operation);
+     }
++    if (!op) {
++        g_warning("SelectMode retry could not query PulseAudio");
++        operation->in_flight = FALSE;
++        cad_pulse_op_fail(operation, TRUE);
++    } else {
++        operation->in_flight = TRUE;
++        pa_operation_unref(op);
++    }
++    return G_SOURCE_REMOVE;
++}
++
++static void cad_pulse_op_apply(pa_context *ctx, CadPulseOperation *operation,
++                               const CadSelOut *out)
++{
++    pa_operation *op = NULL;
+ 
+-    if (info->index != operation->pulse->card_id)
++    if (!operation || !out || operation->done)
+         return;
+ 
+-    profile = info->active_profile2;
++    operation->retries_left = out->retries_left;
++    operation->queued = out->queued ? TRUE : FALSE;
++    operation->queued_success = out->queued_success ? TRUE : FALSE;
++    operation->suppress_eol = out->suppress_eol ? TRUE : FALSE;
+ 
+-    if (g_str_has_prefix(profile->name, SND_USE_CASE_VERB_VOICECALL) && operation->value == 0) {
+-        g_debug("switching to default profile");
+-        target_verb = SND_USE_CASE_VERB_HIFI;
+-    } else if (g_str_has_prefix(profile->name, SND_USE_CASE_VERB_HIFI) && operation->value == 1) {
+-        g_debug("switching to voice profile");
+-        target_verb = SND_USE_CASE_VERB_VOICECALL;
++    switch (out->step) {
++    case CAD_STEP_IGNORE:
++        return;
++    case CAD_STEP_OK:
++        operation_complete_cb(ctx, 1, operation);
++        return;
++    case CAD_STEP_FAIL:
++        operation->in_flight = FALSE;
++        cad_pulse_op_fail(operation, TRUE);
++        return;
++    case CAD_STEP_RETRY:
++        if (out->arm_timeout)
++            cad_pulse_op_arm(operation);
++        if (operation->retry_id)
++            g_source_remove(operation->retry_id);
++        operation->retry_id = g_timeout_add(CAD_SELECT_RETRY_MS,
++                                            cad_pulse_op_retry, operation);
++        return;
++    case CAD_STEP_SET_PROFILE:
++        if (out->arm_timeout)
++            cad_pulse_op_arm(operation);
++        if (!operation->profile_name) {
++            g_warning("SelectMode had no target profile or port");
++            operation->in_flight = FALSE;
++            cad_pulse_op_fail(operation, TRUE);
++            return;
++        }
++        operation->async_started = TRUE;
++        operation->in_flight = TRUE;
++        if (operation->query == 0) {
++            op = pa_context_set_card_profile_by_index(ctx, operation->pulse->card_id,
++                                                      operation->profile_name,
++                                                      operation_complete_cb, operation);
++        } else {
++            op = pa_context_set_sink_port_by_index(ctx, operation->pulse->sink_id,
++                                                   operation->profile_name,
++                                                   operation_complete_cb, operation);
++        }
++        if (op) {
++            pa_operation_unref(op);
++        } else {
++            operation->async_started = FALSE;
++            operation->in_flight = FALSE;
++            g_warning("SelectMode could not start the PulseAudio operation");
++            cad_pulse_op_fail(operation, TRUE);
++        }
++        return;
++    default:
++        cad_pulse_op_fail(operation, TRUE);
++        return;
+     }
++}
+ 
+-    if (target_verb) {
+-        uint32_t target_priority = 0;
+-        const char *target_profile = NULL;
++static void operation_complete_cb(pa_context *ctx, int success, void *data)
++{
++    CadPulseOperation *operation = data;
+ 
+-        for (int i = 0; i < info->n_profiles; i++) {
+-            profile = info->profiles2[i];
++    g_debug("operation returned %d", success);
++
++    if (!operation)
++        return;
+ 
+-            if (profile->available &&
+-                g_str_has_prefix(profile->name, target_verb) &&
+-                profile->priority > target_priority) {
+-                target_profile = profile->name;
+-                target_priority = profile->priority;
++    cad_pulse_op_disarm(operation);
++
++    /* Timeout already answered D-Bus. This is the single-shot PA completion. */
++    if (operation->done) {
++        g_free(operation->profile_name);
++        free(operation);
++        return;
++    }
++    operation->done = TRUE;
++    operation->in_flight = FALSE;
++
++    if (operation->op) {
++        operation->op->success = (gboolean)!!success;
++        if (operation->op->callback)
++            operation->op->callback(operation->op);
++
++        if (operation->op->success) {
++            guint new_value = GPOINTER_TO_UINT(operation->value);
++
++            switch (operation->op->type) {
++            case CAD_OPERATION_SELECT_MODE:
++                if (operation->pulse->audio_mode != new_value) {
++                    operation->pulse->audio_mode = new_value;
++                    g_object_set(operation->pulse->manager, "audio-mode", new_value, NULL);
++                }
++                break;
++            case CAD_OPERATION_ENABLE_SPEAKER:
++                if (operation->pulse->speaker_state != new_value) {
++                    operation->pulse->speaker_state = new_value;
++                    g_object_set(operation->pulse->manager, "speaker-state", new_value, NULL);
++                }
++                break;
++            case CAD_OPERATION_MUTE_MIC:
++                /*
++                 * "Mute mic" operation's value is TRUE (1) for muting the mic,
++                 * so ensure mic_state carries the right value.
++                 */
++                new_value = new_value ? CALL_AUDIO_MIC_OFF : CALL_AUDIO_MIC_ON;
++                if (operation->pulse->mic_state != new_value) {
++                    operation->pulse->mic_state = new_value;
++                    g_object_set(operation->pulse->manager, "mic-state", new_value, NULL);
++                }
++                break;
++            default:
++                break;
+             }
+         }
+ 
+-        if (target_profile) {
+-            g_debug("target profile: '%s'", target_profile);
+-            op = pa_context_set_card_profile_by_index(ctx, operation->pulse->card_id,
+-                                                      target_profile,
+-                                                      operation_complete_cb, operation);
++        free(operation->op);
++    }
++
++    g_free(operation->profile_name);
++    free(operation);
++}
++
++static void set_card_profile(pa_context *ctx, const pa_card_info *info, int eol, void *data)
++{
++    CadPulseOperation *operation = data;
++    CadSelIn in;
++    CadSelOut out;
++    const char *verb = NULL;
++    const char *picked = NULL;
++
++    if (!operation)
++        return;
++
++    operation->query = 0;
++
++    if (operation->done) {
++        /* get_card_info still owes us eol>0. Do not free on the info item. */
++        if (eol != 0 && !operation->async_started) {
++            g_free(operation->profile_name);
++            free(operation);
+         }
++        return;
+     }
+ 
+-    if (op) {
+-        pa_operation_unref(op);
+-    } else {
+-        g_debug("%s: nothing to be done", __func__);
+-        operation_complete_cb(ctx, 1, operation);
++    if (eol == 0 && info && info->index != operation->pulse->card_id)
++        return;
++
++    if (eol != 0 && !operation->async_started)
++        operation->in_flight = FALSE;
++
++    memset(&in, 0, sizeof in);
++    in.mode = (operation->value == CALL_AUDIO_MODE_CALL) ? 1 : 0;
++    in.has_voice = 1;
++    in.phase = CAD_PHASE_CARD;
++    in.eol = eol;
++    in.active = CAD_ACTIVE_UNKNOWN;
++    in.async_started = operation->async_started ? 1 : 0;
++    in.queued = operation->queued ? 1 : 0;
++    in.queued_success = operation->queued_success ? 1 : 0;
++    in.retries_left = operation->retries_left;
++    in.suppress_eol = operation->suppress_eol ? 1 : 0;
++
++    if (eol == 0 && info && info->active_profile2 && info->active_profile2->name) {
++        in.active = cad_profile_kind(info->active_profile2->name);
++        verb = (operation->value == CALL_AUDIO_MODE_CALL)
++            ? SND_USE_CASE_VERB_VOICECALL : SND_USE_CASE_VERB_HIFI;
++        if ((in.active == CAD_ACTIVE_VOICE && operation->value == CALL_AUDIO_MODE_CALL) ||
++            (in.active == CAD_ACTIVE_HIFI && operation->value == CALL_AUDIO_MODE_DEFAULT)) {
++            in.already_there = 1;
++            in.target_available = 1;
++            g_debug("card profile '%s' is already the target", info->active_profile2->name);
++        } else {
++            picked = cad_best_profile(info, verb);
++            if (picked) {
++                in.target_available = 1;
++                g_free(operation->profile_name);
++                operation->profile_name = g_strdup(picked);
++                g_debug("target profile: '%s'", picked);
++            }
++        }
++    } else if (eol == 0 && !info) {
++        g_critical("PA returned no card info (eol=%d)", eol);
+     }
++
++    cad_selectmode_decide(&in, &out);
++    cad_pulse_op_apply(ctx, operation, &out);
+ }
+ 
+ static void set_output_port(pa_context *ctx, const pa_sink_info *info, int eol, void *data)
+ {
+     CadPulseOperation *operation = data;
+-    pa_operation *op = NULL;
+-    const gchar *target_port;
++    CadSelIn in;
++    CadSelOut out;
++    const gchar *target_port = NULL;
+ 
+-    if (eol != 0)
++    if (!operation)
+         return;
+ 
+-    if (!info) {
+-        g_critical("PA returned no sink info (eol=%d)", eol);
++    operation->query = 1;
++
++    if (operation->done) {
++        if (eol != 0 && !operation->async_started) {
++            g_free(operation->profile_name);
++            free(operation);
++        }
+         return;
+     }
+ 
+-    if (info->card != operation->pulse->card_id || info->index != operation->pulse->sink_id)
++    if (eol == 0 && info && (info->card != operation->pulse->card_id ||
++                             info->index != operation->pulse->sink_id))
+         return;
+ 
+-    if (operation->op && operation->op->type == CAD_OPERATION_SELECT_MODE) {
+-        /*
+-         * When switching to voice call mode, we want to switch to any port
+-         * other than the speaker; this makes sure we use the headphones if they
+-         * are connected, and the earpiece otherwise.
+-         * When switching back to normal mode, the highest priority port is to
+-         * be selected anyway.
+-         */
+-        if (operation->value == CALL_AUDIO_MODE_CALL)
+-            target_port = get_available_sink_port(info, operation->pulse->speaker_port);
+-        else
+-            target_port = get_available_sink_port(info, NULL);
+-    } else {
+-        /*
+-         * When forcing speaker output, we simply select the speaker port.
+-         * When disabling speaker output, we want the highest priority port
+-         * other than the speaker, so that we use the headphones if connected,
+-         * and the earpiece otherwise.
+-         */
+-        if (operation->value)
++    if (eol != 0 && !operation->async_started)
++        operation->in_flight = FALSE;
++
++    memset(&in, 0, sizeof in);
++    in.mode = (operation->value == CALL_AUDIO_MODE_CALL) ? 1 : 0;
++    in.phase = CAD_PHASE_PORT;
++    in.eol = eol;
++    in.async_started = operation->async_started ? 1 : 0;
++    in.queued = operation->queued ? 1 : 0;
++    in.queued_success = operation->queued_success ? 1 : 0;
++    in.retries_left = operation->retries_left;
++    in.suppress_eol = operation->suppress_eol ? 1 : 0;
++    in.active = CAD_ACTIVE_UNKNOWN;
++
++    if (eol == 0 && info) {
++        if (operation->op && operation->op->type == CAD_OPERATION_SELECT_MODE) {
++            if (operation->value == CALL_AUDIO_MODE_CALL)
++                target_port = get_available_sink_port(info, operation->pulse->speaker_port);
++            else
++                target_port = get_available_sink_port(info, NULL);
++        } else if (operation->value) {
+             target_port = operation->pulse->speaker_port;
+-        else
++        } else {
+             target_port = get_available_sink_port(info, operation->pulse->speaker_port);
+-    }
+-
+-    g_debug("active port is '%s', target port is '%s'", info->active_port->name, target_port);
++        }
+ 
+-    if (target_port && g_strcmp0(info->active_port->name, target_port) != 0) {
+-        g_debug("switching to target port '%s'", target_port);
+-        op = pa_context_set_sink_port_by_index(ctx, operation->pulse->sink_id,
+-                                               target_port,
+-                                               operation_complete_cb, operation);
++        if (!info->active_port || !info->active_port->name) {
++            g_debug("sink has no active port yet");
++        } else if (!target_port || g_strcmp0(info->active_port->name, target_port) == 0) {
++            in.already_there = 1;
++            in.target_available = 1;
++            in.active = CAD_ACTIVE_HIFI;
++        } else {
++            in.active = CAD_ACTIVE_OTHER;
++            in.target_available = 1;
++            g_free(operation->profile_name);
++            operation->profile_name = g_strdup(target_port);
++            g_debug("switching to target port '%s'", target_port);
++        }
++    } else if (eol == 0 && !info) {
++        g_critical("PA returned no sink info (eol=%d)", eol);
+     }
+ 
+-    if (op) {
+-        pa_operation_unref(op);
+-    } else {
+-        g_debug("%s: nothing to be done", __func__);
+-        operation_complete_cb(ctx, 1, operation);
+-    }
++    cad_selectmode_decide(&in, &out);
++    cad_pulse_op_apply(ctx, operation, &out);
+ }
+ 
+ /**
+@@ -979,12 +1223,15 @@
+  */
+ void cad_pulse_select_mode(CallAudioMode mode, CadOperation *cad_op)
+ {
+-    CadPulseOperation *operation = g_new(CadPulseOperation, 1);
++    CadPulseOperation *operation = g_new0(CadPulseOperation, 1);
++    CadSelIn in;
++    CadSelOut out;
+     pa_operation *op = NULL;
+ 
+     if (!cad_op) {
+         g_critical("%s: no callaudiod operation", __func__);
+-        goto error;
++        free(operation);
++        return;
+     }
+ 
+     /*
+@@ -995,71 +1242,87 @@
+     operation->pulse = cad_pulse_get_default();
+     operation->op = cad_op;
+     operation->value = mode;
++    operation->retries_left = CAD_SELECT_RETRIES;
++
++    memset(&in, 0, sizeof in);
++    in.mode = (mode == CALL_AUDIO_MODE_CALL) ? 1 : 0;
++    in.has_voice = operation->pulse->has_voice_profile ? 1 : 0;
++    in.source_id = operation->pulse->source_id;
++    in.sink_id = operation->pulse->sink_id;
++    in.phase = CAD_PHASE_ENTER;
++    in.retries_left = operation->retries_left;
++    cad_selectmode_decide(&in, &out);
+ 
++    /*
++     * Leaving a call used to call mute/speaker unconditionally. When the
++     * Voice Call source and sink have already disappeared, those calls logged
++     * "card has no usable source/sink" and returned. The card-profile query
++     * then ran, and its callback returned on eol!=0 without completing
++     * SelectMode (and freed the operation on eol==0, before eol==1).
++     * Skip the side operations when the port is already gone. The warnings
++     * stay, so the journal still shows the flicker.
++     */
+     if (mode != CALL_AUDIO_MODE_CALL) {
+-        /*
+-         * When ending a call, we want to make sure the mic doesn't stay muted
+-         */
+-        CadOperation *unmute_op = g_new0(CadOperation, 1);
+-        unmute_op->type = CAD_OPERATION_MUTE_MIC;
+-
+-        cad_pulse_mute_mic(FALSE, unmute_op);
+-
+-        /*
+-         * If the card has a dedicated voice profile, disable speaker so it
+-         * doesn't get automatically enabled for next call.
+-         */
++        if (out.skip_mute) {
++            g_warning("card has no usable source");
++        } else {
++            CadOperation *unmute_op = g_new0(CadOperation, 1);
++            unmute_op->type = CAD_OPERATION_MUTE_MIC;
++            cad_pulse_mute_mic(FALSE, unmute_op);
++        }
+         if (operation->pulse->has_voice_profile) {
+-            CadOperation *disable_speaker_op = g_new0(CadOperation, 1);
+-            disable_speaker_op->type = CAD_OPERATION_ENABLE_SPEAKER;
+-
+-            cad_pulse_enable_speaker(FALSE, disable_speaker_op);
++            if (out.skip_speaker) {
++                g_warning("card has no usable sink");
++            } else {
++                CadOperation *disable_speaker_op = g_new0(CadOperation, 1);
++                disable_speaker_op->type = CAD_OPERATION_ENABLE_SPEAKER;
++                cad_pulse_enable_speaker(FALSE, disable_speaker_op);
++            }
+         }
+     }
+ 
++    if (out.step == CAD_STEP_FAIL) {
++        g_warning("card has no voice profile and no usable sink");
++        cad_pulse_op_fail(operation, TRUE);
++        return;
++    }
++
++    operation->retries_left = out.retries_left;
++    cad_pulse_op_arm(operation);
++    operation->in_flight = TRUE;
++
+     if (operation->pulse->has_voice_profile) {
+-      /*
+-       * The pinephone f.e. has a voice profile
+-       */
+         g_debug("card has voice profile, using it");
++        operation->query = 0;
+         op = pa_context_get_card_info_by_index(operation->pulse->ctx,
+                                                operation->pulse->card_id,
+                                                set_card_profile, operation);
+     } else {
+-        if (operation->pulse->sink_id < 0) {
+-            g_warning("card has no voice profile and no usable sink");
+-            goto error;
+-        }
+         g_debug("card doesn't have voice profile, switching output port");
+-
++        operation->query = 1;
+         op = pa_context_get_sink_info_by_index(operation->pulse->ctx,
+                                                operation->pulse->sink_id,
+                                                set_output_port, operation);
+     }
+ 
+-    if (op)
+-        pa_operation_unref(op);
+-
+-    return;
+-
+-error:
+-    if (cad_op) {
+-        cad_op->success = FALSE;
+-        if (cad_op->callback)
+-            cad_op->callback(cad_op);
++    if (!op) {
++        operation->in_flight = FALSE;
++        g_warning("SelectMode could not query PulseAudio");
++        cad_pulse_op_fail(operation, TRUE);
++        return;
+     }
+-    if (operation)
+-        free(operation);
++    pa_operation_unref(op);
+ }
+ 
+ void cad_pulse_enable_speaker(gboolean enable, CadOperation *cad_op)
+ {
+-    CadPulseOperation *operation = g_new(CadPulseOperation, 1);
++    CadPulseOperation *operation = g_new0(CadPulseOperation, 1);
+     pa_operation *op = NULL;
+ 
+     if (!cad_op) {
+         g_critical("%s: no callaudiod operation", __func__);
+-        goto error;
++        free(operation);
++        return;
+     }
+ 
+     /*
+@@ -1076,13 +1339,21 @@
+ 
+     operation->op = cad_op;
+     operation->value = (guint)enable;
++    operation->retries_left = CAD_SELECT_RETRIES;
++    operation->query = 1;
++    operation->in_flight = TRUE;
++    cad_pulse_op_arm(operation);
+ 
+     op = pa_context_get_sink_info_by_index(operation->pulse->ctx,
+                                            operation->pulse->sink_id,
+                                            set_output_port, operation);
+-    if (op)
+-        pa_operation_unref(op);
+-
++    if (!op) {
++        operation->in_flight = FALSE;
++        g_warning("could not query sink for speaker switch");
++        cad_pulse_op_fail(operation, TRUE);
++        return;
++    }
++    pa_operation_unref(op);
+     return;
+ 
+ error:
+@@ -1090,19 +1361,20 @@
+         cad_op->success = FALSE;
+         if (cad_op->callback)
+             cad_op->callback(cad_op);
++        free(cad_op);
+     }
+-    if (operation)
+-        free(operation);
++    free(operation);
+ }
+ 
+ void cad_pulse_mute_mic(gboolean mute, CadOperation *cad_op)
+ {
+-    CadPulseOperation *operation = g_new(CadPulseOperation, 1);
++    CadPulseOperation *operation = g_new0(CadPulseOperation, 1);
+     pa_operation *op = NULL;
+ 
+     if (!cad_op) {
+         g_critical("%s: no callaudiod operation", __func__);
+-        goto error;
++        free(operation);
++        return;
+     }
+ 
+     /*
+@@ -1133,6 +1405,8 @@
+     }
+ 
+     if (op) {
++        operation->in_flight = TRUE;
++        cad_pulse_op_arm(operation);
+         pa_operation_unref(op);
+     } else {
+         g_debug("%s: nothing to be done", __func__);
+@@ -1146,9 +1420,9 @@
+         cad_op->success = FALSE;
+         if (cad_op->callback)
+             cad_op->callback(cad_op);
++        free(cad_op);
+     }
+-    if (operation)
+-        free(operation);
++    free(operation);
+ }
+ 
+ CallAudioMode cad_pulse_get_audio_mode(void)
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -23,6 +23,7 @@
+         'callaudiod.c', 'callaudiod.h',
+         'cad-manager.c', 'cad-manager.h',
+         'cad-pulse.c', 'cad-pulse.h',
++        'cad-selectmode-decide.c', 'cad-selectmode-decide.h',
+     ],
+     dependencies : cad_deps,
+     include_directories : include_directories('..', '../libcallaudio'),
+--- a/src/cad-selectmode-decide.c
++++ b/src/cad-selectmode-decide.c
+@@ -0,0 +1,108 @@
++/*
++ * See cad-selectmode-decide.h.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#include "cad-selectmode-decide.h"
++
++#include <string.h>
++
++static void finish_list(const CadSelIn *in, CadSelOut *out)
++{
++    if (in->queued)
++        out->step = in->queued_success ? CAD_STEP_OK : CAD_STEP_FAIL;
++    else
++        out->step = CAD_STEP_FAIL;
++}
++
++void cad_selectmode_decide(const CadSelIn *in, CadSelOut *out)
++{
++    if (!out)
++        return;
++    memset(out, 0, sizeof *out);
++    if (!in) {
++        out->step = CAD_STEP_FAIL;
++        return;
++    }
++
++    out->retries_left = in->retries_left;
++    out->queued = in->queued;
++    out->queued_success = in->queued_success;
++    out->suppress_eol = in->suppress_eol;
++    out->skip_mute = in->source_id < 0;
++    out->skip_speaker = in->sink_id < 0;
++
++    /*
++     * Upstream only unmutes and drops the speaker when leaving a call.
++     * Entering a call must not run those side operations.
++     */
++    if (in->phase == CAD_PHASE_ENTER && in->mode != 0) {
++        out->skip_mute = 1;
++        out->skip_speaker = 1;
++    }
++
++    /*
++     * A retry was armed on eol==0. The matching eol>0 belongs to the old
++     * query and must not complete or fail the D-Bus call.
++     */
++    if (in->suppress_eol) {
++        out->step = CAD_STEP_IGNORE;
++        if (in->eol > 0)
++            out->suppress_eol = 0;
++        else
++            out->suppress_eol = 1;
++        return;
++    }
++
++    if (in->phase == CAD_PHASE_ENTER) {
++        if (!in->has_voice && in->sink_id < 0) {
++            out->step = CAD_STEP_FAIL;
++            return;
++        }
++        out->step = CAD_STEP_SET_PROFILE;
++        out->arm_timeout = 1;
++        if (out->retries_left <= 0)
++            out->retries_left = CAD_SELECT_RETRIES;
++        return;
++    }
++
++    /* CARD and PORT: one PulseAudio info list. */
++    if (in->async_started) {
++        out->step = CAD_STEP_IGNORE;
++        return;
++    }
++    if (in->eol < 0) {
++        out->step = CAD_STEP_FAIL;
++        return;
++    }
++    if (in->eol > 0) {
++        finish_list(in, out);
++        return;
++    }
++
++    /*
++     * eol == 0. Do not complete yet: PulseAudio calls the callback again
++     * with eol>0, and freeing here is the 0.1.99 use-after-free.
++     */
++    if (in->active == CAD_ACTIVE_UNKNOWN || !in->target_available) {
++        if (in->retries_left > 0) {
++            out->step = CAD_STEP_RETRY;
++            out->retries_left = in->retries_left - 1;
++            out->suppress_eol = 1;
++            out->arm_timeout = 1;
++            return;
++        }
++        out->queued = 1;
++        out->queued_success = 0;
++        out->step = CAD_STEP_IGNORE;
++        return;
++    }
++    if (in->already_there) {
++        out->queued = 1;
++        out->queued_success = 1;
++        out->step = CAD_STEP_IGNORE;
++        return;
++    }
++    out->step = CAD_STEP_SET_PROFILE;
++    out->arm_timeout = 1;
++}
+--- a/src/cad-selectmode-decide.h
++++ b/src/cad-selectmode-decide.h
+@@ -0,0 +1,66 @@
++/*
++ * Decision helper for callaudiod 0.1.99 SelectMode.
++ *
++ * The PulseAudio backend calls this and does the I/O itself. This file has
++ * no PulseAudio and no GLib types, so the host build can unit-test it.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#ifndef CAD_SELECTMODE_DECIDE_H
++#define CAD_SELECTMODE_DECIDE_H
++
++enum {
++    CAD_STEP_OK = 0,          /* complete the D-Bus call successfully now */
++    CAD_STEP_FAIL = 1,        /* complete the D-Bus call with an error now */
++    CAD_STEP_SET_PROFILE = 2, /* start the async PulseAudio operation */
++    CAD_STEP_RETRY = 3,       /* ask PulseAudio again after a short delay */
++    CAD_STEP_IGNORE = 4       /* do not complete and do not free */
++};
++
++enum {
++    CAD_PHASE_ENTER = 0, /* before any PulseAudio info query */
++    CAD_PHASE_CARD = 1,  /* pa_context_get_card_info callback */
++    CAD_PHASE_PORT = 2   /* pa_context_get_sink_info callback */
++};
++
++enum {
++    CAD_ACTIVE_UNKNOWN = 0,
++    CAD_ACTIVE_VOICE = 1,
++    CAD_ACTIVE_HIFI = 2,
++    CAD_ACTIVE_OTHER = 3
++};
++
++/* Short bound: 5 retries, 200 ms apart, under the 2.5 s SelectMode timeout. */
++#define CAD_SELECT_RETRIES 5
++
++typedef struct {
++    int mode;             /* 0 = default (HiFi), 1 = voice call */
++    int has_voice;        /* card has a Voice Call profile */
++    int source_id;        /* <0 : no usable source */
++    int sink_id;          /* <0 : no usable sink */
++    int phase;
++    int eol;              /* <0 error, 0 one info item, >0 end of list */
++    int active;           /* CAD_ACTIVE_* */
++    int target_available; /* a suitable target profile or port exists */
++    int already_there;    /* active profile or port is already the target */
++    int async_started;    /* set_card_profile / set_sink_port is in flight */
++    int queued;           /* a result is waiting for eol>0 */
++    int queued_success;
++    int retries_left;
++    int suppress_eol;     /* ignore the rest of this PulseAudio list */
++} CadSelIn;
++
++typedef struct {
++    int step;
++    int skip_mute;        /* do not call mute-mic (source already gone) */
++    int skip_speaker;     /* do not call enable-speaker (sink already gone) */
++    int arm_timeout;      /* arm the SelectMode deadline if not armed yet */
++    int retries_left;
++    int queued;
++    int queued_success;
++    int suppress_eol;
++} CadSelOut;
++
++void cad_selectmode_decide(const CadSelIn *in, CadSelOut *out);
++
++#endif

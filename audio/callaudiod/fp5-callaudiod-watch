@@ -1,0 +1,205 @@
+#!/bin/sh
+# fp5-callaudiod-watch — restart callaudiod when SelectMode is wedged and
+# no call is active. D-Bus activation starts the next process.
+#
+# A restart is pkill -x callaudiod. It runs only when all of these hold:
+#   * no ModemManager call, no oFono/imsd VoiceCall, no HFP state file,
+#     and fp5-call-mic.service is not active (unknown state counts as busy);
+#   * the user bus owns org.mobian_project.CallAudio;
+#   * either the recent journal has "card has no usable source/sink", or the
+#     slow probe is due (about once a minute) so a long-wedged daemon is caught;
+#   * a SelectMode(0) probe does not return within a few seconds;
+#   * a second idle check, after the probe, is still idle;
+#   * the previous restart was at least FP5_CALLAUDIOD_WATCH_LIMIT seconds ago.
+#
+# SelectMode(0) is the default/HiFi mode. Probing it during a call would
+# pull the card off Voice Call, so the idle check is strict and is repeated
+# immediately before the probe and again before pkill.
+#
+# Dry run (no pkill, no state file): FP5_CALLAUDIOD_WATCH_DRYRUN=1
+# One pass: FP5_CALLAUDIOD_WATCH_ONCE=1
+# Logs: journalctl --user -t fp5-callaudiod-watch
+set -u
+TAG=fp5-callaudiod-watch
+DRY=${FP5_CALLAUDIOD_WATCH_DRYRUN:-0}
+ONCE=${FP5_CALLAUDIOD_WATCH_ONCE:-0}
+INTERVAL=${FP5_CALLAUDIOD_WATCH_INTERVAL:-5}
+PROBE_S=${FP5_CALLAUDIOD_WATCH_PROBE_S:-3}
+LIMIT=${FP5_CALLAUDIOD_WATCH_LIMIT:-60}
+SLOW_S=${FP5_CALLAUDIOD_WATCH_SLOW_S:-60}
+RT=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+HFP_STATE=${FP5_HFP_STATE:-$RT/fp5-hfp-audio.json}
+IMSD_STATUS=${FP5_IMSD_STATUS:-/var/lib/fp5-imsd/status.json}
+MIC_UNIT=${FP5_CALL_MIC_UNIT:-fp5-call-mic.service}
+STATE=${FP5_CALLAUDIOD_WATCH_STATE:-$RT/fp5-callaudiod-watch.state}
+DEST=org.mobian_project.CallAudio
+OBJ=/org/mobian_project/CallAudio
+
+red() {
+    printf '%s' "$1" | sed -E \
+        -e 's/[Ii][Mm][Ss][Ii][^0-9]*[0-9]{5,}/<imsi>/g' \
+        -e 's/[Ii][Mm][Ee][Ii][^0-9]*[0-9]{5,}/<imei>/g' \
+        -e 's/[Ii][Cc][Cc][Ii][Dd][^0-9]*[0-9]{5,}/<iccid>/g' \
+        -e 's/(sips?|tel):[^ ]+/<uri>/g' \
+        -e 's/([0-9A-Fa-f]{2}[:_-]){5}[0-9A-Fa-f]{2}/<mac>/g' \
+        -e 's/[0-9]{1,3}(\.[0-9]{1,3}){3}/<ip>/g' \
+        -e 's/\+?[0-9]{7,15}/<num>/g'
+}
+log() {
+    msg=$(red "$*")
+    if [ "$DRY" = 1 ]; then printf '%s: %s\n' "$TAG" "$msg"
+    else logger -t "$TAG" -- "$msg"; fi
+}
+
+num() { case "$1" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$1" ;; esac; }
+
+state_get() { # key
+    [ -f "$STATE" ] || { printf '0'; return; }
+    v=$(sed -n "s/^$1=//p" "$STATE" | head -1)
+    num "$v"
+}
+
+state_put() { # last_restart last_probe
+    [ "$DRY" = 1 ] && return 0
+    mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
+    printf 'last_restart=%s\nlast_probe=%s\n' "$1" "$2" > "$STATE"
+}
+
+# 0 = confirmed idle, 1 = busy or not proven idle.
+confirmed_idle() {
+    if [ -e "$HFP_STATE" ]; then return 1; fi
+    st=$(systemctl --user is-active --quiet "$MIC_UNIT" >/dev/null 2>&1; echo $?)
+    if [ "$st" != 3 ] && [ "$st" != 4 ]; then return 1; fi
+    verdict=$(FP5_IMSD_STATUS="$IMSD_STATUS" python3 - <<'PY'
+import json, os, subprocess, sys
+
+def bus(*args):
+    try:
+        r = subprocess.run(["busctl", "--system", "--json=short", *args],
+                           capture_output=True, text=True, timeout=2)
+    except Exception:
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    try:
+        return json.loads(r.stdout).get("data")
+    except Exception:
+        return None
+
+mm_ok = False
+for i in range(4):
+    calls = bus("get-property", "org.freedesktop.ModemManager1",
+                "/org/freedesktop/ModemManager1/Modem/%d" % i,
+                "org.freedesktop.ModemManager1.Modem.Voice", "Calls")
+    if calls is None:
+        continue
+    mm_ok = True
+    if isinstance(calls, list) and len(calls) > 0:
+        print("busy")
+        sys.exit(0)
+if not mm_ok:
+    print("unknown")
+    sys.exit(0)
+
+try:
+    r = subprocess.run(["busctl", "--system", "--json=short", "call", "org.ofono",
+                        "/imsd", "org.ofono.VoiceCallManager", "GetCalls"],
+                       capture_output=True, text=True, timeout=2)
+    if r.returncode == 0 and r.stdout.strip():
+        data = json.loads(r.stdout).get("data") or []
+        if isinstance(data, list) and len(data) > 0:
+            print("busy")
+            sys.exit(0)
+except Exception:
+    print("unknown")
+    sys.exit(0)
+
+path = os.environ.get("FP5_IMSD_STATUS", "")
+if not path or not os.path.exists(path):
+    print("unknown")
+    sys.exit(0)
+try:
+    q = json.loads(open(path).read())
+    calls = q.get("calls") or []
+    if isinstance(calls, list) and len(calls) > 0:
+        print("busy")
+        sys.exit(0)
+except Exception:
+    print("unknown")
+    sys.exit(0)
+print("idle")
+PY
+    )
+    [ "$verdict" = idle ]
+}
+
+hint_present() {
+    if [ "${FP5_CALLAUDIOD_WATCH_HINT+x}" = x ]; then
+        [ "$FP5_CALLAUDIOD_WATCH_HINT" = 1 ]
+        return
+    fi
+    journalctl --user --since "-5 min" -o cat 2>/dev/null \
+        | grep -E -q "card has no usable (source|sink)"
+}
+
+slow_due() {
+    # 1 forces a probe this pass. 0 suppresses the slow path. Unset uses the clock.
+    case "${FP5_CALLAUDIOD_WATCH_SLOW_DUE-}" in
+        1) return 0 ;;
+        0) return 1 ;;
+    esac
+    now=$(date +%s)
+    last=$(state_get last_probe)
+    # First start: remember the time and wait one slow period. A login-time
+    # probe would race a call that is already up.
+    if [ "$last" = 0 ]; then
+        state_put "$(state_get last_restart)" "$now"
+        return 1
+    fi
+    [ $((now - last)) -ge "$SLOW_S" ]
+}
+
+tick() {
+    confirmed_idle || return 0
+    hint=0
+    hint_present && hint=1
+    slow=0
+    slow_due && slow=1
+    if [ "$hint" != 1 ] && [ "$slow" != 1 ]; then return 0; fi
+    busctl --user status "$DEST" >/dev/null 2>&1 || return 0
+    # The call may have started while we decided to probe.
+    confirmed_idle || return 0
+    err=$(timeout "$PROBE_S" busctl --user call "$DEST" "$OBJ" "$DEST" SelectMode u 0 2>&1 >/dev/null)
+    rc=$?
+    now=$(date +%s)
+    last_r=$(state_get last_restart)
+    if [ "$rc" != 124 ]; then
+        state_put "$last_r" "$now"
+        if [ "$rc" != 0 ]; then
+            log "probe returned rc=$rc $(red "$err")"
+        fi
+        return 0
+    fi
+    if ! confirmed_idle; then
+        log "SelectMode probe timed out but a call is active; not restarting"
+        return 0
+    fi
+    if [ $((now - last_r)) -lt "$LIMIT" ] && [ "$last_r" != 0 ]; then
+        log "SelectMode wedged while idle; restart suppressed by the rate limit"
+        return 0
+    fi
+    if [ "$DRY" = 1 ]; then
+        log "dry: would pkill -x callaudiod"
+        return 0
+    fi
+    log "SelectMode wedged while idle; restarting callaudiod"
+    pkill -x callaudiod || true
+    state_put "$now" "$now"
+}
+
+while true; do
+    tick || true
+    [ "$ONCE" = 1 ] && break
+    sleep "$INTERVAL"
+done
+exit 0
