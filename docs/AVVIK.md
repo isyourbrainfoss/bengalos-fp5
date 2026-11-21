@@ -73,6 +73,8 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 
 - 21.11 ca. 09:43: X11-omveien (`flatpak override --user --socket=x11 --env=GDK_BACKEND=x11`) for Flowlog, Navigation og Spectrogram ble fjernet igjen etter Kristians ønske (`flatpak override --user --reset`). Grunn til omveien: Flutter 3.50 Wayland-subsurface-renderer deadlocker («Timed out waiting for subsurface frame», intet vindu; flutter#196529/#196663/#195822). Appene åpner ikke på Wayland før Grok Bot har bygd dem på nytt med Flutter 3.47.8 via Grok Build på desk.
 
+- 21.11 kl. 11:38: midlertidig dvalelogging for å fange hvor dvaledødsfallene skjer (warm reset fra PS_HOLD minutter inn i s2idle, sist 10:54 på 1120.1; krasjloggen viste ingen feil fordi loggnivået var lavt). Bare i minnet til neste omstart: `kernel.printk` 4→8, `printk.console_suspend` Y→N, `/sys/power/pm_debug_messages` 0→1, `/sys/power/pm_print_times` 0→1. Tilbake: skriv 4 / Y / 0 / 0 eller reboot. Merk: lignende cmdline-flagg 19.11 var mistenkt for Phosh-krasj ved oppvåkning. Krasjlogg-kopi: `/var/lib/fp5-suspend-guard/pstore/20261121-1058-console-ramoops-0`.
+
 ## 6. Ikke rørt (bevisst standard)
 
 Modem-NV/PDC/MBN, bootloader/firmware-partisjoner, krasj-/watchdog-funksjoner og mobildata-policy er ikke endret.
