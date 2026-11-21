@@ -86,3 +86,11 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 Modem-NV/PDC/MBN, bootloader/firmware-partisjoner, krasj-/watchdog-funksjoner og mobildata-policy er ikke endret.
 
 Full historikk: FP5-siden «BengalOS på Fairphone 5: bugs og endringer».
+
+### 2026-11-21 17:15 – Installert: VoLTE gjennom dvale (fp5-modemmanager IMS-spare + fp5-ims rask resume)
+- **Hva:** `/var/lib/extensions/fp5-modemmanager_0.26.1120.1.raw` byttet til sha 8ff5b91a… (ModemManager med `mm-fp5-keep-ims-bearer.patch`, binær fc7239de…), og `/opt/fp5-imsd/service/manager.py` byttet til sha 09521f8e… (PrepareForSleep-lytter, poll hvert 2. s i 10 min etter oppvåkning). Branches: fix/mm-keep-ims-bearer (d99036b, flettet inn i feed/carry-local-sysexts 0b494ec), fix/ims-resume-fast (af7716a).
+- **Hvorfor:** NetworkManager kobler ned ALLE bearere ved dvale (disconnect(NULL)), også IMS-bæreren, så innkommende anrop i dvale gikk over CS/2G og IMS kom tilbake først etter 25 s–5 min.
+- **Hvordan:** `run0 sh /home/fp5/fp5-xfer/install.sh` med Kristians ja (17:10, "nå" 17:12). sysext refresh, ModemManager restartet, fp5-ims startet. Backup: /var/lib/fp5-backup/20261121-volte-suspend/.
+- **Resultat:** sysext aktiv, ny binær har IMS-spare, ModemManager og fp5-ims active. IMS-bæreren (bearer2, IPv6) oppe igjen 17:15:34. Ikke testet ennå: VoLTE-anrop i dvale, og "sparing IMS bearer" i journalen ved neste dvale.
+- **Tilbake:** `run0 sh /home/fp5/fp5-xfer/rollback.sh`
+- Merknad: q6voiced-resume-workaround.service feilet 17:10:31 (før installasjonen, ved en oppvåkning); ikke relatert, ikke rørt.
