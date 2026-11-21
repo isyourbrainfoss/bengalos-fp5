@@ -12,6 +12,14 @@ the tests is `example.smart`.
 This is not a sysext. The ims-app sysext only carries the polkit action. These
 files are installed under `/opt/fp5-imsd/service`.
 
+`manager.py` subscribes to logind `PrepareForSleep` on its own system-bus
+connection. Sleep clears the 3-attempts-per-30-minutes budget. Resume wakes
+any `pause()` at once, polls `ready()` every 2 s for 10 minutes, and skips the
+post-transaction backoff for the first 3 attempts. After that the historical
+15/60/300 s schedule and the 30-minute budget apply again. A missing bus or
+login1 leaves the historical schedule in place. The supervisor still does not
+write the modem and does not call mmcli.
+
 ## Tests
 
 From this directory:
@@ -19,4 +27,5 @@ From this directory:
 ```
 python3 test_coexist.py
 python3 test_ownership.py
+python3 test_resume.py
 ```
