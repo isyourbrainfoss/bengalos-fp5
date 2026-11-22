@@ -209,3 +209,10 @@ Desk nådde ikke telefonen (ikke på hjemme-Wi-Fi), så alt gikk lokalt på tele
 - **Backup:** `/var/lib/fp5-backup/20261122T165528-ringback/`. Mappen har imsd (gammel) og imsd.sha256, og root-install.sh, rollback.sh og idle.py er kopiert dit.
 - **Tilbake (trengs nå):** `run0 sh /var/lib/fp5-backup/20261122T165528-ringback/root-install.sh --rollback /var/lib/fp5-backup/20261122T165528-ringback`. Kommandoen sjekker sha256, sjekker at telefonen er ledig, legger tilbake gammel imsd og restarter fp5-ims. Ferdig skript som også viser TRANSACTION_OBSTACLE og lager tmpfiles-fila: `run0 sh /home/fp5/fp5-1122-root2.sh`. Begge run0-forsøkene 16:57 og 16:58 fikk «Connection timed out» i polkit-spørsmålet, så ingenting ble endret. Rollback er IKKE gjort ennå.
 - imsd fix/ringback c10bb5f er ikke pushet. Det finnes ikke noe imsd-repo under isyourbrainfoss, bare upstream-remoten forgejo.catcrafts.net. bengalos-fp5 fix/ringback 057f4db og fix/phoc-resume-output 7ed7b58 er pushet fra før.
+
+## 2026-11-22 18:31 — Ringback-imsd rullet tilbake (VoLTE var nede 16:55–18:31)
+
+**Hva:** /opt/fp5-imsd/bin/imsd er tilbake til f7dd7c9b… (fra 93f77606…) via `root-install.sh --rollback /var/lib/fp5-backup/20261122T165528-ringback`, og fp5-ims.service er restartet. Ingenting annet er restartet.
+**Hvorfor:** Ringback-imsd (fix/ringback 057f4db, imsd c10bb5f) registrerte aldri IMS. Alle forsøkene endte med exit 3 og `TRANSACTION_OBSTACLE FileNotFoundError`, altså at den nye binæren eller installasjonen mangler en fil. Ringback-fiksen må undersøkes før et nytt forsøk.
+**Merknad:** Den første tilbakerullingen (root2.sh, 18:12) avbrøt med "oFono call state unknown" fordi samtalesjekken ikke virker under root. Samtalesjekken ble derfor gjort som fp5 (0 samtaler i MM og gnome-calls), og tilbakerullingen ble kjørt med FP5_SKIP_CALLCHECK=1. Dette er en kjent installer-feil.
+**pm_print_times:** er nå permanent via /etc/tmpfiles.d/fp5-pm-print-times.conf. Rollback: /var/lib/fp5-backup/20261122T165528-pm-print-times/rollback.sh.
