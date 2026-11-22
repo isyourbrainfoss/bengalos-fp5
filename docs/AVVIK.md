@@ -169,3 +169,12 @@ Full historikk: FP5-siden «BengalOS på Fairphone 5: bugs og endringer».
 ## 2026-11-22 — Uskarphet etter oppvåkning (diagnose, ingen endring)
 
 - Skala er riktig (DSI-1 = 3). Phosh dør med exit 1 ved hver oppvåkning (13 ganger), fordi phoc lager en ny DSI-1 etter at logind har pauset DRM. Glitchen er phoc «Atomic commit failed: Device or resource busy». Apper som var åpne før Phosh startet på nytt, kan bli uskarpe. Lukk og åpne dem, eller logg ut og inn. Mulig fiks oppstrøms: phoc/wlroots gjenbruker output ved seat-resume. Grok Build-jobb 20261122-104817-3546155.
+
+## 2026-11-22 14:53 — gnome-calls VoLTE-først INSTALLERT (lab FP5)
+
+- **Hva:** Sysext `fp5-gnome-calls_0.26.1120.1.raw` i /var/lib/extensions (gnome-calls 51.1 git 9469d4d + patch). Vanlige tel:-oppringinger går via online oFono `/imsd` (VoLTE) og faller tilbake til ModemManager (CS) når imsd mangler eller er offline. Nødnumre, USSD og valgt origin er uendret. `/imsd` legges også til igjen når den forsvinner og kommer tilbake. Branch `fix/calls-prefer-ims-origin` (974d78e, pushet, ikke merget).
+- **Hvorfor:** 09:09- og 14:18-samtalene gikk CS fordi Calls tok første origin (MM). Kristian: «ta volte også. jeg vil at alt skal fungere hele tiden når det gjelder ringing.»
+- **Hvordan:** Root-delen via desk SSH fp5ops (run0, idle-sjekk først), med `systemd-sysext refresh` (bare /usr remerge). Deretter `systemctl --user try-restart calls-daemon`. Etterpå logget journalen «Adding origin imsd» og «Modem `/imsd' added». ModemManager, imsd, WirePlumber og PipeWire ble ikke startet på nytt.
+- **Backup:** `/var/lib/fp5-backup/20261122T145245-origin-selectmode-calls/`.
+- **Tilbake:** `sh /home/fp5/fp5-xfer-origin-selectmode/rollback.sh --calls` (trenger root: fjerner sysexten, refresh, try-restart calls-daemon).
+- **Ikke testet ennå:** ekte utgående samtale over VoLTE med den nye Calls.
