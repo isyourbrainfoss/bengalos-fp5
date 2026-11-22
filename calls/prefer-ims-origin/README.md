@@ -1,69 +1,32 @@
-# gnome-calls: prefer an online oFono imsd origin
+# gnome-calls: prefer an online oFono `/imsd` origin
 
-gnome-calls 51.1 (Debian `51.1-1`, git `9469d4d`) has no setting that
-picks an online oFono origin named `imsd` ahead of ModemManager. This
-directory holds the patch and the arm64 sysext build. The patched tree
-used to produce the patch is `src/calls` in the origin-selectmode workdir.
+Shipped binary on BengalOS 0.26.1120.1:
 
-`0001-prefer-online-ofono-imsd-for-tel-dials.patch` applies with
-`patch -p1` on that 51.1 tree.
+- version string `51.1-9469d4d+`
+- commit `9469d4d29f25586443acca21b9318bdf5153f370`
+- not the Debian `51.1-1` orig (tag `v51.1`, `d3a2a224`)
 
-## Behaviour
+There is no gsettings key that prefers an online oFono origin over
+ModemManager. `0001-prefer-online-ofono-imsd-for-tel-dials.patch` is the
+change, against that commit.
 
-When default origins are on, a keypad or `tel:` number uses a usable
-oFono origin whose name or id is `imsd` or `/imsd`. If that origin is
-missing or offline, the first usable origin is used (ModemManager, when
-it is first).
+When default origins are on, a normal `tel:` or keypad number uses an
+online oFono origin named `imsd` (or id `imsd` / `/imsd`). If that origin
+is missing or offline, the first usable origin is used, which is
+ModemManager when it is present. An explicit origin, a USSD code,
+`112` / `911` / `999` / `000`, and any number an origin lists as
+emergency stay on the previous rule.
 
-These stay on the previous rule:
+oFono vanishing cleared the origin list and left `/imsd` in the modem
+hash. The next GetModems logged `Modem '/imsd' already exists` and the
+origin never returned. The patch drops the hash together with the list.
 
-- default origins off (the origin selected in the dialer)
-- a number an origin lists as emergency (the first origin that lists it)
-- a USSD code (`calls_number_is_ussd`)
+Build (desk only, arm64 Debian under qemu-user):
 
-oFono vanishing used to clear the origin list and leave the modem path
-in the hash. The next `GetModems` then logged `already exists` and
-`/imsd` never came back, so the journal had no `Adding origin imsd`
-after `/imsd` returned. Vanish now drops the proxies and the origins
-together. A path that is still in the hash but has no origin is added
-again. `Online=false` keeps the voice origin out of the list so a `tel:`
-dial falls back to ModemManager.
+    sh calls/prefer-ims-origin/build-docker.sh
 
-Schemas and the other plugins are the packaged files. The sysext
-replaces only:
+Host test, no GTK:
 
-- `/usr/bin/gnome-calls`
-- `/usr/lib/aarch64-linux-gnu/calls/plugins/provider/ofono/libofono.so`
-
-`libcalls` is a static library, so the picker is inside `gnome-calls`
-and the vanish/re-add helper is inside `libofono.so`.
-
-## Tests
-
-```
-sh calls/prefer-ims-origin/run-host-test.sh
-```
-
-Twelve tests, glib only. The same file is the meson `default-origin`
-test when gnome-calls is built with `-Dtests=true`.
-
-## Build
-
-Needs Docker and the 1120.1 reference tree (default
-`/home/kb/repos/grok_build/fp5/internal-install/cmp-20261121/usr`).
-Does not install anything and does not touch the phone.
-
-```
-sh calls/prefer-ims-origin/build-docker.sh
-```
-
-That runs `build-sysext.sh` in `debian:forky` with
-`--platform linux/arm64`. Output under `calls/prefer-ims-origin/out/`:
-
-- `fp5-gnome-calls_0.26.1120.1.raw` (and `.xz`)
-- `gnome-calls.readelf`, `libofono.readelf`, `symbols.txt` (NEEDED diff
-  against the 1120.1 binaries; a new NEEDED library fails the build)
-- `SHA256SUMS`
-
-`out/` is a build product. It is not committed. The phone bundle is
-`/home/kb/fp5-xfer-origin-selectmode`.
+    cc -Isrc -o test-default-origin tests/test-default-origin.c \
+      src/calls-default-origin.c $(pkg-config --cflags --libs glib-2.0 gio-2.0)
+    ./test-default-origin
