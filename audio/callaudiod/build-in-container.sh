@@ -46,12 +46,17 @@ ldd "$bin" | tee /out/ldd.txt || true
 mkdir -p /out
 cp -a "$bin" /out/callaudiod
 chmod 0755 /out/callaudiod
-# Smoke: the dynamic linker must accept the binary. A short run may exit
-# because there is no session bus; an exec-format error is a failure.
+# Smoke: the dynamic linker must accept the binary. callaudiod opens
+# PulseAudio before it handles --help, and this container has no daemon,
+# so the process aborts. That abort means the aarch64 code ran. An
+# exec-format error is a failure. Bash runs the ERR trap on SIGABRT
+# even when set +e, so the trap is off for this command.
+trap - ERR
 set +e
 timeout 3 /out/callaudiod --help > /out/smoke.txt 2>&1
 rc=$?
 set -e
+trap fail ERR
 echo "smoke rc=$rc" | tee -a /out/smoke.txt
 if grep -E -q 'Exec format error|cannot execute' /out/smoke.txt; then
   fail
