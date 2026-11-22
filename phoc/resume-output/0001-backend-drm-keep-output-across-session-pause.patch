@@ -1,0 +1,143 @@
+From: BengalOS <bengalos@localhost>
+Date: Sun, 22 Nov 2026 16:00:00 +0100
+Subject: [PATCH] backend/drm: keep the output across a seat pause
+
+logind pauses the DRM fd on system suspend, not only on a VT switch.
+wlroots 0.20 destroys every connected wlr_output at that point and the
+resume scan publishes a new one. On a phone the only connector is the
+panel: the shell loses its layer surfaces and exits, and clients that
+keep the old wl_output scale are composited soft.
+
+Leave the connector in place. Mark it so the next commit is a modeset,
+and on resume schedule a frame for outputs that are still enabled.
+Real hotplug is unchanged: scan_drm_connectors still runs.
+
+Upstream wlroots master still destroys the output in
+handle_session_active (checked 22 Nov 2026). There is no fix to
+backport.
+---
+diff --git a/backend/drm/backend.c b/backend/drm/backend.c
+index 5a545b1..a5bae3f 100644
+--- a/backend/drm/backend.c
++++ b/backend/drm/backend.c
+@@ -7,6 +7,7 @@
+ #include <wlr/backend/interface.h>
+ #include <wlr/backend/session.h>
+ #include <wlr/interfaces/wlr_output.h>
++#include <wlr/types/wlr_output.h>
+ #include <wlr/util/log.h>
+ #include <xf86drm.h>
+ #include "backend/drm/drm.h"
+@@ -112,18 +113,54 @@ static void handle_session_active(struct wl_listener *listener, void *data) {
+ 	wlr_log(WLR_INFO, "DRM FD %s", session->active ? "resumed" : "paused");
+ 
+ 	if (!session->active) {
+-		// Disconnect any active connectors so that the client will modeset and
+-		// rerender when the session is activated again.
++		/*
++		 * logind pauses the DRM fd on system suspend, not only on a VT
++		 * switch. Destroying the wlr_output here drops wl_output out
++		 * from under every client. On a phone that is the only panel:
++		 * the shell's layer surfaces are unbound and it exits, and
++		 * clients that keep the old scale are composited soft.
++		 * Leave the connector. The resume path modesets it again.
++		 */
+ 		struct wlr_drm_connector *conn;
+ 		wl_list_for_each(conn, &drm->connectors, link) {
+-			if (conn->status == DRM_MODE_CONNECTED) {
+-				wlr_output_destroy(&conn->output);
++			if (conn->status != DRM_MODE_CONNECTED) {
++				continue;
+ 			}
++			conn->resume_needs_modeset = true;
++			wlr_drm_conn_log(conn, WLR_INFO,
++				"Keeping output across session pause");
+ 		}
+ 		return;
+ 	}
+ 
+ 	scan_drm_connectors(drm, NULL);
++
++	struct wlr_drm_connector *conn;
++	wl_list_for_each(conn, &drm->connectors, link) {
++		if (!conn->resume_needs_modeset ||
++				conn->status != DRM_MODE_CONNECTED ||
++				!conn->output.enabled) {
++			continue;
++		}
++		/*
++		 * The mode blob is replaced by the resume modeset. Do not
++		 * destroy the previous one: master was revoked and it may
++		 * already be gone. Gamma and HDR blobs are left in place so
++		 * a still-valid lut is not cleared.
++		 */
++		if (conn->crtc != NULL) {
++			conn->crtc->own_mode_id = false;
++		}
++		/*
++		 * A page-flip submitted before the pause may never complete.
++		 * frame_pending would then stay set and schedule_frame would
++		 * not arm an idle repaint.
++		 */
++		conn->output.frame_pending = false;
++		wlr_drm_conn_log(conn, WLR_INFO,
++			"Re-modesetting existing output after session resume");
++		wlr_output_schedule_frame(&conn->output);
++	}
+ }
+ 
+ static void handle_dev_change(struct wl_listener *listener, void *data) {
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index bd29872..6d427c9 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -945,14 +945,21 @@ static bool drm_connector_commit_state(struct wlr_drm_connector *conn,
+ 	bool ok = false;
+ 	struct wlr_drm_connector_state pending = {0};
+ 	drm_connector_state_init(&pending, conn, state);
++	/*
++	 * After a seat pause the kernel may have dropped the mode. A page-flip
++	 * commit then fails, and the output would stay dark. Force one modeset.
++	 * A modeset is blocking, so a flip that was in flight across the pause
++	 * cannot return EBUSY from DRM_MODE_ATOMIC_NONBLOCK.
++	 */
++	bool modeset = state->allow_reconfiguration || conn->resume_needs_modeset;
+ 	struct wlr_drm_device_state pending_dev = {
+-		.modeset = state->allow_reconfiguration,
++		.modeset = modeset,
+ 		// The wlr_output API requires non-modeset commits with a new buffer to
+ 		// wait for the frame event. However compositors often perform
+ 		// non-modesets commits without a new buffer without waiting for the
+ 		// frame event. In that case we need to make the KMS commit blocking,
+ 		// otherwise the kernel will error out with EBUSY.
+-		.nonblock = !state->allow_reconfiguration &&
++		.nonblock = !modeset &&
+ 			(state->committed & WLR_OUTPUT_STATE_BUFFER),
+ 		.connectors = &pending,
+ 		.connectors_len = 1,
+@@ -1004,6 +1011,9 @@ static bool drm_connector_commit_state(struct wlr_drm_connector *conn,
+ 	}
+ 
+ 	ok = drm_commit(drm, &pending_dev, flags, test_only);
++	if (ok && !test_only) {
++		conn->resume_needs_modeset = false;
++	}
+ 
+ out:
+ 	drm_connector_state_finish(&pending);
+diff --git a/include/backend/drm/drm.h b/include/backend/drm/drm.h
+index a8c5e07..35ecc44 100644
+--- a/include/backend/drm/drm.h
++++ b/include/backend/drm/drm.h
+@@ -218,6 +218,11 @@ struct wlr_drm_connector {
+ 	// Last committed page-flip
+ 	struct wlr_drm_page_flip *pending_page_flip;
+ 
++	// Seat was paused (suspend or VT). The next real commit must modeset:
++	// the kernel may have dropped the mode while DRM master was revoked.
++	// The wlr_output itself stays, so clients keep their wl_output.
++	bool resume_needs_modeset;
++
+ 	// Atomic modesetting only
+ 	uint32_t colorspace;
+ 	uint32_t hdr_output_metadata;
