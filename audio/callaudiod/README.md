@@ -6,10 +6,13 @@ Activation: `/usr/share/dbus-1/services/org.mobian_project.CallAudio.service`
 (`Exec=/usr/bin/callaudiod`). There is no `callaudiod.service` unit.
 Upstream: https://gitlab.com/mobian1/callaudiod tag `0.1.99` (commit `8d262597`).
 
-This desk has no `aarch64-linux-gnu-gcc`. There is no patched binary here.
-Do not install `org.mobian_project.CallAudio.service` until
-`build-aarch64.sh` has produced an aarch64 `callaudiod`. The installable
-safety net is `fp5-callaudiod-watch`.
+This desk has no `aarch64-linux-gnu-gcc`. `build-aarch64.sh` is the
+cross-build and exits 2 here. `build-docker.sh` compiles tag `0.1.99`
+plus `0001-selectmode-always-completes.patch` in `debian:forky` under
+`docker run --platform linux/arm64` and writes `out/callaudiod`. That
+ELF is staged for the phone. It is not committed in this tree.
+Install `org.mobian_project.CallAudio.service` only together with that
+aarch64 binary. The installable safety net is `fp5-callaudiod-watch`.
 
 ## What wedged
 
@@ -63,6 +66,12 @@ voice profile (the FP5 does):
 
 `build-aarch64.sh` clones tag `0.1.99`, applies the patch, and cross-builds.
 It exits 2 when the cross compiler is missing.
+
+`build-docker.sh` is the build that works on this desk. It runs
+`build-in-container.sh` inside arm64 Debian, checks that `readelf -h`
+says AArch64, records NEEDED, and refuses an exec-format error. Output
+is `audio/callaudiod/out/callaudiod` plus `file.txt`, `readelf.txt`,
+`needed.txt`, and `SHA256SUMS`.
 
 A patched binary is installed as `/var/lib/fp5-oot/bin/callaudiod` and
 selected with a user D-Bus override

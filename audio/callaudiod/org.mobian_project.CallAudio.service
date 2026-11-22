@@ -2,8 +2,8 @@
 # Install to ~/.local/share/dbus-1/services/org.mobian_project.CallAudio.service
 # ONLY together with an aarch64 /var/lib/fp5-oot/bin/callaudiod.
 # The Debian package file /usr/share/dbus-1/services/... is left in place.
-# This desk build has no aarch64 binary, so the installer does not install
-# this file and does not pkill the packaged callaudiod.
+# build-docker.sh writes the ELF to out/callaudiod. The phone installer
+# copies that binary and this file, then pkills callaudiod once while idle.
 [D-BUS Service]
 Name=org.mobian_project.CallAudio
 Exec=/var/lib/fp5-oot/bin/callaudiod
