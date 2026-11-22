@@ -216,3 +216,10 @@ Desk nådde ikke telefonen (ikke på hjemme-Wi-Fi), så alt gikk lokalt på tele
 **Hvorfor:** Ringback-imsd (fix/ringback 057f4db, imsd c10bb5f) registrerte aldri IMS. Alle forsøkene endte med exit 3 og `TRANSACTION_OBSTACLE FileNotFoundError`, altså at den nye binæren eller installasjonen mangler en fil. Ringback-fiksen må undersøkes før et nytt forsøk.
 **Merknad:** Den første tilbakerullingen (root2.sh, 18:12) avbrøt med "oFono call state unknown" fordi samtalesjekken ikke virker under root. Samtalesjekken ble derfor gjort som fp5 (0 samtaler i MM og gnome-calls), og tilbakerullingen ble kjørt med FP5_SKIP_CALLCHECK=1. Dette er en kjent installer-feil.
 **pm_print_times:** er nå permanent via /etc/tmpfiles.d/fp5-pm-print-times.conf. Rollback: /var/lib/fp5-backup/20261122T165528-pm-print-times/rollback.sh.
+
+## 2026-11-22 22:14 — console_suspend=N (midlertidig test, DES-4 steg B)
+
+**Hva:** `/sys/module/printk/parameters/console_suspend` er satt fra Y til N som root over SSH. Det er bare en runtime-endring og forsvinner ved omstart. Resten er uendret: printk `4 4 1 8`, pm_debug_messages=0, pm_print_times=1.
+**Hvorfor:** Telefonen fortsetter å dø med varm PS_HOLD-reset når den våkner fra dvale på batteri. Ni dødsfall er registrert, det siste 22.11 etter 20:58 (forrige vekking var RTC-alarmen, ingen lader). Ifølge suspend-race-rapporten kan det at GENI-konsollen slås av under dvale være det som gjør oppvåkningen sårbar. Steg B tester dette alene: hvis rundt 30 dvaler på batteri går uten dødsfall, peker det mot konsollmotoren og ikke mot loggmengden. Tidligere funn: av fem dødsfall med data var laderen satt i ved tre.
+**Backup:** `/var/lib/fp5-backup/20261122T221416-console-suspend-N/` (før-verdier og rollback.sh).
+**Tilbake:** `run0 sh /var/lib/fp5-backup/20261122T221416-console-suspend-N/rollback.sh` (setter Y), eller ta en omstart.
