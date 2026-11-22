@@ -153,9 +153,9 @@ Built from gnome-calls commit 9469d4d29f25586443acca21b9318bdf5153f370
 For a keypad or tel: number, when default origins are on, an online
 oFono origin named imsd is preferred over ModemManager. If that origin
 is missing or offline, ModemManager is used. An explicit origin
-(default origins off), a USSD code, 112/911/999/000, and a number an
-origin lists as emergency stay on the first usable origin. Schemas and
-the other plugins are the packaged files.
+(default origins off) and a USSD code stay on the first usable origin.
+A number an origin lists as emergency stays on the first origin that
+lists it. Schemas and the other plugins are the packaged files.
 R
 printf 'ID=bengalos\nVERSION_ID=%s\nARCHITECTURE=arm64\nSYSEXT_SCOPE=system\n' "$V" \
   > /tmp/sx/usr/lib/extension-release.d/extension-release.fp5-gnome-calls_$V

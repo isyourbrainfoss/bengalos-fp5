@@ -13,9 +13,9 @@ change, against that commit.
 When default origins are on, a normal `tel:` or keypad number uses an
 online oFono origin named `imsd` (or id `imsd` / `/imsd`). If that origin
 is missing or offline, the first usable origin is used, which is
-ModemManager when it is present. An explicit origin, a USSD code,
-`112` / `911` / `999` / `000`, and any number an origin lists as
-emergency stay on the previous rule.
+ModemManager when it is present. An explicit origin and a USSD code
+stay on the first usable origin. A number an origin lists as emergency
+stays on the first origin that lists it.
 
 oFono vanishing cleared the origin list and left `/imsd` in the modem
 hash. The next GetModems logged `Modem '/imsd' already exists` and the
