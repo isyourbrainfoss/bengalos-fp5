@@ -178,3 +178,11 @@ Full historikk: FP5-siden «BengalOS på Fairphone 5: bugs og endringer».
 - **Backup:** `/var/lib/fp5-backup/20261122T145245-origin-selectmode-calls/`.
 - **Tilbake:** `sh /home/fp5/fp5-xfer-origin-selectmode/rollback.sh --calls` (trenger root: fjerner sysexten, refresh, try-restart calls-daemon).
 - **Ikke testet ennå:** ekte utgående samtale over VoLTE med den nye Calls.
+
+## 2026-11-22 16:45 — Tre Grok Build-resultater (ingenting installert)
+
+**Phosh dør ved oppvåkning, apper blir uskarpe** (jobb 20261122-153957-217354): wlroots 0.20 `handle_session_active` ødelegger alle outputs når logind pauser DRM. Ved resume lages en ny DSI-1, Phosh avslutter, og klienter med gammel `wl_output` blir uskarpe. Upstream master e3a06b6 gjør det samme, så det finnes ingen backport. Patch: behold output ved pause og modeset samme output ved resume. Branch `fix/phoc-resume-output` 7ed7b58 (pushet, ikke merget). Sysext `fp5-phoc_0.26.1120.1.raw` staget i desk:/home/kb/fp5-xfer-phoc-resume (sha256 bad7ff5c…). Installasjonen restarter ingenting, og ny phoc tas i bruk ved neste innlogging eller omstart. Ikke testet på telefonen. Bør sendes upstream til wlroots.
+
+**Avslåing i dvale** (jobb 20261122-162542-295379, kun lesing): 7 dødsfall siden 16. nov, alle PS_HOLD/warm reset under s2idle-resume. Ingen undervoltage, PMIC-watchdog eller oops. Bare på batteri, ca. 8 % av dvalene, sammenfallende med en vekking (ipa, lader, av/på-knapp). Med all debug-logging på (21.11 22:28–22.11 16:2x) døde den ikke. Sannsynligvis skjuler `console_suspend=N` + printk 8 et kappløp, siden UART holdes klokket og resume strekkes. Tastaturtapet kom av samme trege resume (Phosh/squeekboard dør). Forslag: én bryter om gangen, først bare `pm_print_times=1` i ca. 30 batteridvaler, så `console_suspend=N` alene, så høy printk med konsollen suspendert. Ikke slått på.
+
+**Summetone** (jobb 20261122-150008-182949, lav prioritet): imsd starter RTP først ved 200 OK, og gnome-calls spiller bare tone for SIP-origin. Fiks: imsd spiller early media når nettet tilbyr det, ellers lokal 425 Hz (1 s på, 4 s av). Branch `fix/ringback` 057f4db (pushet, ikke merget, imsd c10bb5f lokalt). Staget i desk:/home/kb/fp5-xfer-ringback. Installasjonen restarter fp5-ims (IMS registrerer på nytt).
