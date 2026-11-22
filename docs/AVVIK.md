@@ -186,3 +186,26 @@ Full historikk: FP5-siden «BengalOS på Fairphone 5: bugs og endringer».
 **Avslåing i dvale** (jobb 20261122-162542-295379, kun lesing): 7 dødsfall siden 16. nov, alle PS_HOLD/warm reset under s2idle-resume. Ingen undervoltage, PMIC-watchdog eller oops. Bare på batteri, ca. 8 % av dvalene, sammenfallende med en vekking (ipa, lader, av/på-knapp). Med all debug-logging på (21.11 22:28–22.11 16:2x) døde den ikke. Sannsynligvis skjuler `console_suspend=N` + printk 8 et kappløp, siden UART holdes klokket og resume strekkes. Tastaturtapet kom av samme trege resume (Phosh/squeekboard dør). Forslag: én bryter om gangen, først bare `pm_print_times=1` i ca. 30 batteridvaler, så `console_suspend=N` alene, så høy printk med konsollen suspendert. Ikke slått på.
 
 **Summetone** (jobb 20261122-150008-182949, lav prioritet): imsd starter RTP først ved 200 OK, og gnome-calls spiller bare tone for SIP-origin. Fiks: imsd spiller early media når nettet tilbyr det, ellers lokal 425 Hz (1 s på, 4 s av). Branch `fix/ringback` 057f4db (pushet, ikke merget, imsd c10bb5f lokalt). Staget i desk:/home/kb/fp5-xfer-ringback. Installasjonen restarter fp5-ims (IMS registrerer på nytt).
+
+## 2026-11-22 16:55 — Tre steg installert (t947u: «gjør alle tre stegene du foreslo»)
+
+Desk nådde ikke telefonen (ikke på hjemme-Wi-Fi), så alt gikk lokalt på telefonen som fp5 med én run0 (godkjent på skjermen, t949u «nå»). Filene ble kopiert fra desk til /home/fp5/fp5-xfer-phoc-resume og /home/fp5/fp5-xfer-ringback, og sha256 ble sjekket. Logg: `/var/lib/fp5-backup/20261122-three-steps.log`.
+
+**1. Phoc resume-fiks (DES-9).**
+- **Hva:** Sysext `fp5-phoc_0.26.1120.1.raw` (sha256 bad7ff5c…) ligger nå i /var/lib/extensions. `systemd-sysext refresh` er kjørt, men phoc, greetd og Phosh ble ikke startet på nytt. Sammenslått /usr/bin/phoc har sha256 658d… og stemmer med phoc i imaget (før: 641c6a8f…). Kjørende phoc er fortsatt den gamle til neste innlogging eller omstart.
+- **Hvorfor:** Phosh dør og apper blir uskarpe etter oppvåkning.
+- **Backup:** `/var/lib/fp5-backup/20261122T165528-phoc-resume/`. Ingenting ble erstattet. Mappen har manifest, phoc-hash før og sysext-status før.
+- **Tilbake:** `run0 sh /var/lib/fp5-backup/20261122T165528-phoc-resume/rollback.sh` fjerner imaget og kjører refresh. Ingenting restartes.
+
+**2. Dvalelogging (DES-4).**
+- **Hva:** Bare `/sys/power/pm_print_times=1` er slått på. pm_debug_messages=0, pm_test=none, printk.console_suspend=Y og printk «4 4 1 8» er uendret. For at det skal overleve omstart skal `/etc/tmpfiles.d/fp5-pm-print-times.conf` inneholde `w /sys/power/pm_print_times - - - - 1`. Men /etc/tmpfiles.d fantes ikke, så fila ble ikke laget. Verdien ble satt direkte og gjelder bare til omstart. Det andre run0-forsøket, som skulle lage mappa, fikk tidsavbrudd i passordspørsmålet (se under).
+- **Hvorfor:** Første bryter i planen med én bryter om gangen, ca. 30 batteridvaler.
+- **Backup:** `/var/lib/fp5-backup/20261122T165528-pm-print-times/` (before.txt).
+- **Tilbake:** `echo 0 > /sys/power/pm_print_times` som root. Har fila blitt laget, må den også fjernes.
+
+**3. Summetone-fiks (DES-7). Feilet, IMS er ikke registrert.**
+- **Hva:** /opt/fp5-imsd/bin/imsd ble byttet fra f7dd7c9b… til 93f77606… (imsd fix/ringback c10bb5f), og fp5-ims.service ble startet på nytt. Først ble det sjekket at ingen samtale var aktiv. Etterpå er fp5-ims aktiv, men alle tre IMS-transaksjonene (16:55:37, 16:55:56 og 16:56:59) endte med exit_code=3, ims-bearer=absent. grant-wake melder «IMS not registered». Manageren venter nå på ny kvote, ca. 30 min fra 16:55. Verifiseringen i skriptet godtok feilaktig en «poll … imsd_registered=yes»-linje. Den linja kom fra gammel status.json.
+- **Hvorfor:** Lokal 425 Hz-summetone eller early media ved utgående VoLTE.
+- **Backup:** `/var/lib/fp5-backup/20261122T165528-ringback/`. Mappen har imsd (gammel) og imsd.sha256, og root-install.sh, rollback.sh og idle.py er kopiert dit.
+- **Tilbake (trengs nå):** `run0 sh /var/lib/fp5-backup/20261122T165528-ringback/root-install.sh --rollback /var/lib/fp5-backup/20261122T165528-ringback`. Kommandoen sjekker sha256, sjekker at telefonen er ledig, legger tilbake gammel imsd og restarter fp5-ims. Ferdig skript som også viser TRANSACTION_OBSTACLE og lager tmpfiles-fila: `run0 sh /home/fp5/fp5-1122-root2.sh`. Begge run0-forsøkene 16:57 og 16:58 fikk «Connection timed out» i polkit-spørsmålet, så ingenting ble endret. Rollback er IKKE gjort ennå.
+- imsd fix/ringback c10bb5f er ikke pushet. Det finnes ikke noe imsd-repo under isyourbrainfoss, bare upstream-remoten forgejo.catcrafts.net. bengalos-fp5 fix/ringback 057f4db og fix/phoc-resume-output 7ed7b58 er pushet fra før.
