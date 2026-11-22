@@ -1,5 +1,5 @@
 #!/bin/sh
-# The 12 default-origin tests. gcc and glib/gio only.
+# The default-origin tests. gcc and glib/gio only.
 # The meson entry is tests/meson.build ('default-origin'); this desk has
 # no meson, and the aarch64 sysext build uses -Dtests=false.
 set -eu
