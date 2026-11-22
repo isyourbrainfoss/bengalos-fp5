@@ -1,0 +1,600 @@
+From c10bb5f39f44c6041552d86f10da568d4ffe1d1f Mon Sep 17 00:00:00 2001
+From: isyourbrainfoss <isyourbrainfoss@proton.me>
+Date: Sun, 22 Nov 2026 15:30:52 +0100
+Subject: [PATCH] imsd: play early media, and local ringback when alerting has
+ none
+
+A 1xx only moved the call to ringing. Nothing opened RTP or played a
+tone before 200 OK, so an outgoing VoLTE call was silent while the
+other party was alerted.
+
+Play a downlink-only media leg when this 1xx carries an audio answer
+and backward early media is allowed (P-Early-Media sendrecv or
+sendonly, else a non-precondition SDP). Otherwise play a local 425 Hz
+tone, 1s on and 4s off, and stop it on answer or hangup. If that early
+leg ends before the answer, fall back to the tone.
+---
+ implementations/main.cpp    | 130 +++++++++++++++++++++++++++++++++-
+ interfaces/Imsd-Engine.cppm | 135 +++++++++++++++++++++++++++++++++++-
+ tests/Engine/main.cpp       | 120 +++++++++++++++++++++++++++++++-
+ 3 files changed, 378 insertions(+), 7 deletions(-)
+
+diff --git a/implementations/main.cpp b/implementations/main.cpp
+index 6410719..67a38c4 100644
+--- a/implementations/main.cpp
++++ b/implementations/main.cpp
+@@ -10,7 +10,10 @@ Owns net.catcrafts.IMS1 on the system bus with the project's frozen D-Bus ABI
+ + IPsec sec-agree, fresh or warm-resume, with a keepalive re-REGISTER refresh),
+ run outgoing and incoming calls through the Imsd:Engine call machine (inbound
+ INVITEs on the protected-port listeners become ringing calls a dialer answers
+-via Accept), and spawn one imsd-media data-plane process per answered call.
++via Accept), and spawn one imsd-media data-plane process per call that has media
++(downlink-only before the answer when the network sends early media,
++full duplex on 200 OK). Alerting with no early media plays a local
++425 Hz ringback until the call is answered or cleared.
+ GLib/GDBus lives only here and in ImsdBus (the polkit gate in front of call
+ control, shared with imsd-ofonod) — the integration daemons imsd-dialerd and
+ imsd-ofonod carry their own; every message, digest, SA command, and
+@@ -1121,6 +1124,7 @@ public:
+             MaybeResubscribe();
+             if (!call_ && sip_.Alive() && Mono() - lastKa_ > 30) { sip_.SendKeepalive(); lastKa_ = Mono(); }
+             ReapMedia();
++            ReapRingback();
+             if (call_ && call_->State() != imsd::engine::CallState::Active && Mono() > deadline_) {
+                 Execute(call_->OnDeadline());
+                 MaybeDropCall();
+@@ -1253,6 +1257,7 @@ private:
+     bool closeFlowWhenIdle_ = false;   // a binding was terminated under a call: its flow closes with the call
+     pid_t mediaPid_ = -1;
+     int mediaCtl_ = -1;       // our end of the leg's control pipe (its stdin)
++    pid_t ringbackPid_ = -1;  // local alerting tone, process-group leader
+     double deadline_ = 0;
+     // reply_ answers the inbound request being dispatched right now;
+     // callReply_ is the call's durable response channel — refreshed from
+@@ -2524,6 +2529,8 @@ private:
+                     break;
+                 case T::StartMedia: StartMedia(a.media); break;
+                 case T::StopMedia: StopMedia(); break;
++                case T::StartRingback: StartRingback(); break;
++                case T::StopRingback: StopRingback(); break;
+                 case T::SendDtmf: SendDtmfToMedia(a.text); break;
+                 case T::State:
+                     if (announce) PostState(call_->Uni(), a.state, a.reason);
+@@ -2551,6 +2558,10 @@ private:
+ 
+     void StartMedia(const imsd::engine::MediaLeg& leg) {
+         if (!leg.Valid()) { Log("SDP answer missing media endpoint; no media leg"); return; }
++        // The answered call replaces a downlink-only early leg, and either
++        // one replaces the local tone.
++        StopRingback();
++        if (mediaPid_ > 0) StopMedia();
+         Log(std::format("media {} pt={} octet={} -> [{}]:{}, telephone-event pt {}{}", leg.codec, leg.payloadType, leg.octetAlign, leg.remoteIp, leg.remotePort,
+                         leg.dtmfPt ? std::to_string(*leg.dtmfPt) : std::string("none"),
+                         leg.dtmfRxPt && leg.dtmfRxPt != leg.dtmfPt ? std::format(" (theirs {})", *leg.dtmfRxPt) : std::string()));
+@@ -2587,7 +2598,12 @@ private:
+                 // missing variable as a caller older than 0.3.10
+                 setenv("AUDIO_USER", session.name.c_str(), 1);
+             }
+-            setenv("MIC", EnvOr("MIC", "1").c_str(), 1);
++            // Early media is downlink only (TS 24.229: do not send until the
++            // call is answered, unless the network authorized forward media,
++            // which this leg does not). "0" is off: imsd-media treats only
++            // "1" as true. No logging here: this is the forked child.
++            std::string mic = leg.uplink ? EnvOr("MIC", "1") : std::string("0");
++            setenv("MIC", mic.c_str(), 1);
+             setenv("PLAY", EnvOr("PLAY", "1").c_str(), 1);
+             // FP5 ALSA capture clips at the upstream default of 10. Gain 1 is
+             // unity. MIC_BACKEND=pw and GAIN=10 in the environment put the
+@@ -2635,6 +2651,109 @@ private:
+         mediaCtl_ = -1;
+     }
+ 
++    // Local ringback into the same PipeWire session imsd-media plays to.
++    // One process group: the writer and pw-play. SIGTERM to the group
++    // stops both. 20 ms frames at 8 kHz, paced, so the pipe does not
++    // fill ahead of the earpiece.
++    void StartRingback() {
++        if (ringbackPid_ > 0) return;
++        AudioSession session;
++        if (geteuid() == 0) session = ResolveAudioSession();
++        // Built before the fork. The writer never execs, so it must not
++        // allocate, and the play child only execs this argv.
++        std::vector<std::string> argv;
++        if (geteuid() == 0 && !session.name.empty()) {
++            argv = {"sudo", "-u", session.name, "env",
++                    std::format("XDG_RUNTIME_DIR=/run/user/{}", session.uid)};
++        }
++        for (const char* a : {"pw-play", "--raw", "--rate", "8000", "--channels", "1", "--format", "s16", "--latency", "40ms", "-"})
++            argv.emplace_back(a);
++        int fds[2];
++        if (pipe(fds) != 0) {
++            Log(std::format("local ringback: pipe: {}", std::strerror(errno)));
++            return;
++        }
++        pid_t pid = fork();
++        if (pid < 0) {
++            close(fds[0]);
++            close(fds[1]);
++            Log(std::format("local ringback: fork: {}", std::strerror(errno)));
++            return;
++        }
++        if (pid == 0) {
++            // The engine thread's parent has GLib's SIGTERM handler. This
++            // process does not exec, so put the defaults back or the tone
++            // survives the first stop and only SIGKILL ends it.
++            signal(SIGTERM, SIG_DFL);
++            signal(SIGINT, SIG_DFL);
++            signal(SIGHUP, SIG_DFL);
++            signal(SIGPIPE, SIG_IGN);
++            sigset_t empty;
++            sigemptyset(&empty);
++            sigprocmask(SIG_SETMASK, &empty, nullptr);
++            setpgid(0, 0);
++            pid_t play = fork();
++            if (play == 0) {
++                dup2(fds[0], STDIN_FILENO);
++                close(fds[0]);
++                close(fds[1]);
++                std::vector<char*> cargv;
++                for (auto& s : argv) cargv.push_back(const_cast<char*>(s.c_str()));
++                cargv.push_back(nullptr);
++                execvp(cargv[0], cargv.data());
++                _exit(127);
++            }
++            close(fds[0]);
++            if (play < 0) _exit(127);
++            std::uint64_t n = 0;
++            std::int16_t frame[160];
++            auto next = std::chrono::steady_clock::now();
++            for (;;) {
++                for (int i = 0; i < 160; i++)
++                    frame[i] = imsd::engine::RingbackSample(n++);
++                const char* p = reinterpret_cast<const char*>(frame);
++                std::size_t off = 0;
++                while (off < sizeof frame) {
++                    ssize_t w = write(fds[1], p + off, sizeof frame - off);
++                    if (w < 0 && errno == EINTR) continue;
++                    if (w <= 0) _exit(0);
++                    off += static_cast<std::size_t>(w);
++                }
++                next += std::chrono::milliseconds(20);
++                std::this_thread::sleep_until(next);
++            }
++        }
++        setpgid(pid, pid);
++        close(fds[0]);
++        close(fds[1]);
++        ringbackPid_ = pid;
++        Log("local ringback: 425 Hz, 1s on, 4s off");
++    }
++
++    void StopRingback() {
++        if (ringbackPid_ <= 0) return;
++        kill(-ringbackPid_, SIGTERM);
++        kill(ringbackPid_, SIGTERM);
++        for (int i = 0; i < 50; i++) {
++            if (waitpid(ringbackPid_, nullptr, WNOHANG) != 0) { ringbackPid_ = -1; return; }
++            usleep(20000);
++        }
++        kill(-ringbackPid_, SIGKILL);
++        kill(ringbackPid_, SIGKILL);
++        waitpid(ringbackPid_, nullptr, 0);
++        ringbackPid_ = -1;
++    }
++
++    void ReapRingback() {
++        if (ringbackPid_ <= 0) return;
++        int status = 0;
++        pid_t r = waitpid(ringbackPid_, &status, WNOHANG);
++        if (r == 0) return;
++        kill(-ringbackPid_, SIGTERM);
++        ringbackPid_ = -1;
++        Log("local ringback ended");
++    }
++
+     void StopMedia() {
+         CloseMediaCtl();
+         if (mediaPid_ <= 0) return;
+@@ -2650,13 +2769,18 @@ private:
+ 
+     void ReapMedia() {
+         if (!call_ || mediaPid_ <= 0) return;
+-        if (call_->State() != imsd::engine::CallState::Active) return;
+         int status = 0;
+         pid_t r = waitpid(mediaPid_, &status, WNOHANG);
+         if (r == 0) return;  // still running
+         int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+         mediaPid_ = -1;  // reaped; don't re-terminate
+         CloseMediaCtl();
++        // An early-media leg can exit before the answer (no RTP yet).
++        // The engine falls back to local ringback and does not BYE.
++        if (call_->State() != imsd::engine::CallState::Active) {
++            Execute(call_->OnMediaExit(code));
++            return;
++        }
+         Execute(call_->OnMediaExit(code));
+         MaybeDropCall();
+     }
+diff --git a/interfaces/Imsd-Engine.cppm b/interfaces/Imsd-Engine.cppm
+index 7c1d4ce..a932b7f 100644
+--- a/interfaces/Imsd-Engine.cppm
++++ b/interfaces/Imsd-Engine.cppm
+@@ -13,7 +13,8 @@ responses, an in-dialog request from the network, an accept/hang-up command,
+ the media leg exiting, a setup timeout) is a method that mutates the dialog
+ state and returns a list of Actions for the daemon shell to carry out — send
+ this on the client flow, answer the request on the channel it came in on,
+-start/stop the media leg, emit this D-Bus state change, arm this deadline.
++start/stop the media leg (including downlink-only early media), start/stop
++local ringback, emit this D-Bus state change, arm this deadline.
+ That keeps the whole call FSM — PRACK on reliable 18x, ACK of 2xx vs non-2xx
+ finals, CANCEL/answer races, remote BYE, media-plane far-end-hangup, the
+ emergency attempt chain (urn:service:sos first for a classified number, one
+@@ -300,6 +301,9 @@ export namespace imsd::engine {
+         std::string codec = "AMR-WB";
+         std::optional<int> dtmfPt;
+         std::optional<int> dtmfRxPt;
++        // false: play the far end and do not send (early media, before 200).
++        // true: both directions, the answered call.
++        bool uplink = true;
+         bool Valid() const { return !remoteIp.empty() && remotePort > 0 && payloadType >= 0; }
+     };
+ 
+@@ -309,6 +313,8 @@ export namespace imsd::engine {
+             SendResponse,  // answer the just-handled inbound request on its origin channel
+             StartMedia,    // bring up the media leg described by `media`
+             StopMedia,     // tear the media leg down
++            StartRingback, // local alerting tone; no network media to play
++            StopRingback,  // stop that tone (early media, answer, or hangup)
+             SendDtmf,      // hand `text` (the tones) to the running media leg
+             State,         // emit CallStateChanged(uni, `state`, `reason`)
+             Deleted,       // emit CallDeleted(uni); drop this machine
+@@ -328,6 +334,29 @@ export namespace imsd::engine {
+     // within one atomic pipe write, POSIX's 512-byte PIPE_BUF floor.
+     inline constexpr std::size_t DtmfMaxTones = 128;
+ 
++    // Local ringback when the network is alerting and is not sending media.
++    // Norway / ETSI: 425 Hz, 1 s on, 4 s off. A short fade keeps the burst
++    // from clicking into the silence. The shell writes these samples to the
++    // earpiece; the engine only decides when.
++    inline constexpr int RingbackRate = 8000;
++    inline constexpr int RingbackHz = 425;
++    inline constexpr int RingbackOnSamples = RingbackRate;
++    inline constexpr int RingbackPeriodSamples = RingbackRate * 5;
++    inline constexpr int RingbackFade = 40;
++    inline constexpr int RingbackAmplitude = 8000;
++
++    inline std::int16_t RingbackSample(std::uint64_t n) {
++        const std::uint64_t pos = n % static_cast<std::uint64_t>(RingbackPeriodSamples);
++        if (pos >= static_cast<std::uint64_t>(RingbackOnSamples)) return 0;
++        double env = 1.0;
++        if (pos < static_cast<std::uint64_t>(RingbackFade))
++            env = static_cast<double>(pos) / static_cast<double>(RingbackFade);
++        else if (pos + static_cast<std::uint64_t>(RingbackFade) >= static_cast<std::uint64_t>(RingbackOnSamples))
++            env = static_cast<double>(RingbackOnSamples - 1 - pos) / static_cast<double>(RingbackFade);
++        const double x = std::sin(2.0 * std::numbers::pi * static_cast<double>(RingbackHz) * static_cast<double>(n) / static_cast<double>(RingbackRate));
++        return static_cast<std::int16_t>(std::lround(env * x * static_cast<double>(RingbackAmplitude)));
++    }
++
+     // ring/answer budget, and how long to wait for a 487 after CANCEL — the
+     // imsd.py INVITE_TIMEOUT / CANCEL_487_TIMEOUT constants.
+     inline constexpr double InviteTimeout = 90.0;
+@@ -497,6 +526,33 @@ export namespace imsd::engine {
+                     a.push_back(Send(imsd::msg::BuildInDialog(ctx_, d_, "PRACK", nextCseq_, rng_.Token(20), extra)));
+                     nextCseq_++;
+                 }
++                // 3GPP TS 24.229 / RFC 5009: play backward early media when
++                // the network offers it; otherwise the UE generates the
++                // local ringback. P-Early-Media sendrecv or sendonly (the
++                // network's direction) authorizes that. With no header, a
++                // usable SDP answer is the offer — except a precondition
++                // 183, which is the QoS answer, not the ring.
++                if (Body(msg).contains("m=audio") && BackwardEarly(code, msg)) {
++                    MediaLeg leg = ParseAnswer();
++                    if (leg.Valid()) {
++                        if (!earlyMedia_) {
++                            if (ringback_) {
++                                ringback_ = false;
++                                a.push_back(Action{Action::Type::StopRingback});
++                            }
++                            earlyMedia_ = true;
++                            leg.uplink = false;
++                            a.push_back(LogAct("early media: downlink only, before answer"));
++                            a.push_back(StartMediaAct(leg));
++                        }
++                        return a;
++                    }
++                }
++                if (!ringback_ && !earlyMedia_) {
++                    ringback_ = true;
++                    a.push_back(LogAct("local ringback: alerting without early media"));
++                    a.push_back(Action{Action::Type::StartRingback});
++                }
+                 return a;
+             }
+             if (code < 200)
+@@ -518,7 +574,11 @@ export namespace imsd::engine {
+                 // wanted — the user never hung up. Matters most when the sos
+                 // attempt is answered at the wire just as the timeout fires:
+                 // BYEing an answering PSAP is the worst possible outcome.
++                // Ringback and a downlink-only early leg stop here. The
++                // shell replaces the early leg with a full-duplex one.
++                Append(a, StopAlertAudio());
+                 MediaLeg leg = ParseAnswer();
++                leg.uplink = true;
+                 a.push_back(StartMediaAct(leg));
+                 state_ = CallState::Active;
+                 a.push_back(StateAct("accepted"));
+@@ -617,8 +677,10 @@ export namespace imsd::engine {
+                 Append(a, Finish("local-hangup", "HangUp; BYE sent"));
+             } else if (state_ == CallState::Dialing || state_ == CallState::Ringing) {
+                 // even when a deadline already CANCELled: the user's intent
+-                // also kills the emergency fallback chain
++                // also kills the emergency fallback chain. The tone stops
++                // with the hangup, not when the 487 arrives.
+                 userCancelled_ = true;
++                Append(a, StopAlertAudio());
+                 if (!cancelled_) {
+                     a.push_back(Send(imsd::msg::BuildCancel(ctx_, d_)));
+                     cancelled_ = true;
+@@ -680,7 +742,20 @@ export namespace imsd::engine {
+         // call was up we release it network-side and tear down.
+         std::vector<Action> OnMediaExit(int code) {
+             std::vector<Action> a;
+-            if (state_ != CallState::Active) return a;
++            if (state_ != CallState::Active) {
++                // The downlink-only leg died before the answer (no RTP, or
++                // it crashed). That is not a hangup. Fall back to the local
++                // tone so alerting is not silent.
++                if (earlyMedia_ && (state_ == CallState::Ringing || state_ == CallState::Dialing)) {
++                    earlyMedia_ = false;
++                    if (!ringback_) {
++                        ringback_ = true;
++                        a.push_back(LogAct("early media ended before answer; local ringback"));
++                        a.push_back(Action{Action::Type::StartRingback});
++                    }
++                }
++                return a;
++            }
+             nextCseq_++;
+             a.push_back(Send(imsd::msg::BuildInDialog(ctx_, d_, "BYE", nextCseq_, rng_.Token(20))));
+             Append(a, Finish("remote-hangup", code == 3 ? "far-end hangup (downlink RTP stopped); BYE sent" : std::format("media leg died (code {}); BYE sent", code)));
+@@ -701,6 +776,7 @@ export namespace imsd::engine {
+                 return a;
+             }
+             if (!cancelled_ && (state_ == CallState::Dialing || state_ == CallState::Ringing)) {
++                Append(a, StopAlertAudio());
+                 a.push_back(Send(imsd::msg::BuildCancel(ctx_, d_)));
+                 cancelled_ = true;
+                 a.push_back(Deadline(Cancel487Timeout));
+@@ -747,6 +823,8 @@ export namespace imsd::engine {
+         std::set<std::string> pracked_;
+         std::string answerSdp_;
+         std::optional<int> dtmfPt_;    // the running leg's telephone-event pt, set at media start
++        bool ringback_ = false;        // local tone is running
++        bool earlyMedia_ = false;      // downlink-only leg is running, before 200
+ 
+         // Fresh dialog identity for the current attempt. A fallback INVITE
+         // after a final response is a new transaction AND a clean new dialog
+@@ -793,6 +871,7 @@ export namespace imsd::engine {
+             ResetDialog();
+             state_ = CallState::Dialing;
+             std::vector<Action> a;
++            Append(a, StopAlertAudio());
+             a.push_back(LogAct(std::format("call {}: {} — retrying as {}", uni_, why, sos ? "emergency (urn:service:sos)" : "plain INVITE of the digits")));
+             a.push_back(StateAct("outgoing"));
+             Append(a, Start());
+@@ -831,6 +910,55 @@ export namespace imsd::engine {
+             if (body.contains("m=audio")) answerSdp_ = std::string(body);
+         }
+ 
++        // Whole-word match, ASCII case-insensitive. "sendrecv" does not
++        // count as "sendonly".
++        static bool PemToken(std::string_view value, std::string_view token) {
++            auto lower = [](char c) {
++                return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
++            };
++            auto alpha = [](char c) {
++                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
++            };
++            std::size_t at = 0;
++            while (at + token.size() <= value.size()) {
++                bool match = true;
++                for (std::size_t i = 0; i < token.size(); i++) {
++                    if (lower(value[at + i]) != lower(token[i])) { match = false; break; }
++                }
++                const bool left = at == 0 || !alpha(value[at - 1]);
++                const bool right = at + token.size() == value.size() || !alpha(value[at + token.size()]);
++                if (match && left && right) return true;
++                at++;
++            }
++            return false;
++        }
++
++        // True when this 1xx offers backward early media the UE should
++        // render instead of a local tone. P-Early-Media wins when present
++        // (RFC 5009: sendrecv/sendonly from the network). Absent, any
++        // usable SDP is the offer, except a precondition 183.
++        bool BackwardEarly(int code, std::string_view msg) const {
++            if (auto pem = imsd::sip::Header(msg, "P-Early-Media"))
++                return PemToken(*pem, "sendrecv") || PemToken(*pem, "sendonly");
++            if (precond_ && code != 180) return false;
++            return true;
++        }
++
++        // Drop the local tone and a downlink-only early leg. A full-duplex
++        // leg (the answered call) is not marked early and is left to Finish.
++        std::vector<Action> StopAlertAudio() {
++            std::vector<Action> a;
++            if (ringback_) {
++                ringback_ = false;
++                a.push_back(Action{Action::Type::StopRingback});
++            }
++            if (earlyMedia_) {
++                earlyMedia_ = false;
++                a.push_back(Action{Action::Type::StopMedia});
++            }
++            return a;
++        }
++
+         MediaLeg ParseAnswer() const {
+             imsd::sdp::Answer ans = imsd::sdp::ParseAnswer(answerSdp_, codecs_);
+             MediaLeg leg;
+@@ -861,6 +989,7 @@ export namespace imsd::engine {
+             std::vector<Action> a;
+             a.push_back(LogAct(detail.empty() ? std::format("call {} ended: {}", uni_, reason) : std::format("call {} ended: {} — {}", uni_, reason, detail)));
+             a.push_back(StateAct(reason));
++            Append(a, StopAlertAudio());
+             a.push_back(Action{Action::Type::StopMedia});
+             a.push_back(Action{Action::Type::Deleted});
+             return a;
+diff --git a/tests/Engine/main.cpp b/tests/Engine/main.cpp
+index 75e1555..167a224 100644
+--- a/tests/Engine/main.cpp
++++ b/tests/Engine/main.cpp
+@@ -209,10 +209,16 @@ int main() {
+         // PRACK targets the remote Contact and routes via the Record-Route
+         Check(prack && prack->text.starts_with("PRACK sip:termgw@[2001:db8::9]:5060 SIP/2.0"), "PRACK targets remote Contact");
+         Check(prack && prack->text.contains("Route: <sip:[2001:db8::105]:6000;lr>\r\n"), "PRACK routes via reversed Record-Route");
++        // 183 carries an SDP answer and no P-Early-Media: that is early
++        // media, downlink only, and not a local tone.
++        const Action* early = Find(a183, Action::Type::StartMedia);
++        Check(early && early->media.Valid() && !early->media.uplink, "183 with SDP and no P-Early-Media starts downlink-only early media");
++        Check(!Has(a183, Action::Type::StartRingback), "183 with SDP does not start local ringback");
+ 
+-        // a second identical 183 must NOT re-PRACK the same RSeq
++        // a second identical 183 must NOT re-PRACK the same RSeq or open a second leg
+         auto a183b = m.OnInviteResponse(R183(m.CallId()));
+         Check(Sent(a183b, "PRACK ") == nullptr, "duplicate RSeq not re-PRACKed");
++        Check(!Has(a183b, Action::Type::StartMedia), "duplicate 183 does not start a second leg");
+ 
+         // 200 OK: ACK + StartMedia + active
+         auto a200 = m.OnInviteResponse(R200(m.CallId()));
+@@ -227,6 +233,8 @@ int main() {
+         Check(media && media->media.remotePort == 6004, "media remote port");
+         Check(media && media->media.payloadType == 97, "media pt");
+         Check(media && media->media.codec == "AMR-WB", "media codec");
++        Check(media && media->media.uplink, "200 starts the uplink");
++        Check(Has(a200, Action::Type::StopMedia), "200 stops the downlink-only early leg");
+         Check(media && !media->media.dtmfPt, "an answer without telephone-event: the leg has no DTMF pt");
+         const Action* active = Find(a200, Action::Type::State);
+         Check(active && active->state == "active" && active->reason == "accepted", "200 emits active/accepted");
+@@ -1224,6 +1232,116 @@ int main() {
+         }
+     }
+ 
++    // ---- ringback: 180 with no media, PEM gates, tone shape ----
++    {
++        auto prov = [](std::string_view callid, int code, std::string_view reason, std::string_view extra, std::string_view body) {
++            return std::format(
++                "SIP/2.0 {} {}\r\n"
++                "Via: SIP/2.0/TCP [2001:db8::db43]:45061;branch=z9hG4bKx\r\n"
++                "From: <sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org>;tag=it\r\n"
++                "To: <sip:1233@ims>;tag=remote7\r\n"
++                "Call-ID: {}\r\nCSeq: 1 INVITE\r\n"
++                "{}"
++                "Content-Length: {}\r\n\r\n{}",
++                code, reason, callid, extra, body.size(), body);
++        };
++        const std::string sdp =
++            "v=0\r\no=- 1 1 IN IP6 2001:db8::9\r\ns=-\r\nc=IN IP6 2001:db8::9\r\n"
++            "t=0 0\r\nm=audio 6004 RTP/AVP 97\r\na=rtpmap:97 AMR-WB/16000/1\r\n";
++
++        imsd::util::Rng rng(7);
++        CallMachine m(c, rng, "ims-call-rb", "1233", 50004, false);
++        m.Start();
++        auto a180 = m.OnInviteResponse(prov(m.CallId(), 180, "Ringing", "", ""));
++        Check(m.State() == CallState::Ringing, "180 -> ringing");
++        Check(Has(a180, Action::Type::StartRingback), "180 without SDP starts local ringback");
++        Check(!Has(a180, Action::Type::StartMedia), "180 without SDP starts no media");
++        auto a180b = m.OnInviteResponse(prov(m.CallId(), 180, "Ringing", "", ""));
++        Check(!Has(a180b, Action::Type::StartRingback), "a second 180 does not start a second tone");
++
++        auto hung = m.OnHangup();
++        Check(Has(hung, Action::Type::StopRingback), "hangup stops ringback");
++        Check(Sent(hung, "CANCEL ") != nullptr, "hangup while alerting sends CANCEL");
++
++        imsd::util::Rng rng2(8);
++        CallMachine n(c, rng2, "ims-call-rb2", "1233", 50004, false);
++        n.Start();
++        n.OnInviteResponse(prov(n.CallId(), 180, "Ringing", "", ""));
++        auto ans = n.OnInviteResponse(R200(n.CallId()));
++        Check(Has(ans, Action::Type::StopRingback), "200 stops ringback");
++        const Action* up = Find(ans, Action::Type::StartMedia);
++        Check(up && up->media.uplink, "200 after a bare 180 starts the uplink");
++        Check(n.State() == CallState::Active, "answered after local ringback");
++
++        imsd::util::Rng rng3(9);
++        CallMachine p(c, rng3, "ims-call-rb3", "1233", 50004, false);
++        p.Start();
++        auto inactive = p.OnInviteResponse(prov(p.CallId(), 183, "Session Progress", "P-Early-Media: inactive\r\n", sdp));
++        Check(Has(inactive, Action::Type::StartRingback), "P-Early-Media inactive keeps the local tone");
++        Check(!Has(inactive, Action::Type::StartMedia), "P-Early-Media inactive does not play SDP");
++        auto later = p.OnInviteResponse(prov(p.CallId(), 183, "Session Progress", "P-Early-Media: sendonly\r\n", sdp));
++        Check(Has(later, Action::Type::StopRingback), "authorized early media stops the local tone");
++        const Action* em = Find(later, Action::Type::StartMedia);
++        Check(em && em->media.Valid() && !em->media.uplink, "P-Early-Media sendonly starts downlink-only media");
++
++        imsd::util::Rng rng4(10);
++        CallMachine q(c, rng4, "ims-call-rb4", "1233", 50004, false);
++        q.Start();
++        auto recvonly = q.OnInviteResponse(prov(q.CallId(), 183, "Session Progress", "P-Early-Media: recvonly\r\n", sdp));
++        Check(Has(recvonly, Action::Type::StartRingback), "P-Early-Media recvonly is not backward media");
++        Check(!Has(recvonly, Action::Type::StartMedia), "recvonly does not start a leg");
++
++        imsd::util::Rng rng5(11);
++        CallMachine r(c, rng5, "ims-call-rb5", "1233", 50004, true);
++        r.Start();
++        auto qos = r.OnInviteResponse(prov(r.CallId(), 183, "Session Progress", "", sdp));
++        Check(Has(qos, Action::Type::StartRingback), "precondition 183 without P-Early-Media is not early media");
++        Check(!Has(qos, Action::Type::StartMedia), "precondition 183 does not start a leg");
++        auto ring = r.OnInviteResponse(prov(r.CallId(), 180, "Ringing", "", ""));
++        Check(!Has(ring, Action::Type::StartMedia), "180 without SDP does not reuse the precondition SDP");
++        Check(!Has(ring, Action::Type::StartRingback), "ringback already started on the 183");
++
++        imsd::util::Rng rng6(12);
++        CallMachine s(c, rng6, "ims-call-rb6", "1233", 50004, false);
++        s.Start();
++        s.OnInviteResponse(R183(s.CallId()));
++        auto died = s.OnMediaExit(3);
++        Check(Has(died, Action::Type::StartRingback), "early-media exit before answer falls back to local ringback");
++        Check(!Has(died, Action::Type::Deleted), "early-media exit before answer does not end the call");
++        Check(s.State() == CallState::Ringing, "still ringing after the early leg exits");
++
++        imsd::util::Rng rng7(13);
++        CallMachine t(c, rng7, "ims-call-rb7", "1233", 50004, false);
++        t.Start();
++        t.OnInviteResponse(prov(t.CallId(), 180, "Ringing", "", ""));
++        auto busy = t.OnInviteResponse(Final(t.CallId(), 486, "Busy Here"));
++        Check(Has(busy, Action::Type::StopRingback), "486 stops ringback");
++        Check(t.State() == CallState::Terminated, "486 ends the call");
++
++        Check(RingbackSample(0) == 0, "ringback starts at zero");
++        Check(RingbackSample(static_cast<std::uint64_t>(RingbackOnSamples - 1)) == 0, "ringback burst ends at zero");
++        bool offSilent = true;
++        for (int i = RingbackOnSamples; i < RingbackPeriodSamples; i++)
++            if (RingbackSample(static_cast<std::uint64_t>(i)) != 0) offSilent = false;
++        Check(offSilent, "ringback is silent for the 4 s off");
++        Check(RingbackSample(static_cast<std::uint64_t>(RingbackPeriodSamples)) == 0, "the next burst starts at zero");
++        int peak = 0;
++        int trough = 0;
++        for (int i = RingbackFade; i < RingbackOnSamples - RingbackFade; i++) {
++            int s = RingbackSample(static_cast<std::uint64_t>(i));
++            if (s > peak) peak = s;
++            if (s < trough) trough = s;
++        }
++        Check(peak >= 7000 && peak <= RingbackAmplitude, "ringback reaches the 425 Hz peak");
++        Check(trough <= -7000 && trough >= -RingbackAmplitude, "ringback reaches the negative peak");
++        imsd::util::Rng rng8(14);
++        CallMachine u(c, rng8, "ims-call-rb8", "1233", 50004, false);
++        u.Start();
++        auto only200 = u.OnInviteResponse(R200(u.CallId()));
++        Check(!Has(only200, Action::Type::StopRingback) && !Has(only200, Action::Type::StartRingback), "a 200 with no alerting starts no ringback");
++        Check(Find(only200, Action::Type::StartMedia) && Find(only200, Action::Type::StartMedia)->media.uplink, "direct 200 is full duplex");
++    }
++
+     if (Failures == 0) std::println("Engine: all tests passed");
+     return Failures != 0;   // not the count: an exit status keeps 8 bits, and this suite has more checks than that
+ }
+-- 
+2.56.1
+
