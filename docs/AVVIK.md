@@ -155,3 +155,17 @@ Full historikk: FP5-siden «BengalOS på Fairphone 5: bugs og endringer».
 - **Hvorfor:** Kristian rebootet 22:26 og loggingen fra 11:37 forsvant. Han vil ha den på for å fange hvorfor telefonen skrur seg av i dvale (førsteprioritet), selv om den gjør oppvåkningen tregere (350–800 ms) og utløser Phosh-krasj som nå fanges av resume-guard og invalid-scale-patchen.
 - **Hvordan:** Kristian valgte «bare til neste omstart» og sa «nå». Én `run0` 22:28:35 (`echo` til de fire filene). Ingen omstart av tjenester.
 - **Tilbake:** Omstart, eller `run0 sh -c 'echo 4 > /proc/sys/kernel/printk; echo Y > /sys/module/printk/parameters/console_suspend; echo 0 > /sys/power/pm_debug_messages; echo 0 > /sys/power/pm_print_times'`.
+
+## 2026-11-22 14:50 — callaudiod-fiks INSTALLERT (lab FP5)
+
+- **Hva:** Egen callaudiod 0.1.99 med SelectMode-fiks i `/var/lib/fp5-oot/bin/callaudiod`, startet via bruker-D-Bus-override `~fp5/.local/share/dbus-1/services/org.mobian_project.CallAudio.service`. `/usr/bin/callaudiod` og pakkens D-Bus-fil er urørt. Vakten `fp5-callaudiod-watch` er startet på nytt med ny versjon. Branch `fix/callaudiod-hang-aarch64` (478fb4b, pushet, ikke merget). Grok Build-jobb 20261122-103814-3503080.
+- **Hvorfor:** Samtaler 09:09 og 14:18 var helt uten lyd: callaudiod logget «card has no usable source/sink» og hang i SelectMode. Kristian valgte «Installer callaudiod-fiksen nå».
+- **Hvordan:** Root-delen gikk via SSH fra desk som fp5ops (run0 uten passord, Kristian ba om det). Fp5-delen ble kjørt for hånd. Idle-sjekk gjort som fp5 (ingen samtale i MM, oFono eller imsd, fp5-call-mic inaktiv), så `FP5_SKIP_CALLCHECK=1`. Etterpå trengtes `busctl --user call org.freedesktop.DBus … ReloadConfig` + `pkill -x -u fp5 callaudiod` før D-Bus startet den nye. Kjører nå som pid 2629497, AudioMode svarer.
+- **Feil i installeren funnet (må rettes i branch/stage):** (1) Idle-sjekken så `{"data":[[]]}` fra busctl som «har samtale» — rettet på telefonen ved å pakke ut data[0]. (2) `systemctl --user` virker ikke under run0 som root, så fp5-call-mic-sjekken ble «unknown». (3) D-Bus-override krever ReloadConfig før pkill.
+- **Backup:** `/var/lib/fp5-backup/20261122T144824-origin-selectmode/`.
+- **Tilbake:** `sh /home/fp5/fp5-xfer-origin-selectmode/rollback.sh --callaudiod /var/lib/fp5-backup/20261122T144824-origin-selectmode` (trenger root; eller fjern override-fila, ReloadConfig og `pkill -x -u fp5 callaudiod`).
+- **Ikke installert:** gnome-calls VoLTE-først (`fix/calls-prefer-ims-origin` 974d78e, pushet). Venter på Kristian.
+
+## 2026-11-22 — Uskarphet etter oppvåkning (diagnose, ingen endring)
+
+- Skala er riktig (DSI-1 = 3). Phosh dør med exit 1 ved hver oppvåkning (13 ganger), fordi phoc lager en ny DSI-1 etter at logind har pauset DRM. Glitchen er phoc «Atomic commit failed: Device or resource busy». Apper som var åpne før Phosh startet på nytt, kan bli uskarpe. Lukk og åpne dem, eller logg ut og inn. Mulig fiks oppstrøms: phoc/wlroots gjenbruker output ved seat-resume. Grok Build-jobb 20261122-104817-3546155.
