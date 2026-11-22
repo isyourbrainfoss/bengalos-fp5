@@ -13,7 +13,7 @@ fi
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   build-essential meson ninja-build pkg-config git ca-certificates \
-  libglib2.0-dev libpulse-dev libappstream-dev binutils file
+  libglib2.0-dev libpulse-dev libasound2-dev libappstream-dev binutils file
 rm -rf /tmp/cad
 git clone --branch 0.1.99 --depth 1 https://gitlab.com/mobian1/callaudiod.git /tmp/cad
 cd /tmp/cad
@@ -29,6 +29,19 @@ file "$bin" | tee /out/file.txt
 readelf -h "$bin" | tee /out/readelf.txt
 grep -q AArch64 /out/readelf.txt
 readelf -d "$bin" | tee /out/needed.txt
+if [ -f /ref/callaudiod ]; then
+  readelf -d /ref/callaudiod | sed -n 's/.*Shared library: \[\([^]]*\)\]/\1/p' | sort -u > /tmp/need-old
+  readelf -d "$bin" | sed -n 's/.*Shared library: \[\([^]]*\)\]/\1/p' | sort -u > /tmp/need-new
+  {
+    echo "=== callaudiod NEEDED (shipped vs built) ==="
+    diff -u /tmp/need-old /tmp/need-new || true
+  } | tee /out/needed-diff.txt
+  if comm -13 /tmp/need-old /tmp/need-new | grep -q .; then
+    echo "unexpected new NEEDED"
+    comm -13 /tmp/need-old /tmp/need-new
+    fail
+  fi
+fi
 ldd "$bin" | tee /out/ldd.txt || true
 mkdir -p /out
 cp -a "$bin" /out/callaudiod
