@@ -1,7 +1,7 @@
 # FP5 BengalOS – avviksdokument (ikke-standard oppsett)
 
 Telefon: lab-FP5, maskin «phosh» (bruker fp5), BengalOS fra intern UFS (A/B via systemd-sysupdate fra isyourbrainfoss/bengalos-fp5 fp5-feed).
-Sist oppdatert: 22. nov 2026 kl. 09:35 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
+Sist oppdatert: 23. nov 2026 kl. 07:51 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
 Prinsipp: alt som avviker fra offisiell BengalOS står her med plassering, hvorfor og hvordan det fjernes.
 
 ## 1. Bil / Tesla (Bluetooth)
@@ -44,7 +44,7 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 |---|---|---|
 | Klokker-timer: stopp-knapp v2 | `~/.local/bin/fp5-timer-sound-stop`, gren fix/clocks-timer-stop | `~/.local/state/fp5-timer-stop/rollback.sh` |
 | feedbackd-tema fp5-strong (timer spiller Argon-timer.ogg) | `~/.config/feedbackd/themes/fp5-strong.json` | backup `fp5-strong.json.bak-20261120-timer2` |
-| Alarmlyd-reserve | `~/.local/bin/fp5-clocks-alarm-sound` + tjeneste | `systemctl --user disable --now fp5-clocks-alarm-sound` |
+| Alarmlyd-reserve v2 (ringer på silent/quiet) | `~/.local/bin/fp5-clocks-alarm-sound` + tjeneste, gren fix/alarm-silent-fallback | `sh ~/.local/state/fp5-clocks-alarm-sound/rollback.sh` |
 | feedbackd-profil-synk, ff-gain | `fp5-feedbackd-profile-sync`, `fp5-ff-gain` (brukertjenester) | disable tjenestene |
 
 ## 4. Skjerm, opplåsing og strøm
@@ -223,3 +223,10 @@ Desk nådde ikke telefonen (ikke på hjemme-Wi-Fi), så alt gikk lokalt på tele
 **Hvorfor:** Telefonen fortsetter å dø med varm PS_HOLD-reset når den våkner fra dvale på batteri. Ni dødsfall er registrert, det siste 22.11 etter 20:58 (forrige vekking var RTC-alarmen, ingen lader). Ifølge suspend-race-rapporten kan det at GENI-konsollen slås av under dvale være det som gjør oppvåkningen sårbar. Steg B tester dette alene: hvis rundt 30 dvaler på batteri går uten dødsfall, peker det mot konsollmotoren og ikke mot loggmengden. Tidligere funn: av fem dødsfall med data var laderen satt i ved tre.
 **Backup:** `/var/lib/fp5-backup/20261122T221416-console-suspend-N/` (før-verdier og rollback.sh).
 **Tilbake:** `run0 sh /var/lib/fp5-backup/20261122T221416-console-suspend-N/rollback.sh` (setter Y), eller ta en omstart.
+
+## 2026-11-23 07:51 — Alarmlyd-reserve v2 (lydløs/quiet)
+
+**Hva:** `~/.local/bin/fp5-clocks-alarm-sound` er oppdatert til v2 (Kristian sa «ja fiks» i t960u). Bare brukerenheten `fp5-clocks-alarm-sound.service` ble startet på nytt. Temaet `fp5-strong`, gnome-clocks, feedbackd, PipeWire og WirePlumber er uendret.
+**Hvorfor:** Morgenalarmen 23.11 07:00 (ukedagsalarmen, profil `silent`) ble behandlet av Klokker, men det kom ingen lyd. v1 spilte bare reserve-lyd når `TriggerFeedback` ga UnknownMethod. Kl. 06:59:59 tolket v1 et hendelses-id som at feedbackd spilte, og gikk idle. På `silent` (og `quiet` i fp5-strong) returnerer feedbackd likevel et id og sender `FeedbackEnded` med årsak NOT_FOUND; `EndFeedback` lykkes også, så et id alene er ikke bevis for lyd. v2 spiller `paplay` med `media.role=Alarm` mens alarmen er forfalt hvis profilen ikke er `full`, eller hvis proben er ødelagt/NOT_FOUND. På `full` med ekte avspilling forblir reserven idle (ingen dobbeltlyd). Stopper som før ved stopp/slumring (`ring_time` endres) eller når `ring_minutes` er ute. På silent/quiet probes ikke v2 (unngår ekstra hendelser).
+**Backup:** `~/.local/state/fp5-clocks-alarm-sound/backup-20261123T075150/` (v1 sha256 24cd73c9…, v2 01b120fc…). Gren `fix/alarm-silent-fallback` (ikke merget).
+**Tilbake:** `sh ~/.local/state/fp5-clocks-alarm-sound/rollback.sh` (legger tilbake v1 og restarter bare denne brukerenheten).
