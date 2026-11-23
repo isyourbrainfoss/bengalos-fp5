@@ -268,3 +268,10 @@ Lest tilbake: printk `8 4 1 8`, console_suspend N, pm_debug_messages 1, pm_print
 **Backup:** Kjørende kjerne 7.2.8-sc7280-volte20261107+ er fortsatt standard oppstartsvalg. Ny UKI er ikke bygget og ikke lagt inn. Patchene er på grenen fix/ucsi-suspend-defer, commit d7002f24e577387cea073ddb5a0b678d43d1962a.
 
 **Tilbake:** Ingenting er installert. Etter en senere test: velg forrige kjerne i systemd-boot-menyen. Ikke bytt default før testen er grønn. Ingen fastboot.
+
+### 2026-11-23 20:35 — UCSI-dvalefiks parkert som mulig fiks
+
+**Hva:** Grenen fix/ucsi-suspend-defer (d7002f24, upstream-RFC «soc: qcom: pmic_glink: Hold back notifications over system sleep», 22. okt) er bare en **mulig fiks**. Den er ikke bygget som UKI, ikke installert og ikke merget.
+**Hvorfor:** Kristian vil vente noen dager (t974u). RFC-en er ikke tatt inn upstream, og den forklarer bare dødsfall med lader (pluggen settes i eller tas ut under s2idle), ikke de uten lader (21.11 10:54, 22.11 ~20:58).
+**Midlertidig tiltak:** Kristian skrur på skjermen før han setter i eller tar ut laderen. Ingen endring på telefonen.
+**Neste steg:** Sjekk RFC-status upstream og bestem om det skal bygges en UKI for testoppstart. Les console-ramoops ved neste dødsfall uten lader.
