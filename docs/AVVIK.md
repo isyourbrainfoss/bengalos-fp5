@@ -230,3 +230,17 @@ Desk nådde ikke telefonen (ikke på hjemme-Wi-Fi), så alt gikk lokalt på tele
 **Hvorfor:** Morgenalarmen 23.11 07:00 (ukedagsalarmen, profil `silent`) ble behandlet av Klokker, men det kom ingen lyd. v1 spilte bare reserve-lyd når `TriggerFeedback` ga UnknownMethod. Kl. 06:59:59 tolket v1 et hendelses-id som at feedbackd spilte, og gikk idle. På `silent` (og `quiet` i fp5-strong) returnerer feedbackd likevel et id og sender `FeedbackEnded` med årsak NOT_FOUND; `EndFeedback` lykkes også, så et id alene er ikke bevis for lyd. v2 spiller `paplay` med `media.role=Alarm` mens alarmen er forfalt hvis profilen ikke er `full`, eller hvis proben er ødelagt/NOT_FOUND. På `full` med ekte avspilling forblir reserven idle (ingen dobbeltlyd). Stopper som før ved stopp/slumring (`ring_time` endres) eller når `ring_minutes` er ute. På silent/quiet probes ikke v2 (unngår ekstra hendelser).
 **Backup:** `~/.local/state/fp5-clocks-alarm-sound/backup-20261123T075150/` (v1 sha256 24cd73c9…, v2 01b120fc…). Gren `fix/alarm-silent-fallback` (ikke merget).
 **Tilbake:** `sh ~/.local/state/fp5-clocks-alarm-sound/rollback.sh` (legger tilbake v1 og restarter bare denne brukerenheten).
+
+## 2026-11-23 16:07 — Tyngre dvalelogging (midlertidig, DES-4 steg B+)
+
+**Hva:** Satt som root med run0 på telefonen (Kristian godkjente prompten, «nå» 16:07). Bare runtime-endringer som forsvinner ved omstart:
+- `/proc/sys/kernel/printk`: `4 4 1 8` → `8 4 1 8`. Bare konsollens loggnivå er endret.
+- `/sys/power/pm_debug_messages`: 0 → 1.
+- `/sys/module/printk/parameters/console_suspend`: Y → N. Den hadde gått tilbake til Y etter omstarten 23.11 ca. 15:23.
+- `pm_print_times`: uendret 1 (permanent via tmpfiles fra 22.11).
+
+Ingen tmpfiles, enheter eller sysctl.d. Ingen tjenester er restartet. pstore, mobildata og crash/watchdog er ikke rørt.
+**Hvorfor:** Telefonen døde igjen 23.11 15:09 i dvale (varm PS_HOLD-reset). Kristian satte i laderen mens den sov. Den eneste andre gangen laderen ble satt i under dvale (22.11 22:22), overlevde den, men kjernen skrev «i2c Transfer while suspended»-advarsler fra ptn36502 og fsa4480. Advarslene kom via ucsi_handle_connector_change, altså Type-C-bryterne mens de ennå sov. console-ramoops fra dødsfallet (lest 15:39) hadde bare advarselsnivå. Siste linje var fra oppvåkningen 15:02:40, og det var ingenting fra den dødelige dvalen. Med loglevel 8 og pm_debug_messages kommer suspend- og resume-sporet per enhet med i ramoops. Neste dødsfall viser da hvor oppvåkningen stopper.
+**Backup:** `/var/lib/fp5-backup/20261123T160751-suspend-logging-heavy/`. Mappen har før-verdiene og rollback.sh.
+**Tilbake:** `run0 sh /var/lib/fp5-backup/20261123T160751-suspend-logging-heavy/rollback.sh`. Den setter `4 4 1 8`, pm_debug 0, console_suspend Y og pm_print_times 1. Alternativt: ta en omstart.
+**Etter neste dødsfall:** `run0 cat /var/lib/systemd/pstore/console-ramoops-0` (bare lesing, før neste reset). Se etter siste «PM: calling …»-linje.
