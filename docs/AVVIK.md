@@ -244,3 +244,17 @@ Ingen tmpfiles, enheter eller sysctl.d. Ingen tjenester er restartet. pstore, mo
 **Backup:** `/var/lib/fp5-backup/20261123T160751-suspend-logging-heavy/`. Mappen har før-verdiene og rollback.sh.
 **Tilbake:** `run0 sh /var/lib/fp5-backup/20261123T160751-suspend-logging-heavy/rollback.sh`. Den setter `4 4 1 8`, pm_debug 0, console_suspend Y og pm_print_times 1. Alternativt: ta en omstart.
 **Etter neste dødsfall:** `run0 cat /var/lib/systemd/pstore/console-ramoops-0` (bare lesing, før neste reset). Se etter siste «PM: calling …»-linje.
+
+## 2026-11-23 17:36 — Tyngre dvalelogging slått på igjen (midlertidig, DES-4)
+
+**Hva:** Satt som root over SSH fra desk (run0 --no-ask-password). Kristian sa ja kl. 17:35 via Grok Bot. Bare runtime-endringer som forsvinner ved neste omstart:
+- `/proc/sys/kernel/printk`: `4 4 1 8` → `8 4 1 8`.
+- `/sys/module/printk/parameters/console_suspend`: Y → N.
+- `/sys/power/pm_debug_messages`: 0 → 1.
+- `pm_print_times`: uendret 1.
+
+Lest tilbake: printk `8 4 1 8`, console_suspend N, pm_debug_messages 1, pm_print_times 1. Ingen tmpfiles, sysctl.d, enheter eller cmdline. Ingen tjenester restartet. pstore, mobildata og crash/watchdog er ikke rørt.
+**Hvorfor:** Dødsfallet 23.11 ca. 17:19 (lader satt i under dvale) ble fanget i ramoops: UCSI-arbeidet (ucsi_handle_connector_change) kjørte mens telefonen fortsatt var i s2idle, med «i2c Transfer while suspended» fra ptn36502/fsa4480 og «parent port0 should not be sleeping», så stille PS_HOLD-reset. Loggingen forsvant ved omstarten. Den slås på igjen for å fange et dødsfall uten lader (som 21.11 10:54 og 22.11 ca. 20:58).
+**Backup:** `/var/lib/fp5-backup/20261123T173655-suspend-logging-heavy/` (før-verdier og rollback.sh).
+**Tilbake:** `run0 sh /var/lib/fp5-backup/20261123T173655-suspend-logging-heavy/rollback.sh` (setter `4 4 1 8`, pm_debug 0, console_suspend Y, pm_print_times 1), eller ta en omstart.
+**Etter neste dødsfall:** `run0 cat /var/lib/systemd/pstore/console-ramoops-0` (bare lesing). Se etter siste «PM: calling …»-linje.
