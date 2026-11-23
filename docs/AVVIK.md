@@ -258,3 +258,13 @@ Lest tilbake: printk `8 4 1 8`, console_suspend N, pm_debug_messages 1, pm_print
 **Backup:** `/var/lib/fp5-backup/20261123T173655-suspend-logging-heavy/` (før-verdier og rollback.sh).
 **Tilbake:** `run0 sh /var/lib/fp5-backup/20261123T173655-suspend-logging-heavy/rollback.sh` (setter `4 4 1 8`, pm_debug 0, console_suspend Y, pm_print_times 1), eller ta en omstart.
 **Etter neste dødsfall:** `run0 cat /var/lib/systemd/pstore/console-ramoops-0` (bare lesing). Se etter siste «PM: calling …»-linje.
+
+## 2026-11-23 17:19 — Lader under s2idle gir PS_HOLD varm reset (UCSI/pmic_glink)
+
+**Hva:** Lader koblet til mens FP5 lå i s2idle. Stille heng, deretter PMIC PS_HOLD → WARM_RESET. Konsollloggen (printk 8, console_suspend=N) viser at ucsi_handle_connector_change kjørte på events-køen mens enhetene fortsatt var noirq-suspendert: i2c-varsel fra ptn36502 og fsa4480, «parent port0 should not be sleeping», deretter ingen oops.
+
+**Hvorfor:** GLINK-avbruddet har IRQF_NO_SUSPEND, så ladermeldingen vekker CPU-en uten å ta enhetene ut av dvale. UCSI legger konnektor-arbeidet på den ikke-frysbare systemkøen, som rører Type-C-brytere, QMP combo PHY og dwc3 mens klokkene er av. Patch 0008–0010 (RFC fra 22. okt 2026) holder meldingene tilbake fra ->prepare() og leverer dem fra ->complete() på system_freezable_wq. ucsi_glink vekker fortsatt ved konnektorendring. Ladingen skjer i PMIC-fastvaren.
+
+**Backup:** Kjørende kjerne 7.2.8-sc7280-volte20261107+ er fortsatt standard oppstartsvalg. Ny UKI er ikke bygget og ikke lagt inn. Patchene er på grenen fix/ucsi-suspend-defer, commit d7002f24e577387cea073ddb5a0b678d43d1962a.
+
+**Tilbake:** Ingenting er installert. Etter en senere test: velg forrige kjerne i systemd-boot-menyen. Ikke bytt default før testen er grønn. Ingen fastboot.
