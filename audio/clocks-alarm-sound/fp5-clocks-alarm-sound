@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""Play GNOME Clocks alarm audio when feedbackd will not.
+
+GNOME Clocks 51 (BengalOS libfeedback patch) rings via Lfb.Event
+('alarm-clock-elapsed', important=true, loop). It does not use Gtk.MediaFile
+and does not pass sound_uri to feedbackd.
+
+v1 played a paplay fallback only when TriggerFeedback returned
+UnknownMethod. That missed the silent/quiet case: TriggerFeedback still
+returns an event id, but feedbackd emits FeedbackEnded with reason
+NOT_FOUND and plays nothing (EndFeedback also returns success, so an id
+alone is not proof that anything is playing).
+
+v2 (2026-11-23): while an alarm is due, play the alarm's sound_uri (else
+the freedesktop alarm-clock-elapsed sound) with media.role=Alarm when:
+
+- the feedbackd profile is silent or quiet (or anything other than full), or
+- TriggerFeedback is missing/broken, or
+- feedbackd ended the probe event with NOT_FOUND (nothing was played).
+
+Do not play the fallback when the profile is full and a probe event is
+actually started, so a working full-profile alarm is not doubled. Stops
+when ring_time changes (stop/snooze) or ring_minutes elapse. Logs times
+and reasons only, never alarm names or bodies. No root. Does not restart
+feedbackd/PipeWire/gnome-clocks.
+
+On silent/quiet, v2 does not send probe TriggerFeedback calls (no need,
+and it avoids stray events).
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "2"
+DEFAULT_SOUND = "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
+APP_NAME = "fp5-clocks-alarm-sound"
+PROBE_INTERVAL = 60
+CHECK_INTERVAL = 1.0
+PROBE_APP_ID = "org.example.fp5-alarm-probe"
+# D-Bus FeedbackEnded.reason is 'u'; FBD_EVENT_END_REASON_NOT_FOUND is -1.
+ENDED_REASON_NOT_FOUND = 0xFFFFFFFF
+ENDED_REASON_NOT_FOUND_SIGNED = -1
+
+PROBE_OK = "ok"
+PROBE_METHOD_BROKEN = "method_broken"
+PROBE_EVENT_MISSING = "event_missing"
+PROBE_ERROR = "error"
+PROBE_SKIPPED = "skipped"
+
+
+def log(msg: str) -> None:
+    ts = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+    print(f"{ts} {APP_NAME}: {msg}", flush=True)
+
+
+def normalize_profile(value: str | None) -> str:
+    p = (value or "").strip().strip("'\"")
+    return p or "full"
+
+
+def profile_needs_fallback(profile: str) -> bool:
+    """True when the theme/profile will not play alarm audio.
+
+    fp5-strong has no silent profile, and quiet overrides
+    alarm-clock-elapsed with a no-op vibration. Only 'full' may play.
+    """
+    return normalize_profile(profile) != "full"
+
+
+def classify_probe_error(exc: BaseException) -> str:
+    msg = str(exc)
+    low = msg.lower()
+    if "UnknownMethod" in msg or "not implemented" in low:
+        return PROBE_METHOD_BROKEN
+    if "non-existing" in low or "not found" in low or "does not exist" in low:
+        return PROBE_EVENT_MISSING
+    return PROBE_ERROR
+
+
+def ended_reason_is_not_found(reason: int | None) -> bool:
+    if reason is None:
+        return False
+    return reason in (ENDED_REASON_NOT_FOUND, ENDED_REASON_NOT_FOUND_SIGNED)
+
+
+def fallback_reason(profile: str, probe_status: str | None) -> str | None:
+    """Return a short reason to play the fallback, or None to stay idle.
+
+    probe_status may be None when the profile already requires fallback
+    and no live probe was done.
+    """
+    if profile_needs_fallback(profile):
+        return "profile:%s" % normalize_profile(profile)
+    if probe_status in (None, PROBE_SKIPPED):
+        return "probe:needed"
+    if probe_status == PROBE_OK:
+        return None
+    if probe_status in (PROBE_METHOD_BROKEN, PROBE_EVENT_MISSING, PROBE_ERROR, "unconfirmed"):
+        return "probe:%s" % probe_status
+    return "probe:%s" % probe_status
+
+
+def alarm_is_due(now: datetime, ring_time: datetime | None, ring_minutes: int) -> bool:
+    if ring_time is None:
+        return False
+    elapsed = (now - ring_time).total_seconds()
+    if elapsed < -1:
+        return False
+    mins = ring_minutes if ring_minutes > 0 else 5
+    return elapsed <= mins * 60
+
+
+def parse_dt(value) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return dt
+
+
+def unpack_alarm(child) -> dict:
+    if isinstance(child, dict):
+        return child
+    if hasattr(child, "unpack"):
+        u = child.unpack()
+        if isinstance(u, dict):
+            return u
+    return {}
+
+
+def uri_to_path(uri: str | None) -> str | None:
+    if not uri:
+        return None
+    uri = str(uri)
+    if "GLib" in globals() and GLib is not None:
+        try:
+            path, _ = GLib.filename_from_uri(uri)
+            return path
+        except Exception:
+            pass
+    if uri.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+
+        return unquote(urlparse(uri).path)
+    if uri.startswith("/") and Path(uri).is_file():
+        return uri
+    return None
+
+
+# --- runtime (GI imported lazily so unit tests need no GObject) ---
+Gio = None
+GLib = None
+
+
+def _gi():
+    global Gio, GLib
+    if Gio is not None:
+        return
+    import gi
+
+    gi.require_version("Gio", "2.0")
+    gi.require_version("GLib", "2.0")
+    from gi.repository import Gio as _Gio, GLib as _GLib
+
+    Gio = _Gio
+    GLib = _GLib
+
+
+def list_alarms(settings) -> list[dict]:
+    out = []
+    try:
+        raw = settings.get_value("alarms")
+    except Exception as e:
+        log("failed to read alarms: %s" % e)
+        return out
+    n = raw.n_children()
+    for i in range(n):
+        d = unpack_alarm(raw.get_child_value(i))
+        rid = str(d.get("id") or i)
+        ring = parse_dt(d.get("ring_time"))
+        try:
+            mins = int(d.get("ring_minutes") or 5)
+        except (TypeError, ValueError):
+            mins = 5
+        if mins <= 0:
+            mins = 5
+        path = uri_to_path(d.get("sound_uri"))
+        out.append({"id": rid, "ring_time": ring, "ring_minutes": mins, "sound": path})
+    return out
+
+
+class Player:
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._proc: subprocess.Popen | None = None
+        self.key: tuple | None = None
+
+    def playing(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, key: tuple, sound: str) -> None:
+        if self.playing() and self.key == key:
+            return
+        self.stop()
+        self._stop.clear()
+        self.key = key
+        self._thread = threading.Thread(target=self._loop, args=(sound,), daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        proc = self._proc
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        if self._thread:
+            self._thread.join(timeout=2)
+        self._thread = None
+        self._proc = None
+        self.key = None
+
+    def _loop(self, sound: str) -> None:
+        if not sound or not Path(sound).is_file():
+            sound = DEFAULT_SOUND
+        if not Path(sound).is_file():
+            log("no playable sound file")
+            return
+        log("playing media.role=Alarm")
+        while not self._stop.is_set():
+            try:
+                self._proc = subprocess.Popen(
+                    [
+                        "paplay",
+                        "--property=media.role=Alarm",
+                        "--property=media.name=alarm-clock-elapsed",
+                        f"--client-name={APP_NAME}",
+                        sound,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                while self._proc.poll() is None:
+                    if self._stop.wait(0.2):
+                        self._proc.terminate()
+                        try:
+                            self._proc.wait(timeout=1)
+                        except subprocess.TimeoutExpired:
+                            self._proc.kill()
+                        return
+            except FileNotFoundError:
+                log("paplay not found")
+                return
+            except Exception:
+                log("paplay failed")
+                time.sleep(0.5)
+            self._proc = None
+        log("stopped")
+
+
+class Guard:
+    def __init__(self) -> None:
+        _gi()
+        self.settings = Gio.Settings.new("org.gnome.clocks")
+        self.fb_settings = Gio.Settings.new("org.sigxcpu.feedbackd")
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.player = Player()
+        self.tf_status: str | None = None
+        self._ok_streak = 0
+        self._last_probe = 0.0
+        self._ended: dict[int, int] = {}
+        self.loop = GLib.MainLoop()
+        self._ended_sub = self.bus.signal_subscribe(
+            "org.sigxcpu.Feedback",
+            "org.sigxcpu.Feedback",
+            "FeedbackEnded",
+            "/org/sigxcpu/Feedback",
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self._on_feedback_ended,
+        )
+
+    def _on_feedback_ended(self, _conn, _sender, _path, _iface, _signal, params) -> None:
+        try:
+            ev_id, reason = params.unpack()
+            self._ended[int(ev_id)] = int(reason)
+        except Exception:
+            pass
+
+    def current_profile(self) -> str:
+        try:
+            return normalize_profile(self.fb_settings.get_string("profile"))
+        except Exception:
+            return "full"
+
+    def _wait_ended(self, ev_id: int, timeout: float = 0.4) -> int | None:
+        deadline = time.monotonic() + timeout
+        ctx = GLib.MainContext.default()
+        while time.monotonic() < deadline:
+            if ev_id in self._ended:
+                return self._ended.pop(ev_id)
+            ctx.iteration(False)
+            time.sleep(0.02)
+        return self._ended.pop(ev_id, None)
+
+    def probe_feedbackd(self) -> str:
+        """Live probe. May trigger a short button-pressed feedback on full."""
+        try:
+            ret = self.bus.call_sync(
+                "org.sigxcpu.Feedback",
+                "/org/sigxcpu/Feedback",
+                "org.sigxcpu.Feedback",
+                "TriggerFeedback",
+                GLib.Variant("(ssa{sv}i)", (PROBE_APP_ID, "button-pressed", {}, 1)),
+                GLib.VariantType("(u)"),
+                Gio.DBusCallFlags.NONE,
+                2000,
+                None,
+            )
+            ev_id = int(ret.unpack()[0])
+        except Exception as e:
+            return classify_probe_error(e)
+
+        reason = self._wait_ended(ev_id)
+        if ended_reason_is_not_found(reason):
+            return PROBE_EVENT_MISSING
+
+        # Event was started (or we timed out waiting for NOT_FOUND).
+        # End it so a full-profile probe does not keep vibrating.
+        try:
+            self.bus.call_sync(
+                "org.sigxcpu.Feedback",
+                "/org/sigxcpu/Feedback",
+                "org.sigxcpu.Feedback",
+                "EndFeedback",
+                GLib.Variant("(u)", (ev_id,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                2000,
+                None,
+            )
+        except Exception as e:
+            # EndFeedback itself returns success even for a missing event
+            # (feedbackd only logs a warning). A real D-Bus error still
+            # means we cannot trust the id.
+            return classify_probe_error(e)
+
+        if ended_reason_is_not_found(self._ended.pop(ev_id, None)):
+            return PROBE_EVENT_MISSING
+        return PROBE_OK
+
+    def decide(self, force_probe: bool = False) -> str | None:
+        """Return fallback reason or None if feedbackd should handle it."""
+        profile = self.current_profile()
+        if profile_needs_fallback(profile):
+            self.tf_status = PROBE_SKIPPED
+            self._ok_streak = 0
+            return fallback_reason(profile, PROBE_SKIPPED)
+
+        now = time.monotonic()
+        if (
+            not force_probe
+            and self.tf_status is not None
+            and (now - self._last_probe) < PROBE_INTERVAL
+        ):
+            return fallback_reason(profile, self.tf_status)
+
+        status = self.probe_feedbackd()
+        if status == PROBE_OK:
+            self._ok_streak += 1
+        else:
+            self._ok_streak = 0
+        # A single flaky OK must not disarm the fallback and skip the alarm.
+        # An unconfirmed OK also must not start paplay (that would double
+        # a working full-profile alarm). _tick keeps an already-playing
+        # fallback going until a second OK.
+        if status == PROBE_OK and self._ok_streak < 2 and self.tf_status != PROBE_OK:
+            status = "unconfirmed"
+        if self.tf_status != status:
+            reason = fallback_reason(profile, status)
+            if status == "unconfirmed":
+                log("feedbackd probe ok once, waiting to confirm before idle")
+            elif reason:
+                log("feedbackd %s, fallback armed" % reason)
+            else:
+                log("feedbackd plays on profile=%s, fallback idle" % profile)
+        self.tf_status = status
+        self._last_probe = now
+        return fallback_reason(profile, status)
+
+    def tick(self) -> bool:
+        try:
+            self._tick()
+        except Exception as e:
+            log("tick error: %s" % type(e).__name__)
+        return True
+
+    def _tick(self) -> None:
+        now = datetime.now().astimezone()
+        alarms = list_alarms(self.settings)
+        due = None
+        for a in alarms:
+            if alarm_is_due(now, a["ring_time"], a["ring_minutes"]):
+                due = a
+                break
+        if due is None:
+            if self.player.playing():
+                log("ring window ended, stopping")
+                self.player.stop()
+            return
+        key = (due["id"], due["ring_time"].isoformat())
+        reason = self.decide()
+        if reason is None:
+            if self.player.playing():
+                log("feedbackd recovered, stopping fallback")
+                self.player.stop()
+            return
+        if reason == "probe:unconfirmed" and not self.player.playing():
+            # Likely a working full profile; do not start a second player.
+            return
+        sound = due["sound"] if due["sound"] and Path(due["sound"]).is_file() else DEFAULT_SOUND
+        if not self.player.playing() or self.player.key != key:
+            log(
+                "alarm due at %s, fallback play (%s)"
+                % (due["ring_time"].isoformat(), reason)
+            )
+            self.player.start(key, sound)
+
+    def run(self) -> int:
+        def _stop(*_a):
+            self.player.stop()
+            self.loop.quit()
+
+        signal.signal(signal.SIGTERM, _stop)
+        signal.signal(signal.SIGINT, _stop)
+        self.settings.connect("changed::alarms", lambda *_: self.tick())
+        self.fb_settings.connect("changed::profile", lambda *_: self.tick())
+        profile = self.current_profile()
+        upcoming = []
+        for a in list_alarms(self.settings):
+            if a["ring_time"] and a["ring_time"] > datetime.now().astimezone():
+                upcoming.append(a["ring_time"].isoformat())
+        upcoming.sort()
+        if profile_needs_fallback(profile):
+            self.tf_status = PROBE_SKIPPED
+            log(
+                "v%s profile=%s, fallback armed; next ring_time=%s"
+                % (VERSION, profile, upcoming[0] if upcoming else "none")
+            )
+        else:
+            # Confirm feedbackd on full at startup (may click/vibrate once).
+            self.decide(force_probe=True)
+            log(
+                "v%s profile=%s; next ring_time=%s"
+                % (VERSION, profile, upcoming[0] if upcoming else "none")
+            )
+        self.tick()
+        GLib.timeout_add(int(CHECK_INTERVAL * 1000), self.tick)
+        self.loop.run()
+        return 0
+
+
+def cmd_status(do_probe: bool = False) -> int:
+    _gi()
+    settings = Gio.Settings.new("org.gnome.clocks")
+    profile = normalize_profile(
+        Gio.Settings.new("org.sigxcpu.feedbackd").get_string("profile")
+    )
+    print("version", VERSION)
+    print("profile", profile)
+    probe_status = PROBE_SKIPPED
+    if do_probe:
+        # Explicit only: can click/vibrate when profile is full.
+        g = Guard()
+        probe_status = g.probe_feedbackd()
+        print("probe", probe_status)
+    else:
+        print("probe skipped (pass --probe to test TriggerFeedback)")
+    reason = fallback_reason(profile, probe_status if do_probe else (
+        PROBE_SKIPPED if profile_needs_fallback(profile) else PROBE_OK
+    ))
+    # Without --probe on full, report policy only (would probe when due).
+    if not do_probe and not profile_needs_fallback(profile):
+        print("fallback when_due=only_if_feedbackd_does_not_play")
+    else:
+        print("fallback when_due=%s" % ("yes " + reason if reason else "no"))
+    now = datetime.now().astimezone()
+    n = 0
+    for a in list_alarms(settings):
+        rt = a["ring_time"]
+        if rt is None:
+            continue
+        n += 1
+        delta = (rt - now).total_seconds()
+        print(
+            "scheduled ring_time=%s in_sec=%.0f ring_minutes=%s has_sound=%s"
+            % (
+                rt.isoformat(),
+                delta,
+                a["ring_minutes"],
+                bool(a["sound"] and Path(a["sound"]).is_file()),
+            )
+        )
+    if n == 0:
+        print("scheduled ring_time=none")
+    return 0
+
+
+def cmd_simulate(profile: str, probe: str, due: bool) -> int:
+    profile = normalize_profile(profile)
+    reason = fallback_reason(profile, probe if not profile_needs_fallback(profile) else PROBE_SKIPPED)
+    print("version", VERSION)
+    print("profile", profile)
+    print("probe", probe)
+    print("due", "yes" if due else "no")
+    if not due:
+        print("action stop_or_idle")
+        print("fallback no")
+        return 0
+    if reason:
+        print("action fallback_play")
+        print("fallback yes")
+        print("reason", reason)
+    else:
+        print("action leave_to_feedbackd")
+        print("fallback no")
+    return 0
+
+
+def cmd_due(now_s: str, ring_time_s: str, ring_minutes: int) -> int:
+    now = parse_dt(now_s)
+    rt = parse_dt(ring_time_s)
+    if now is None or rt is None:
+        print("invalid datetime", file=sys.stderr)
+        return 2
+    yes = alarm_is_due(now, rt, ring_minutes)
+    print("due", "yes" if yes else "no")
+    return 0 if yes else 1
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) > 1 and argv[1] in ("run", "watch"):
+        return Guard().run()
+    if len(argv) == 1:
+        return Guard().run()
+
+    parser = argparse.ArgumentParser(prog=APP_NAME)
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_status = sub.add_parser("status", help="show profile and next ring_time (no sound)")
+    p_status.add_argument(
+        "--probe",
+        action="store_true",
+        help="call TriggerFeedback (may click/vibrate on full)",
+    )
+    sub.add_parser("probe", help="same as status --probe; not used by the service")
+    p_sim = sub.add_parser("simulate", help="dry-run policy, no D-Bus and no sound")
+    p_sim.add_argument("--profile", default="silent")
+    p_sim.add_argument(
+        "--probe",
+        default=PROBE_OK,
+        choices=[PROBE_OK, PROBE_METHOD_BROKEN, PROBE_EVENT_MISSING, PROBE_ERROR, PROBE_SKIPPED, "unconfirmed"],
+    )
+    p_sim.add_argument("--due", action="store_true", default=True)
+    p_sim.add_argument("--not-due", action="store_true")
+    p_due = sub.add_parser("due", help="dry-run ring window")
+    p_due.add_argument("--now", required=True)
+    p_due.add_argument("--ring-time", required=True)
+    p_due.add_argument("--ring-minutes", type=int, default=5)
+    args = parser.parse_args(argv[1:])
+
+    if args.cmd == "status":
+        return cmd_status(do_probe=args.probe)
+    if args.cmd == "probe":
+        return cmd_status(do_probe=True)
+    if args.cmd == "simulate":
+        return cmd_simulate(args.profile, args.probe, due=not args.not_due)
+    if args.cmd == "due":
+        return cmd_due(args.now, args.ring_time, args.ring_minutes)
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
