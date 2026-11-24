@@ -3,6 +3,7 @@
 # checkout and add the two bits that are not on main yet:
 #   * make targets (upstream !118 target, plus bengalos-fp5-immutable)
 #   * FileSystemSectorSize=4096 in image-immutable mkosi.repart/12-usr.conf (!77)
+#   * strip SSH host keys after image-immutable copies /etc into factory
 # Usage: image/apply-upstream-sc7280.sh /path/to/bengalos-recipes
 set -eu
 IMG=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
@@ -44,6 +45,32 @@ if "FileSystemSectorSize=" in text:
 if not text.endswith("\n"):
     text += "\n"
 text += "FileSystemSectorSize=4096\n"
+p.write_text(text)
+PY
+
+python3 - "$RECIPES/mkosi.conf.d/mkosi.profiles/image-immutable/mkosi.finalize" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+text = p.read_text()
+marker = "FP5: strip SSH host keys"
+if marker in text:
+    sys.exit(0)
+text = text.rstrip() + """
+
+# FP5: strip SSH host keys from the factory /etc copy.
+# openssh and mkosi first-boot settings generate them during the image
+# build, after the FP5 postinst. A previous desk image (0.26.1110.1) failed
+# the secret audit on baked host keys. The device creates its own on first boot.
+rm -f "$BUILDROOT/etc/ssh"/ssh_host_* \\
+      "$BUILDROOT/usr/share/factory/etc/ssh"/ssh_host_*
+if find "$BUILDROOT/etc/ssh" "$BUILDROOT/usr/share/factory/etc/ssh" \\
+    -name 'ssh_host_*' -print -quit | grep -q .; then
+    echo "SSH host keys still present after strip" >&2
+    exit 1
+fi
+"""
+if not text.endswith("\n"):
+    text += "\n"
 p.write_text(text)
 PY
 

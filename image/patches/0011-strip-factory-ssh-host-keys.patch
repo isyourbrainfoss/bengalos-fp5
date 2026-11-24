@@ -1,0 +1,20 @@
+diff --git a/mkosi.conf.d/mkosi.profiles/image-immutable/mkosi.finalize b/mkosi.conf.d/mkosi.profiles/image-immutable/mkosi.finalize
+index ee5f10a..e2b13f6 100755
+--- a/mkosi.conf.d/mkosi.profiles/image-immutable/mkosi.finalize
++++ b/mkosi.conf.d/mkosi.profiles/image-immutable/mkosi.finalize
+@@ -11,3 +11,15 @@ cp --archive --no-target-directory --update=none "$BUILDROOT/etc" "$BUILDROOT/us
+ # packaging information
+ mkdir -p "$BUILDROOT/usr/share/factory/var/lib"
+ mv "$BUILDROOT/var/lib/dpkg" "$BUILDROOT/usr/share/factory/var/lib/dpkg"
++
++# FP5: strip SSH host keys from the factory /etc copy.
++# openssh and mkosi first-boot settings generate them during the image
++# build, after the FP5 postinst. A previous desk image (0.26.1110.1) failed
++# the secret audit on baked host keys. The device creates its own on first boot.
++rm -f "$BUILDROOT/etc/ssh"/ssh_host_* \
++      "$BUILDROOT/usr/share/factory/etc/ssh"/ssh_host_*
++if find "$BUILDROOT/etc/ssh" "$BUILDROOT/usr/share/factory/etc/ssh" \
++    -name 'ssh_host_*' -print -quit | grep -q .; then
++    echo "SSH host keys still present after strip" >&2
++    exit 1
++fi
