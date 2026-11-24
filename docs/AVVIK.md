@@ -1,7 +1,7 @@
 # FP5 BengalOS – avviksdokument (ikke-standard oppsett)
 
 Telefon: lab-FP5, maskin «phosh» (bruker fp5), BengalOS fra intern UFS (A/B via systemd-sysupdate fra isyourbrainfoss/bengalos-fp5 fp5-feed).
-Sist oppdatert: 24. nov 2026 kl. 14:05 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
+Sist oppdatert: 24. nov 2026 kl. 22:49 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
 Prinsipp: alt som avviker fra offisiell BengalOS står her med plassering, hvorfor og hvordan det fjernes.
 
 ## 1. Bil / Tesla (Bluetooth)
@@ -47,6 +47,7 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 | Klokker-timer: stopp-knapp v2 | `~/.local/bin/fp5-timer-sound-stop`, gren fix/clocks-timer-stop | `~/.local/state/fp5-timer-stop/rollback.sh` |
 | feedbackd-tema fp5-strong (timer spiller Argon-timer.ogg) | `~/.config/feedbackd/themes/fp5-strong.json` | backup `fp5-strong.json.bak-20261120-timer2` |
 | Alarmlyd-reserve v2 (ringer på silent/quiet) | `~/.local/bin/fp5-clocks-alarm-sound` + tjeneste, gren fix/alarm-silent-fallback | `sh ~/.local/state/fp5-clocks-alarm-sound/rollback.sh` |
+| Automatisk stillemodus 21:00–07:00 (brukertimere, 24.11 22:49) | `~/.config/systemd/user/fp5-quiet-hours-{on,off}.{service,timer}` setter `org.sigxcpu.feedbackd profile` til `silent` kl. 21 og `full` kl. 07 (lokal tid, Europe/Oslo). `Persistent=false`. Alarm-skriptet er uendret. | `systemctl --user disable --now fp5-quiet-hours-on.timer fp5-quiet-hours-off.timer` og fjern de fire filene (eller `sh ~/.local/state/fp5-quiet-hours/rollback.sh`). Rører ikke gjeldende profil. |
 | feedbackd-profil-synk, ff-gain | `fp5-feedbackd-profile-sync`, `fp5-ff-gain` (brukertjenester) | disable tjenestene |
 
 ## 4. Skjerm, opplåsing og strøm
@@ -290,3 +291,16 @@ Lest tilbake: printk `8 4 1 8`, console_suspend N, pm_debug_messages 1, pm_print
 **Hva:** To midlertidige brukertjenester (systemd-run --user, ingen run0, ingen config-filer): `fp5-avrcp-log-session` (dbus-monitor på sesjonsbussen for MPRIS Player-kall og egenskapsendringer på /org/mpris/MediaPlayer2) og `fp5-avrcp-log-system` (signaler fra org.bluez, f.eks. MediaTransport1 Volume). Logger til `~/.local/state/fp5-avrcp-log/`.
 **Hvorfor:** Kristians ja (via Grok Bot 16:45). Bilen satte volumet til 0 og dempet lyden flere ganger (16:28, 16:34, 16:36, 16:44), Podcasts sto på pause, og play i bilen ga ikke lyd. Loggingen skal vise om bilen sender Pause/Play og volum 0.
 **Tilbake:** Forsvinner ved omstart, eller `systemctl --user stop fp5-avrcp-log-session fp5-avrcp-log-system`. Loggfilene kan slettes etterpå.
+
+### 2026-11-24 22:49 — Automatisk stillemodus kl. 21–07 (brukertimere)
+
+**Hva:** Fire nye brukerenheter i `~/.config/systemd/user/` (ingen systemoppsett, ingen run0, ingen andre tjenester restartet):
+- `fp5-quiet-hours-on.timer`/`.service`: `OnCalendar=*-*-* 21:00:00`, `Persistent=false`, `AccuracySec=1s`. Kjører `gsettings set org.sigxcpu.feedbackd profile silent`.
+- `fp5-quiet-hours-off.timer`/`.service`: `OnCalendar=*-*-* 07:00:00`, samme innstillinger. Kjører `gsettings set org.sigxcpu.feedbackd profile full`.
+
+Timerne er aktivert (`systemctl --user daemon-reload && systemctl --user enable --now` bare på de to timerne). Dette er samme bryter som i Phosh-hurtiginnstillingene (`full` / `quiet` / `silent`; «stille» = `silent`, «vanlig lyd» = `full`). `fp5-feedbackd-profile-sync` følger automatisk. Lydprofilen ble **ikke** endret ved installasjon: kl. 22:49 (Europe/Oslo) var kvelden allerede i gang, men profilen sto på `full` og ble stående. Første stille-kjøring er ons. 25.11 21:00; første `full`-kjøring er ons. 25.11 07:00 (da er den allerede `full`).
+**Hvorfor:** Kristian (t989u) vil ha stillemodus automatisk kl. 21 hver kveld og vanlig lyd kl. 07, uten at alarmen styrer det.
+**Alarm:** `~/.local/bin/fp5-clocks-alarm-sound` v2 (sha256 01b120fc…, uendret) spiller fortsatt `paplay` med `media.role=Alarm` når profilen ikke er `full`.
+**Backup:** `~/.local/state/fp5-quiet-hours/backup-20261124T224915/` (ingen eksisterende filer ble overskrevet).
+**Tilbake:** `systemctl --user disable --now fp5-quiet-hours-on.timer fp5-quiet-hours-off.timer` og fjern de fire enhetsfilene, eller `sh ~/.local/state/fp5-quiet-hours/rollback.sh`. Rører ikke gjeldende profil.
+**Gjentatt anrop:** Ingen innebygd funksjon «samme anroper to ganger innen ca. et kvarter slipper gjennom stillemodus» i feedbackd 0.8.11, gnome-calls 51.1 eller Phosh 0.59.0 på denne byggingen. feedbackd har `allow-important` (hintet `important` kan overstyre profilen for visse apper, f.eks. nødvarsler og Klokker; Calls er ikke i lista). Et oppstrømsforslag i Calls (!782) om at favorittkontakter kan ringe gjennom stillemodus er ikke med i 51.1. phosh-antispam har et tilbakeringingsunntak i spamfilteret, men tjenesten er av.
