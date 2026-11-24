@@ -284,3 +284,9 @@ Lest tilbake: printk `8 4 1 8`, console_suspend N, pm_debug_messages 1, pm_print
 **Hvorfor:** Kristians eget ja via Grok Bot 15:01 («Ja, start WirePlumber på nytt nå»). WirePlumber startet før HFP-broen (fa07443, installert 14:03) fikk navnet, så den må lastes på nytt for å se modemet fp5-imsd.
 **Resultat:** wireplumber, pipewire, pipewire-pulse og fp5-hfp-modem-bridge er aktive. «patched libspa-bluez5 enabled» logget 15:02:08, og `60-fp5-hfp-modem.conf` lastes. Broen (PID uendret siden 14:03:31) eier fortsatt io.github.isyourbrainfoss.Fp5HfpModem på systembussen og eksporterer /org/freedesktop/ModemManager1/Modem/fp5imsd0. Bilen var ikke tilkoblet, så selve HFP-bindingen (SCO, RING/+CIEV/+CLIP) er ikke testet før neste ekte bilsamtale. Kjent varsel uten endring: «ofono running, but not configured as HFP/HSP backend».
 **Tilbake:** Ikke nødvendig. Ved problemer: `systemctl --user restart wireplumber` igjen, eller rollback av broen: `run0 sh /var/lib/fp5-backup/20261124T140321-hfp-dbus-policy-uid/rollback.sh`.
+
+### 2026-11-24 16:45 — Midlertidig logging av bilens pause-/play-/volumkommandoer
+
+**Hva:** To midlertidige brukertjenester (systemd-run --user, ingen run0, ingen config-filer): `fp5-avrcp-log-session` (dbus-monitor på sesjonsbussen for MPRIS Player-kall og egenskapsendringer på /org/mpris/MediaPlayer2) og `fp5-avrcp-log-system` (signaler fra org.bluez, f.eks. MediaTransport1 Volume). Logger til `~/.local/state/fp5-avrcp-log/`.
+**Hvorfor:** Kristians ja (via Grok Bot 16:45). Bilen satte volumet til 0 og dempet lyden flere ganger (16:28, 16:34, 16:36, 16:44), Podcasts sto på pause, og play i bilen ga ikke lyd. Loggingen skal vise om bilen sender Pause/Play og volum 0.
+**Tilbake:** Forsvinner ved omstart, eller `systemctl --user stop fp5-avrcp-log-session fp5-avrcp-log-system`. Loggfilene kan slettes etterpå.
