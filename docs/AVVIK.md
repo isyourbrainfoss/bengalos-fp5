@@ -277,3 +277,10 @@ Lest tilbake: printk `8 4 1 8`, console_suspend N, pm_debug_messages 1, pm_print
 **Hvorfor:** Kristian vil vente noen dager (t974u). RFC-en er ikke tatt inn upstream, og den forklarer bare dødsfall med lader (pluggen settes i eller tas ut under s2idle), ikke de uten lader (21.11 10:54, 22.11 ~20:58).
 **Midlertidig tiltak:** Kristian skrur på skjermen før han setter i eller tar ut laderen. Ingen endring på telefonen.
 **Neste steg:** Sjekk RFC-status upstream og bestem om det skal bygges en UKI for testoppstart. Les console-ramoops ved neste dødsfall uten lader.
+
+### 2026-11-24 15:02 — WirePlumber restartet etter HFP-broens D-Bus-fiks
+
+**Hva:** `systemctl --user restart wireplumber` (bare brukertjenesten, ingen run0). Ny WirePlumber-PID startet 15:02:08; forrige kjørte siden 23.11 17:20. Ingen andre tjenester restartet, ingen omstart, ingen samtale.
+**Hvorfor:** Kristians eget ja via Grok Bot 15:01 («Ja, start WirePlumber på nytt nå»). WirePlumber startet før HFP-broen (fa07443, installert 14:03) fikk navnet, så den må lastes på nytt for å se modemet fp5-imsd.
+**Resultat:** wireplumber, pipewire, pipewire-pulse og fp5-hfp-modem-bridge er aktive. «patched libspa-bluez5 enabled» logget 15:02:08, og `60-fp5-hfp-modem.conf` lastes. Broen (PID uendret siden 14:03:31) eier fortsatt io.github.isyourbrainfoss.Fp5HfpModem på systembussen og eksporterer /org/freedesktop/ModemManager1/Modem/fp5imsd0. Bilen var ikke tilkoblet, så selve HFP-bindingen (SCO, RING/+CIEV/+CLIP) er ikke testet før neste ekte bilsamtale. Kjent varsel uten endring: «ofono running, but not configured as HFP/HSP backend».
+**Tilbake:** Ikke nødvendig. Ved problemer: `systemctl --user restart wireplumber` igjen, eller rollback av broen: `run0 sh /var/lib/fp5-backup/20261124T140321-hfp-dbus-policy-uid/rollback.sh`.
