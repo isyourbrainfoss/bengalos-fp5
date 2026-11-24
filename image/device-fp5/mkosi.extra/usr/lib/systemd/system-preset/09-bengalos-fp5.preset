@@ -1,3 +1,6 @@
+# SUPERSEDED. image/profiles/device-sc7280-fp5 enables 81voltd* and hexagon*.
+# The "disable 81voltd*" line below is the old SD draft and is wrong for the
+# lab phone. Kept so this draft still matches the October patch series.
 # Fairphone 5: never touch A/B slot metadata or bootloader firmware from the OS.
 # (qbootctl itself is purged from the image by mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot)
 disable qbootctl.service

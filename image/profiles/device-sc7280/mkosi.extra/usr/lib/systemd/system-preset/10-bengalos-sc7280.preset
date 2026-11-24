@@ -1,0 +1,5 @@
+# Disable until audio is fixed
+disable 81voltd*
+
+# Disable until boot is stable
+disable hexagon*

@@ -1,0 +1,19 @@
+# Fairphone 5. This file sorts before 10-bengalos-sc7280.preset.
+# systemd uses the first matching preset line, so the enables here win
+# over the otter preset, which disables 81voltd* and hexagon*.
+# The lab phone needs calling and the sensor stack.
+enable 81voltd*
+enable hexagon*
+enable mnt-persist.mount
+enable fp5-sensors-registry.service
+enable hexagonrpcd.service
+enable hexagonrpcd-adsp-rootpd.service
+enable hexagonrpcd-suspend.service
+enable hexagonrpcd-resume.service
+
+# Never touch A/B slot metadata or bootloader firmware from the OS.
+# qbootctl is also purged (see 50-fp5-remove-qbootctl.sh.chroot).
+disable qbootctl.service
+disable fwupd.service
+disable fwupd-refresh.timer
+disable fwupd-refresh.service

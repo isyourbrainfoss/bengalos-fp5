@@ -1,0 +1,18 @@
+# FP5 add-on: module tree for kernel 7.2.8-sc7280-volte20261107+. Same pattern as the official dev.transfer / waydroid.transfer, but NOT feature-gated:
+# the phone needs this sysext for every usr version, so sysupdate should only offer versions the FP5 feed has.
+# Source = FP5 feed PLACEHOLDER (see 20-uki.transfer).
+[Transfer]
+ProtectVersion=%A
+Verify=no
+
+[Source]
+Type=url-file
+Path=https://github.com/isyourbrainfoss/bengalos-fp5/releases/download/fp5-feed/
+MatchPattern=fp5-volte-modules_@v.raw.xz
+
+[Target]
+Type=regular-file
+Path=/var/lib/extensions
+MatchPattern=fp5-volte-modules_@v.raw
+Mode=0444
+InstancesMax=2

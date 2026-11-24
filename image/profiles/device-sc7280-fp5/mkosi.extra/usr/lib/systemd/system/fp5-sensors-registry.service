@@ -1,0 +1,18 @@
+# Fairphone 5: copy the Android sensors registry (read-only source) into hexagonrpcd's root.
+# UNVERIFIED source path: Android keeps it in /mnt/vendor/persist/sensors/registry/.
+[Unit]
+Description=Copy FP5 sensors registry from persist (read-only)
+Requires=mnt-persist.mount
+After=mnt-persist.mount droid-juicer.service
+Before=hexagonrpcd.service hexagonrpcd-adsp-rootpd.service
+ConditionPathExists=/mnt/persist/sensors/registry
+ConditionPathExists=!/var/lib/droid-juicer/sensors/sensors/registry
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/mkdir -p /var/lib/droid-juicer/sensors/sensors
+ExecStart=/usr/bin/cp -a --no-preserve=ownership /mnt/persist/sensors/registry /var/lib/droid-juicer/sensors/sensors/registry
+ExecStart=/usr/bin/sh -c 'f=/mnt/persist/sensors/sns_reg.conf; [ -f "$f" ] && cp "$f" /var/lib/droid-juicer/sensors/sensors/ || true'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,527 @@
+diff --git a/Makefile b/Makefile
+index 4fecfac..b842282 100644
+--- a/Makefile
++++ b/Makefile
+@@ -11,6 +11,12 @@ bengalos: build-${DEVICE}-${FLAVOR}/.done
+ bengalos-amd64-immutable:
+ 	$(MAKE) DEVICE=amd64 FLAVOR=immutable bengalos
+ 
++bengalos-sc7280-immutable:
++	$(MAKE) DEVICE=sc7280 FLAVOR=immutable bengalos
++
++bengalos-fp5-immutable:
++	$(MAKE) DEVICE=sc7280-fp5 FLAVOR=immutable bengalos
++
+ bengalos-sdm670-immutable:
+ 	$(MAKE) DEVICE=sdm670 FLAVOR=immutable bengalos
+ 
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.conf b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.conf
+new file mode 100644
+index 0000000..8cf3fe8
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.conf
+@@ -0,0 +1,29 @@
++# Fairphone 5 overlay on upstream device-sc7280 (UFS, 4K sectors).
++# Does not replace device-sc7280. Include pulls in bengalos-kernel-sc7280,
++# the otter DTB and SectorSize=4096. This file only adds the FP5 DTB and
++# the FP5 userspace delta.
++#
++# The old image/device-fp5 profile (microSD, SectorSize=512, 81voltd and
++# hexagon disabled) is not used for this image. The lab phone boots from
++# internal UFS and must keep VoLTE and the sensor stack on.
++[Build]
++Environment=
++        BOS_DEVICE=sc7280
++
++[Include]
++Include=../device-sc7280
++
++[Content]
++# Appended after device-sc7280's otter DTB. The UKI keeps both.
++# linux-image-7.2.8-sc7280+ (7.2.8-bengalos.20261019) already ships
++# qcom/qcm6490-fairphone-fp5.dtb.
++Devicetrees=
++        qcom/qcm6490-fairphone-fp5.dtb
++
++KernelCommandLine=
++        # Camera buffers. Same value as the lab FP5 kernel command line.
++        cma=128M
++
++[Output]
++# Internal UFS logical sectors are 4096 bytes. Not the old SD value of 512.
++SectorSize=4096
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset
+new file mode 100644
+index 0000000..0da3706
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system-preset/09-bengalos-fp5.preset
+@@ -0,0 +1,19 @@
++# Fairphone 5. This file sorts before 10-bengalos-sc7280.preset.
++# systemd uses the first matching preset line, so the enables here win
++# over the otter preset, which disables 81voltd* and hexagon*.
++# The lab phone needs calling and the sensor stack.
++enable 81voltd*
++enable hexagon*
++enable mnt-persist.mount
++enable fp5-sensors-registry.service
++enable hexagonrpcd.service
++enable hexagonrpcd-adsp-rootpd.service
++enable hexagonrpcd-suspend.service
++enable hexagonrpcd-resume.service
++
++# Never touch A/B slot metadata or bootloader firmware from the OS.
++# qbootctl is also purged (see 50-fp5-remove-qbootctl.sh.chroot).
++disable qbootctl.service
++disable fwupd.service
++disable fwupd-refresh.timer
++disable fwupd-refresh.service
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/fp5-sensors-registry.service b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/fp5-sensors-registry.service
+new file mode 100644
+index 0000000..641126b
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/fp5-sensors-registry.service
+@@ -0,0 +1,18 @@
++# Fairphone 5: copy the Android sensors registry (read-only source) into hexagonrpcd's root.
++# UNVERIFIED source path: Android keeps it in /mnt/vendor/persist/sensors/registry/.
++[Unit]
++Description=Copy FP5 sensors registry from persist (read-only)
++Requires=mnt-persist.mount
++After=mnt-persist.mount droid-juicer.service
++Before=hexagonrpcd.service hexagonrpcd-adsp-rootpd.service
++ConditionPathExists=/mnt/persist/sensors/registry
++ConditionPathExists=!/var/lib/droid-juicer/sensors/sensors/registry
++
++[Service]
++Type=oneshot
++ExecStart=/usr/bin/mkdir -p /var/lib/droid-juicer/sensors/sensors
++ExecStart=/usr/bin/cp -a --no-preserve=ownership /mnt/persist/sensors/registry /var/lib/droid-juicer/sensors/sensors/registry
++ExecStart=/usr/bin/sh -c 'f=/mnt/persist/sensors/sns_reg.conf; [ -f "$f" ] && cp "$f" /var/lib/droid-juicer/sensors/sensors/ || true'
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd-adsp-rootpd.service b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd-adsp-rootpd.service
+new file mode 100644
+index 0000000..15ce974
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd-adsp-rootpd.service
+@@ -0,0 +1,22 @@
++# Fairphone 5: ADSP root PD instance (Nura runs rootpd + sensorspd; the Debian unit is sensorspd only).
++[Unit]
++Description=Hexagon DSP root PD daemon (ADSP, FP5)
++ConditionPathExists=/var/lib/droid-juicer/sensors/sensors/config
++Conflicts=shutdown.target
++After=multi-user.target
++Before=shutdown.target
++
++[Service]
++Type=simple
++DevicePolicy=closed
++DeviceAllow=/dev/fastrpc-adsp
++ProtectSystem=strict
++ProtectHome=read-only
++PrivateNetwork=yes
++NoNewPrivileges=yes
++ExecStart=/usr/libexec/hexagonrpc/hexagonrpcd -f /dev/fastrpc-adsp -d adsp -R /var/lib/droid-juicer/sensors/
++User=fastrpc
++Group=fastrpc
++
++[Install]
++WantedBy=default.target
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd.service.d/10-fp5.conf b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd.service.d/10-fp5.conf
+new file mode 100644
+index 0000000..89d9f4e
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/hexagonrpcd.service.d/10-fp5.conf
+@@ -0,0 +1,3 @@
++# Fairphone 5: only start once droid-juicer has extracted the sensors config.
++[Unit]
++ConditionPathExists=/var/lib/droid-juicer/sensors/sensors/config
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/make-dynpart-mappings@.service.d/10-fp5-readonly.conf b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/make-dynpart-mappings@.service.d/10-fp5-readonly.conf
+new file mode 100644
+index 0000000..0bd5bbe
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/make-dynpart-mappings@.service.d/10-fp5-readonly.conf
+@@ -0,0 +1,4 @@
++# Fairphone 5: make the device-mapper views of Android dynamic partitions read-only
++# (make-dynpart-mappings opens super O_RDONLY but creates writable dm targets).
++[Service]
++ExecStartPost=/bin/sh -c 'for d in /dev/mapper/*; do [ "$d" = /dev/mapper/control ] && continue; [ -b "$d" ] && /usr/sbin/blockdev --setro "$d"; done; true'
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/mnt-persist.mount b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/mnt-persist.mount
+new file mode 100644
+index 0000000..d51afef
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/systemd/system/mnt-persist.mount
+@@ -0,0 +1,17 @@
++# Fairphone 5: Android "persist" (sensors registry, fingerprint secure storage).
++# READ-ONLY, always. "noload" skips ext4 journal replay, so mounting can never write to it.
++# The block device is also set read-only by 61-bengalos-fp5-ufs-readonly.rules.
++# NEVER change this to rw in this image. A rw persist for fingerprint templates is a later phase.
++[Unit]
++Description=Android persist partition (read-only)
++ConditionPathExists=/dev/disk/by-partlabel/persist
++DefaultDependencies=no
++Conflicts=umount.target
++Before=umount.target
++
++[Mount]
++What=/dev/disk/by-partlabel/persist
++Where=/mnt/persist
++Type=ext4
++Options=ro,noload,nosuid,nodev,noexec,noatime
++DirectoryMode=0755
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/udev/rules.d/61-bengalos-fp5-ufs-readonly.rules b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/udev/rules.d/61-bengalos-fp5-ufs-readonly.rules
+new file mode 100644
+index 0000000..bd77b61
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/udev/rules.d/61-bengalos-fp5-ufs-readonly.rules
+@@ -0,0 +1,7 @@
++# Internal UFS boot. BengalOS lives in the userdata nested GPT, so userdata
++# must stay writable. super stays writable so device-mapper can map it; the
++# dynpart drop-in then sets those mapper devices read-only.
++# Every other UFS disk and partition is read-only (xbl, abl, boot, modem, persist).
++# The microSD draft of this rule also locked userdata. Do not use that draft here.
++ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="sd[b-f]", RUN+="/usr/sbin/blockdev --setro $devnode"
++ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", KERNEL=="sd[a-f][0-9]*", ENV{ID_PART_ENTRY_NAME}!="super", ENV{ID_PART_ENTRY_NAME}!="userdata", RUN+="/usr/sbin/blockdev --setro $devnode"
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/udev/rules.d/81-libssc-fairphone-fp5.rules b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/udev/rules.d/81-libssc-fairphone-fp5.rules
+new file mode 100644
+index 0000000..2bad473
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/lib/udev/rules.d/81-libssc-fairphone-fp5.rules
+@@ -0,0 +1,3 @@
++# iio-sensor-proxy with libssc: accelerometer mount matrix
++
++SUBSYSTEM=="misc", KERNEL=="fastrpc-*", ENV{ACCEL_MOUNT_MATRIX}+="-1, 0, 0; 0, -1, 0; 0, 0, -1"
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/droid-juicer-fairphone,fp5.toml b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/droid-juicer-fairphone,fp5.toml
+new file mode 100644
+index 0000000..cd35446
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/droid-juicer-fairphone,fp5.toml
+@@ -0,0 +1,49 @@
++# Fairphone 5 droid-juicer config. DRAFT for local testing (BengalOS FP5 prep, 2026-10-27).
++# = upstream droid-juicer configs/fairphone,fp5.toml + QSEE fingerprint trustlet + sensors config.
++# droid-juicer mounts every partition with MS_RDONLY and tries <name>, <name>_a, then <name>_b,
++# so it reads slot A (stock Android). The FP5 udev rule also makes the UFS block devices read-only.
++# Deliberately NO "persist" entry: a failed persist mount would abort the whole extraction.
++# The sensors registry comes from fp5-sensors-registry.service (read-only persist mount) instead.
++[juicer]
++dynpart = "super"
++firmware = [
++    { partition = "vendor", origin = "firmware", destination = "qcom/qcm6490/fairphone5", files = [
++            { name = "a660_zap.mdt" },
++            { name = "aw882xx_acf.bin", rename = "aw88261_acf.bin" },
++            { name = "vpu20_1v.mdt", rename = "venus.mdt" },
++            { name = "yupik_ipa_fws.mdt", rename = "ipa_fws.mdt" },
++        ] },
++    { partition = "modem", origin = "image", destination = "qcom/qcm6490/fairphone5", files = [
++            { name = "adsp.mdt" },
++            { name = "adspr.jsn" },
++            { name = "adsps.jsn" },
++            { name = "adspua.jsn" },
++            { name = "battmgr.jsn" },
++            { name = "cdsp.mdt" },
++            { name = "cdspr.jsn" },
++            { name = "modem.mdt" },
++            { name = "modemr.jsn" },
++            { name = "wpss.mdt" },
++        ] },
++    # Fingerprint trustlet for the QTEE session (fp5-qtee). Android: /vendor/firmware_mnt/image/
++    # = modem_a "image/". Squashed by droid-juicer to /var/lib/firmware/qsee/focal32.mbn.
++    # fingerpr is optional and must NOT be loaded next to focal32 (fp5 TODO F.2); kept out for now.
++    { partition = "modem", origin = "image", destination = "qsee", files = [
++            { name = "focal32.mdt" },
++            # { name = "fingerpr.mdt" },
++        ] },
++    { partition = "bluetooth", origin = "image", destination = "qca", files = [
++            { name = "msbtfw11.mbn" },
++            { name = "msnv11.bin" },
++        ] },
++]
++folders = [
++    { partition = "modem", destination = "qcom/qcm6490/fairphone5", folders = [
++        { name = "image/modem_pr" },
++    ] },
++    # Sensors JSON config for hexagonrpcd's hexagonfs (default root /var/lib/droid-juicer/sensors/).
++    # UNVERIFIED path on the Android side: check `ls /vendor/etc/sensors/config` read-only first.
++    { partition = "vendor", destination = "/var/lib/droid-juicer/sensors/sensors", folders = [
++        { name = "etc/sensors/config" },
++    ] },
++]
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/20-uki.transfer b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/20-uki.transfer
+new file mode 100644
+index 0000000..7fc06c6
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/20-uki.transfer
+@@ -0,0 +1,36 @@
++# FP5 OVERRIDE of /usr/lib/sysupdate.d/20-uki.transfer (same file name in /etc wins).
++# Why: the official usr is VARIANT_ID=sdm845, so the official transfer would install the sdm845 kernel/DTB.
++# Source = the FP5 feed (PLACEHOLDER, not created yet: GitHub repo isyourbrainfoss/bengalos-fp5, rolling release
++# tag "fp5-feed"; every asset + one SHA256SUMS listing all offered versions live in that single release,
++# because sysupdate needs one directory: https://github.com/systemd/systemd/issues/41977).
++# Target is identical to the official transfer so systemd-boot/bootctl/sysupdate treat it the same way.
++[Transfer]
++ProtectVersion=%A
++# Verify=no: no FP5 signing key yet (same trust as today's local transfers; HTTPS to GitHub only).
++# To sign later: gpg-sign SHA256SUMS -> SHA256SUMS.gpg and APPEND the FP5 public key to a copy of
++# /usr/lib/systemd/import-pubring.gpg in /etc/systemd/import-pubring.gpg (replacing it would break the
++# official usr transfers' verification).
++Verify=no
++
++[Source]
++Type=url-file
++Path=https://github.com/isyourbrainfoss/bengalos-fp5/releases/download/fp5-feed/
++MatchPattern=%M_@v.efi.xz
++
++[Target]
++Type=regular-file
++Path=/EFI/Linux
++PathRelativeTo=boot
++# FP5: same pattern order as the official transfer (the FIRST pattern is the one sysupdate writes), so new
++# UKIs are installed boot-counted (%M_@v_%a+3.efi). Boot counting enabled 2026-11-15 (Kristian: test it).
++# U-Boot already writes this ESP (ubootefi.var, boot-secret-mixin) and fsck.fat is clean.
++MatchPattern=%M_@v_%a+@l.efi \
++             %M_@v_%a.efi \
++             %M_@v+@l-@d.efi \
++             %M_@v+@l.efi \
++             %M_@v.efi
++Mode=0600
++# Boot counting ON (official values). Rollback: /var/lib/fp5-backup/20261115-bootcount/20-uki.transfer
++TriesLeft=3
++TriesDone=0
++InstancesMax=2
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/30-fp5-volte-modules.transfer b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/30-fp5-volte-modules.transfer
+new file mode 100644
+index 0000000..65b5ba3
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/30-fp5-volte-modules.transfer
+@@ -0,0 +1,18 @@
++# FP5 add-on: module tree for kernel 7.2.8-sc7280-volte20261107+. Same pattern as the official dev.transfer / waydroid.transfer, but NOT feature-gated:
++# the phone needs this sysext for every usr version, so sysupdate should only offer versions the FP5 feed has.
++# Source = FP5 feed PLACEHOLDER (see 20-uki.transfer).
++[Transfer]
++ProtectVersion=%A
++Verify=no
++
++[Source]
++Type=url-file
++Path=https://github.com/isyourbrainfoss/bengalos-fp5/releases/download/fp5-feed/
++MatchPattern=fp5-volte-modules_@v.raw.xz
++
++[Target]
++Type=regular-file
++Path=/var/lib/extensions
++MatchPattern=fp5-volte-modules_@v.raw
++Mode=0444
++InstancesMax=2
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/31-fp5-qtee.transfer b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/31-fp5-qtee.transfer
+new file mode 100644
+index 0000000..a64d46c
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/31-fp5-qtee.transfer
+@@ -0,0 +1,18 @@
++# FP5 add-on: fingerprint (QTEE broker + fprintd stand-in). Same pattern as the official dev.transfer / waydroid.transfer, but NOT feature-gated:
++# the phone needs this sysext for every usr version, so sysupdate should only offer versions the FP5 feed has.
++# Source = FP5 feed PLACEHOLDER (see 20-uki.transfer).
++[Transfer]
++ProtectVersion=%A
++Verify=no
++
++[Source]
++Type=url-file
++Path=https://github.com/isyourbrainfoss/bengalos-fp5/releases/download/fp5-feed/
++MatchPattern=fp5-qtee_@v.raw.xz
++
++[Target]
++Type=regular-file
++Path=/var/lib/extensions
++MatchPattern=fp5-qtee_@v.raw
++Mode=0444
++InstancesMax=2
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/32-fp5-ims-app.transfer b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/32-fp5-ims-app.transfer
+new file mode 100644
+index 0000000..5339c40
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/32-fp5-ims-app.transfer
+@@ -0,0 +1,18 @@
++# FP5 add-on: IMS polkit action net.catcrafts.IMS1. Same pattern as the official dev.transfer / waydroid.transfer, but NOT feature-gated:
++# the phone needs this sysext for every usr version, so sysupdate should only offer versions the FP5 feed has.
++# Source = FP5 feed PLACEHOLDER (see 20-uki.transfer).
++[Transfer]
++ProtectVersion=%A
++Verify=no
++
++[Source]
++Type=url-file
++Path=https://github.com/isyourbrainfoss/bengalos-fp5/releases/download/fp5-feed/
++MatchPattern=fp5-ims-app_@v.raw.xz
++
++[Target]
++Type=regular-file
++Path=/var/lib/extensions
++MatchPattern=fp5-ims-app_@v.raw
++Mode=0444
++InstancesMax=2
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/33-fp5-device.transfer b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/33-fp5-device.transfer
+new file mode 100644
+index 0000000..816b861
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/33-fp5-device.transfer
+@@ -0,0 +1,18 @@
++# FP5 add-on: FP5 device layer (units, udev rules incl. the INTERNAL UFS read-only rule). Same pattern as the official dev.transfer / waydroid.transfer, but NOT feature-gated:
++# the phone needs this sysext for every usr version, so sysupdate should only offer versions the FP5 feed has.
++# Source = FP5 feed PLACEHOLDER (see 20-uki.transfer).
++[Transfer]
++ProtectVersion=%A
++Verify=no
++
++[Source]
++Type=url-file
++Path=https://github.com/isyourbrainfoss/bengalos-fp5/releases/download/fp5-feed/
++MatchPattern=fp5-device_@v.raw.xz
++
++[Target]
++Type=regular-file
++Path=/var/lib/extensions
++MatchPattern=fp5-device_@v.raw
++Mode=0444
++InstancesMax=2
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/34-fp5-waydroid-fix.transfer b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/34-fp5-waydroid-fix.transfer
+new file mode 100644
+index 0000000..47abc02
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.extra/usr/share/fp5/sysupdate.d/34-fp5-waydroid-fix.transfer
+@@ -0,0 +1,22 @@
++# FP5 add-on: fp5-waydroid-fix_<v> = the generated caches (gschemas.compiled, mime db, icon-theme.cache,
++# giomodule.cache, immodules.cache) regenerated from base usr + the official BengalOS-waydroid-sysext_<v>, which ships
++# small-build-root copies that shadow the base ones (phoc: "Settings schema 'mobi.phosh.phoc' is not installed").
++# Gated on the official "waydroid" feature, so it is only fetched together with the waydroid sysext.
++# "fp5-waydroid-fix" sorts after "BengalOS-waydroid-sysext" and every other fp5-* name, so systemd-sysext stacks it on top.
++# See docs/UPSTREAM-NOTES.md and waydroid/README.md.
++[Transfer]
++Features=waydroid
++ProtectVersion=%A
++Verify=no
++
++[Source]
++Type=url-file
++Path=https://github.com/isyourbrainfoss/bengalos-fp5/releases/download/fp5-feed/
++MatchPattern=fp5-waydroid-fix_@v.raw.xz
++
++[Target]
++Type=regular-file
++Path=/var/lib/extensions
++MatchPattern=fp5-waydroid-fix_@v.raw
++Mode=0444
++InstancesMax=2
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot
+new file mode 100755
+index 0000000..26ba842
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280-fp5/mkosi.postinst.d/50-fp5-remove-qbootctl.sh.chroot
+@@ -0,0 +1,59 @@
++#!/bin/sh
++# Fairphone 5 image fixes that have to run after packages are unpacked.
++# qbootctl can brick an FP5 (linux-msm/qbootctl issue 4). It must not be
++# installed, and nothing in this image may write bootloader or boot partitions.
++set -eu
++
++# qcom-phone-utils depends on qbootctl. Replace the real package with an
++# empty stub so dpkg stays consistent and the binary is gone.
++if dpkg-query -W -f='${Status}' qbootctl 2>/dev/null | grep -q 'ok installed'; then
++    dpkg --purge --force-depends qbootctl
++fi
++stub=$(mktemp -d)
++mkdir -p "$stub/DEBIAN"
++cat > "$stub/DEBIAN/control" <<'CTRL'
++Package: bengalos-fp5-no-qbootctl
++Version: 1.0
++Architecture: all
++Maintainer: BengalOS FP5 desk build <root@localhost>
++Provides: qbootctl (= 0.2.2-99)
++Conflicts: qbootctl
++Replaces: qbootctl
++Description: empty stub so qbootctl is never installed on Fairphone 5
++ This package ships no files. It only satisfies Depends: qbootctl.
++CTRL
++dpkg-deb --root-owner-group -b "$stub" /tmp/bengalos-fp5-no-qbootctl.deb >/dev/null
++dpkg -i /tmp/bengalos-fp5-no-qbootctl.deb
++rm -rf "$stub" /tmp/bengalos-fp5-no-qbootctl.deb
++rm -f /usr/bin/qbootctl /usr/sbin/qbootctl /usr/lib/systemd/system/qbootctl.service
++rm -f /etc/systemd/system/*.wants/qbootctl.service /etc/systemd/system/qbootctl.service
++ln -sf /dev/null /etc/systemd/system/qbootctl.service
++
++# qcom-phone-utils ships a kernel postinst hook that writes an Android boot
++# image. Remove it. BengalOS on this phone boots a UKI from the ESP.
++rm -f /etc/kernel/postinst.d/zz-qcom-bootimg
++rm -f /usr/share/kernel/postinst.d/zz-qcom-bootimg /usr/lib/kernel/postinst.d/zz-qcom-bootimg
++
++# fwupd stays disabled, same as the lab image. Mask in case a package enables it.
++ln -sf /dev/null /etc/systemd/system/fwupd.service
++ln -sf /dev/null /etc/systemd/system/fwupd-refresh.timer
++ln -sf /dev/null /etc/systemd/system/fwupd-refresh.service
++
++# FP5 copies that must win over files the packages just installed.
++install -d /usr/lib/sysupdate.d /usr/share/droid-juicer/configs
++cp -a /usr/share/fp5/sysupdate.d/. /usr/lib/sysupdate.d/
++cp -a /usr/share/fp5/droid-juicer-fairphone,fp5.toml /usr/share/droid-juicer/configs/fairphone,fp5.toml
++
++if [ -e /usr/bin/qbootctl ] || [ -e /usr/sbin/qbootctl ] || [ -e /etc/kernel/postinst.d/zz-qcom-bootimg ]; then
++    echo "qbootctl binary or boot-image hook still present" >&2
++    exit 1
++fi
++if ! grep -q 'focal32.mdt' /usr/share/droid-juicer/configs/fairphone,fp5.toml; then
++    echo "FP5 droid-juicer config was not installed" >&2
++    exit 1
++fi
++if ! grep -q 'isyourbrainfoss/bengalos-fp5' /usr/lib/sysupdate.d/20-uki.transfer; then
++    echo "FP5 sysupdate feed was not installed" >&2
++    exit 1
++fi
++dpkg --audit
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280/mkosi.conf b/mkosi.conf.d/mkosi.profiles/device-sc7280/mkosi.conf
+new file mode 100644
+index 0000000..9797992
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280/mkosi.conf
+@@ -0,0 +1,22 @@
++# Upstream device-sc7280 from bengalos-recipes !118 (SHIFT8 / otter).
++# Commit 71511f021d840250213843e39bba36548eb14244, not merged to main
++# as of 2026-11-24 (main was 7e689106366e5ee38bcea47ac970883ba53ce50a).
++# Kept verbatim so the FP5 profile can Include it instead of forking it.
++[Build]
++Environment=
++        BOS_DEVICE=sc7280
++
++[Include]
++# Use the device-qcom profile as base
++Include=../device-qcom
++
++[Content]
++Packages=
++        bengalos-kernel-sc7280
++
++Devicetrees=
++        qcom/qcm6490-shift-otter.dtb
++
++[Output]
++# Usually UFS with 4k blocks is used.
++SectorSize=4096
+diff --git a/mkosi.conf.d/mkosi.profiles/device-sc7280/mkosi.extra/usr/lib/systemd/system-preset/10-bengalos-sc7280.preset b/mkosi.conf.d/mkosi.profiles/device-sc7280/mkosi.extra/usr/lib/systemd/system-preset/10-bengalos-sc7280.preset
+new file mode 100644
+index 0000000..2aa344a
+--- /dev/null
++++ b/mkosi.conf.d/mkosi.profiles/device-sc7280/mkosi.extra/usr/lib/systemd/system-preset/10-bengalos-sc7280.preset
+@@ -0,0 +1,5 @@
++# Disable until audio is fixed
++disable 81voltd*
++
++# Disable until boot is stable
++disable hexagon*
+diff --git a/mkosi.conf.d/mkosi.profiles/image-immutable/mkosi.repart/12-usr.conf b/mkosi.conf.d/mkosi.profiles/image-immutable/mkosi.repart/12-usr.conf
+index 34bc8e5..c4b70c1 100644
+--- a/mkosi.conf.d/mkosi.profiles/image-immutable/mkosi.repart/12-usr.conf
++++ b/mkosi.conf.d/mkosi.profiles/image-immutable/mkosi.repart/12-usr.conf
+@@ -11,3 +11,4 @@ VerityMatchKey=usr
+ Minimize=yes
+ Compression=zstd
+ SplitName=usr
++FileSystemSectorSize=4096

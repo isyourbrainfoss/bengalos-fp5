@@ -1,0 +1,36 @@
+# FP5 OVERRIDE of /usr/lib/sysupdate.d/20-uki.transfer (same file name in /etc wins).
+# Why: the official usr is VARIANT_ID=sdm845, so the official transfer would install the sdm845 kernel/DTB.
+# Source = the FP5 feed (PLACEHOLDER, not created yet: GitHub repo isyourbrainfoss/bengalos-fp5, rolling release
+# tag "fp5-feed"; every asset + one SHA256SUMS listing all offered versions live in that single release,
+# because sysupdate needs one directory: https://github.com/systemd/systemd/issues/41977).
+# Target is identical to the official transfer so systemd-boot/bootctl/sysupdate treat it the same way.
+[Transfer]
+ProtectVersion=%A
+# Verify=no: no FP5 signing key yet (same trust as today's local transfers; HTTPS to GitHub only).
+# To sign later: gpg-sign SHA256SUMS -> SHA256SUMS.gpg and APPEND the FP5 public key to a copy of
+# /usr/lib/systemd/import-pubring.gpg in /etc/systemd/import-pubring.gpg (replacing it would break the
+# official usr transfers' verification).
+Verify=no
+
+[Source]
+Type=url-file
+Path=https://github.com/isyourbrainfoss/bengalos-fp5/releases/download/fp5-feed/
+MatchPattern=%M_@v.efi.xz
+
+[Target]
+Type=regular-file
+Path=/EFI/Linux
+PathRelativeTo=boot
+# FP5: same pattern order as the official transfer (the FIRST pattern is the one sysupdate writes), so new
+# UKIs are installed boot-counted (%M_@v_%a+3.efi). Boot counting enabled 2026-11-15 (Kristian: test it).
+# U-Boot already writes this ESP (ubootefi.var, boot-secret-mixin) and fsck.fat is clean.
+MatchPattern=%M_@v_%a+@l.efi \
+             %M_@v_%a.efi \
+             %M_@v+@l-@d.efi \
+             %M_@v+@l.efi \
+             %M_@v.efi
+Mode=0600
+# Boot counting ON (official values). Rollback: /var/lib/fp5-backup/20261115-bootcount/20-uki.transfer
+TriesLeft=3
+TriesDone=0
+InstancesMax=2

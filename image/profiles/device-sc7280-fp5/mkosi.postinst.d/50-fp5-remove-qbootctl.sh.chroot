@@ -1,0 +1,59 @@
+#!/bin/sh
+# Fairphone 5 image fixes that have to run after packages are unpacked.
+# qbootctl can brick an FP5 (linux-msm/qbootctl issue 4). It must not be
+# installed, and nothing in this image may write bootloader or boot partitions.
+set -eu
+
+# qcom-phone-utils depends on qbootctl. Replace the real package with an
+# empty stub so dpkg stays consistent and the binary is gone.
+if dpkg-query -W -f='${Status}' qbootctl 2>/dev/null | grep -q 'ok installed'; then
+    dpkg --purge --force-depends qbootctl
+fi
+stub=$(mktemp -d)
+mkdir -p "$stub/DEBIAN"
+cat > "$stub/DEBIAN/control" <<'CTRL'
+Package: bengalos-fp5-no-qbootctl
+Version: 1.0
+Architecture: all
+Maintainer: BengalOS FP5 desk build <root@localhost>
+Provides: qbootctl (= 0.2.2-99)
+Conflicts: qbootctl
+Replaces: qbootctl
+Description: empty stub so qbootctl is never installed on Fairphone 5
+ This package ships no files. It only satisfies Depends: qbootctl.
+CTRL
+dpkg-deb --root-owner-group -b "$stub" /tmp/bengalos-fp5-no-qbootctl.deb >/dev/null
+dpkg -i /tmp/bengalos-fp5-no-qbootctl.deb
+rm -rf "$stub" /tmp/bengalos-fp5-no-qbootctl.deb
+rm -f /usr/bin/qbootctl /usr/sbin/qbootctl /usr/lib/systemd/system/qbootctl.service
+rm -f /etc/systemd/system/*.wants/qbootctl.service /etc/systemd/system/qbootctl.service
+ln -sf /dev/null /etc/systemd/system/qbootctl.service
+
+# qcom-phone-utils ships a kernel postinst hook that writes an Android boot
+# image. Remove it. BengalOS on this phone boots a UKI from the ESP.
+rm -f /etc/kernel/postinst.d/zz-qcom-bootimg
+rm -f /usr/share/kernel/postinst.d/zz-qcom-bootimg /usr/lib/kernel/postinst.d/zz-qcom-bootimg
+
+# fwupd stays disabled, same as the lab image. Mask in case a package enables it.
+ln -sf /dev/null /etc/systemd/system/fwupd.service
+ln -sf /dev/null /etc/systemd/system/fwupd-refresh.timer
+ln -sf /dev/null /etc/systemd/system/fwupd-refresh.service
+
+# FP5 copies that must win over files the packages just installed.
+install -d /usr/lib/sysupdate.d /usr/share/droid-juicer/configs
+cp -a /usr/share/fp5/sysupdate.d/. /usr/lib/sysupdate.d/
+cp -a /usr/share/fp5/droid-juicer-fairphone,fp5.toml /usr/share/droid-juicer/configs/fairphone,fp5.toml
+
+if [ -e /usr/bin/qbootctl ] || [ -e /usr/sbin/qbootctl ] || [ -e /etc/kernel/postinst.d/zz-qcom-bootimg ]; then
+    echo "qbootctl binary or boot-image hook still present" >&2
+    exit 1
+fi
+if ! grep -q 'focal32.mdt' /usr/share/droid-juicer/configs/fairphone,fp5.toml; then
+    echo "FP5 droid-juicer config was not installed" >&2
+    exit 1
+fi
+if ! grep -q 'isyourbrainfoss/bengalos-fp5' /usr/lib/sysupdate.d/20-uki.transfer; then
+    echo "FP5 sysupdate feed was not installed" >&2
+    exit 1
+fi
+dpkg --audit

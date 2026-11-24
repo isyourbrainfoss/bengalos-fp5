@@ -1,0 +1,22 @@
+# FP5 add-on: fp5-waydroid-fix_<v> = the generated caches (gschemas.compiled, mime db, icon-theme.cache,
+# giomodule.cache, immodules.cache) regenerated from base usr + the official BengalOS-waydroid-sysext_<v>, which ships
+# small-build-root copies that shadow the base ones (phoc: "Settings schema 'mobi.phosh.phoc' is not installed").
+# Gated on the official "waydroid" feature, so it is only fetched together with the waydroid sysext.
+# "fp5-waydroid-fix" sorts after "BengalOS-waydroid-sysext" and every other fp5-* name, so systemd-sysext stacks it on top.
+# See docs/UPSTREAM-NOTES.md and waydroid/README.md.
+[Transfer]
+Features=waydroid
+ProtectVersion=%A
+Verify=no
+
+[Source]
+Type=url-file
+Path=https://github.com/isyourbrainfoss/bengalos-fp5/releases/download/fp5-feed/
+MatchPattern=fp5-waydroid-fix_@v.raw.xz
+
+[Target]
+Type=regular-file
+Path=/var/lib/extensions
+MatchPattern=fp5-waydroid-fix_@v.raw
+Mode=0444
+InstancesMax=2

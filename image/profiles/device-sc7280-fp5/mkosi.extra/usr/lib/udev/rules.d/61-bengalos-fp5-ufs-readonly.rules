@@ -1,0 +1,7 @@
+# Internal UFS boot. BengalOS lives in the userdata nested GPT, so userdata
+# must stay writable. super stays writable so device-mapper can map it; the
+# dynpart drop-in then sets those mapper devices read-only.
+# Every other UFS disk and partition is read-only (xbl, abl, boot, modem, persist).
+# The microSD draft of this rule also locked userdata. Do not use that draft here.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="sd[b-f]", RUN+="/usr/sbin/blockdev --setro $devnode"
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", KERNEL=="sd[a-f][0-9]*", ENV{ID_PART_ENTRY_NAME}!="super", ENV{ID_PART_ENTRY_NAME}!="userdata", RUN+="/usr/sbin/blockdev --setro $devnode"
