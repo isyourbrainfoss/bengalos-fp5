@@ -49,7 +49,7 @@ phone. It does not help when we are the AG.
      or CS usable. This uses only ModemManager's normal call API (no profile/RAT/NV change).
    - Signal, operator name and roaming are mirrored **read-only** from ModemManager.
    - IMEI and own numbers are never exposed. Logs contain no numbers or SIP text.
-   - Only uid 0 and fp5 may call it (bus policy plus an in-daemon check).
+   - Only uid 0 and the lab fp5 uid 60434 may call it (bus policy plus an in-daemon check). The policy must use the numeric uid: dbus-daemon starts before systemd-homed, so user="fp5" is "Unknown username" at boot and the allow-own rule is dropped.
 3. **WirePlumber drop-in** (`config/60-fp5-hfp-modem.conf`): `native-modem = "fp5-imsd"` and the
    service key. The backend stays **native**.
    **Interlock:** a stock libspa-bluez5 ignores the service key, and no real modem has the

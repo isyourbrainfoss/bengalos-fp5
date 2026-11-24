@@ -968,11 +968,20 @@ def main(argv=None):
     bridge.export()
     loop = GLib.MainLoop()
 
+    acquired = {"ok": False}
+
+    def got(conn, name):
+        acquired["ok"] = True
+        log("ready on %s" % name)
+
     def lost(conn, name):
-        log("could not own %s (policy missing or already running)" % name, syslog.LOG_ERR)
+        if not acquired["ok"]:
+            log("could not own %s (policy missing or already running)" % name, syslog.LOG_ERR)
+        else:
+            log("lost %s" % name, syslog.LOG_ERR)
         loop.quit()
     Gio.bus_own_name_on_connection(bridge.bus, SERVICE, Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
-                                   lambda c, n: log("ready on %s" % n), lost)
+                                   got, lost)
     bridge.watch_ofono()
     bridge.watch_mm()
     if audio:
@@ -988,7 +997,9 @@ def main(argv=None):
     loop.run()
     if audio:
         audio.shutdown()  # leave the car on A2DP if we stop mid-call or mid-prepare
-    return 0
+    # Exit 1 if the name was never acquired, so systemd Restart=on-failure
+    # retries (the previous exit 0 left the service dead after a policy miss).
+    return 0 if acquired["ok"] else 1
 
 
 if __name__ == "__main__":
