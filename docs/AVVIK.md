@@ -1,7 +1,7 @@
 # FP5 BengalOS – avviksdokument (ikke-standard oppsett)
 
 Telefon: lab-FP5, maskin «phosh» (bruker fp5), BengalOS fra intern UFS (A/B via systemd-sysupdate fra isyourbrainfoss/bengalos-fp5 fp5-feed).
-Sist oppdatert: 24. nov 2026 kl. 22:49 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
+Sist oppdatert: 24. nov 2026 kl. 23:00 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
 Prinsipp: alt som avviker fra offisiell BengalOS står her med plassering, hvorfor og hvordan det fjernes.
 
 ## 1. Bil / Tesla (Bluetooth)
@@ -48,6 +48,7 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 | feedbackd-tema fp5-strong (timer spiller Argon-timer.ogg) | `~/.config/feedbackd/themes/fp5-strong.json` | backup `fp5-strong.json.bak-20261120-timer2` |
 | Alarmlyd-reserve v2 (ringer på silent/quiet) | `~/.local/bin/fp5-clocks-alarm-sound` + tjeneste, gren fix/alarm-silent-fallback | `sh ~/.local/state/fp5-clocks-alarm-sound/rollback.sh` |
 | Automatisk stillemodus 21:00–07:00 (brukertimere, 24.11 22:49) | `~/.config/systemd/user/fp5-quiet-hours-{on,off}.{service,timer}` setter `org.sigxcpu.feedbackd profile` til `silent` kl. 21 og `full` kl. 07 (lokal tid, Europe/Oslo). `Persistent=false`. Alarm-skriptet er uendret. | `systemctl --user disable --now fp5-quiet-hours-on.timer fp5-quiet-hours-off.timer` og fjern de fire filene (eller `sh ~/.local/state/fp5-quiet-hours/rollback.sh`). Rører ikke gjeldende profil. |
+| Gjentatt anroper ringer gjennom stille/quiet (brukertjeneste, 24.11 23:00) | `~/.local/bin/fp5-repeat-caller` + `~/.config/systemd/user/fp5-repeat-caller.service` (sha 3770b745…). Gren `feat/repeat-caller` 2210cf8, ikke merget. | `systemctl --user disable --now fp5-repeat-caller.service` og fjern binær og enhetsfil (eller `sh ~/.local/state/fp5-repeat-caller/rollback.sh`). Rører ikke lydprofilen. |
 | feedbackd-profil-synk, ff-gain | `fp5-feedbackd-profile-sync`, `fp5-ff-gain` (brukertjenester) | disable tjenestene |
 
 ## 4. Skjerm, opplåsing og strøm
@@ -304,3 +305,22 @@ Timerne er aktivert (`systemctl --user daemon-reload && systemctl --user enable 
 **Backup:** `~/.local/state/fp5-quiet-hours/backup-20261124T224915/` (ingen eksisterende filer ble overskrevet).
 **Tilbake:** `systemctl --user disable --now fp5-quiet-hours-on.timer fp5-quiet-hours-off.timer` og fjern de fire enhetsfilene, eller `sh ~/.local/state/fp5-quiet-hours/rollback.sh`. Rører ikke gjeldende profil.
 **Gjentatt anrop:** Ingen innebygd funksjon «samme anroper to ganger innen ca. et kvarter slipper gjennom stillemodus» i feedbackd 0.8.11, gnome-calls 51.1 eller Phosh 0.59.0 på denne byggingen. feedbackd har `allow-important` (hintet `important` kan overstyre profilen for visse apper, f.eks. nødvarsler og Klokker; Calls er ikke i lista). Et oppstrømsforslag i Calls (!782) om at favorittkontakter kan ringe gjennom stillemodus er ikke med i 51.1. phosh-antispam har et tilbakeringingsunntak i spamfilteret, men tjenesten er av.
+
+### 2026-11-24 23:00 — Gjentatt anroper ringer gjennom stillemodus (brukertjeneste)
+
+**Hva:** Ny brukertjeneste `fp5-repeat-caller` (ingen systemoppsett, ingen run0, ingen andre tjenester restartet). Hvis samme nummer ringer igjen innen 15 minutter mens feedbackd-profilen er `silent` eller `quiet`, spilles ringetonen med `paplay` (`media.role=Ringtone`, `/usr/share/sounds/phosh/stereo/phone-incoming-call.oga`) i løkke til samtalen ikke lenger ringer. Lydprofilen endres **ikke**, så tjenesten kjemper ikke med stillemodus-timerne eller `fp5-feedbackd-profile-sync` (de demper bare `media.role=event`).
+
+Tjenesten lytter på systembussen etter innkommende samtaler på tre kilder, og slår sammen samme aktive samtale hvis den vises flere steder:
+- `org.ofono` (`/imsd`) — IMS/VoLTE (ekte ModemManager ser dem aldri)
+- `io.github.isyourbrainfoss.Fp5HfpModem` — broens MM-lignende Call-objekter (IMS og CS)
+- `org.freedesktop.ModemManager1` — vanlige CS-samtaler
+
+Dette er bekreftet i eksisterende logger (innkommende IMS 24.11 16:58): gnome-calls legger til `/imsd/voicecall…` og utløser feedbackd `phone-incoming-call` med en gang ringing starter (for sent til å bytte profil), og HFP-broen logger `call fp5imsdN added (ims) dir=in state=3` i samme sekund.
+
+Anropsnumre lagres bare som sha256 med lokal salt under `~/.local/state/fp5-repeat-caller/` (katalog 700, filer 600) og utløper etter 15 minutter. Logger inneholder aldri numre, bare `repeat caller -> breakthrough` eller `ignored anonymous`. Skjult/ukjent nummer teller ikke og slipper ikke gjennom.
+
+**Hvorfor:** Kristian (t990u, «gjerne») vil ha Androids «gjentatt anroper»-unntak: samme nummer to ganger innen et kvarter skal høres i stillemodus.
+**Test:** 18 enhetstester (syntetiske hendelser, ingen D-Bus, ingen lyd, ingen ekte numre) er grønne på desk og på telefonen. Tjenesten kjører siden 23:00:03, journalen er uten feil, profilen sto uendret på `silent`. **Ekte testanrop er ikke gjort** (krever Kristians ja): to innkommende fra samme nummer innen 15 minutter mens profilen ikke er `full`.
+**Backup:** `~/.local/state/fp5-repeat-caller/backup-20261124T225915/` (ingen eksisterende filer ble overskrevet).
+**Tilbake:** `systemctl --user disable --now fp5-repeat-caller.service` og fjern binær og enhetsfil, eller `sh ~/.local/state/fp5-repeat-caller/rollback.sh`. Rører ikke gjeldende profil; sletter også salt og hashed historikk.
+**Gren:** `feat/repeat-caller` 2210cf8 i isyourbrainfoss/bengalos-fp5, pushet, ikke merget.
