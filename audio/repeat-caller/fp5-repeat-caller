@@ -1,0 +1,1111 @@
+#!/usr/bin/python3
+"""Ring through silent/quiet when the same caller phones again within 15 minutes.
+
+User-level only. Does not change the feedbackd profile (avoids fighting
+quiet-hours and fp5-feedbackd-profile-sync). On a repeat incoming call,
+plays the ringtone with paplay media.role=Ringtone until ringing stops.
+
+Watches the system bus:
+  - org.freedesktop.ModemManager1          (CS calls)
+  - io.github.isyourbrainfoss.Fp5HfpModem  (IMS+CS MM-style mirror)
+  - org.ofono, modem /imsd                 (IMS VoLTE; ModemManager never sees these)
+
+Caller numbers are hashed with a local salt and never logged or stored
+in clear text. Anonymous/withheld numbers are ignored.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import syslog
+import sys
+import tempfile
+import time
+import unittest
+from hashlib import sha256
+from pathlib import Path
+
+VERSION = "1"
+WINDOW_SEC = 15 * 60
+DEDUP_GRACE_SEC = 2.0
+APP_NAME = "fp5-repeat-caller"
+DEFAULT_STATE = Path.home() / ".local/state" / APP_NAME
+
+MM_SERVICE = "org.freedesktop.ModemManager1"
+HFP_SERVICE = "io.github.isyourbrainfoss.Fp5HfpModem"
+OFONO_SERVICE = "org.ofono"
+MM_ROOT = "/org/freedesktop/ModemManager1"
+IF_OM = "org.freedesktop.DBus.ObjectManager"
+IF_PROPS = "org.freedesktop.DBus.Properties"
+IF_VOICE = "org.freedesktop.ModemManager1.Modem.Voice"
+IF_CALL = "org.freedesktop.ModemManager1.Call"
+IF_OFONO_MGR = "org.ofono.Manager"
+IF_OFONO_VCM = "org.ofono.VoiceCallManager"
+IF_OFONO_VC = "org.ofono.VoiceCall"
+
+MM_DIR_INCOMING = 1
+MM_DIR_OUTGOING = 2
+MM_STATE_INCOMING = 3
+MM_STATE_WAITING = 6
+MM_STATE_TERMINATED = 7
+
+# oFono incoming/waiting count as ringing for a caller. Everything else
+# is "not ringing" (answered, outbound, or ended).
+OFONO_RINGING = frozenset({"incoming", "waiting"})
+OFONO_ENDED = frozenset({"disconnected"})
+MM_RINGING_STATES = frozenset({MM_STATE_INCOMING, MM_STATE_WAITING})
+
+ANON_TOKENS = frozenset({
+    "",
+    "withheld",
+    "unknown",
+    "anonymous",
+    "restricted",
+    "private",
+    "unavailable",
+    "hidden",
+    "number withheld",
+    "withheld number",
+    "anonymous number",
+    "anonymous caller",
+    "private number",
+    "no number",
+    "<unknown>",
+    "n/a",
+    "na",
+    "null",
+    "none",
+    "sip:anonymous@anonymous.invalid",
+    "anonymous@anonymous.invalid",
+})
+
+SOUND_CANDIDATES = (
+    "/usr/share/sounds/phosh/stereo/phone-incoming-call.oga",
+    "/usr/share/sounds/freedesktop/stereo/phone-incoming-call.oga",
+)
+
+# Never let a number slip into a log line, even if a caller passes one in.
+_REDACT = [
+    re.compile(r"[\x1b]\[[0-9;]*m"),
+    re.compile(r"(?:tel:|sip:)?\+?[0-9]{6,}"),
+    re.compile(r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}\b"),
+]
+
+
+def redact(text: str) -> str:
+    s = str(text)
+    for pat in _REDACT:
+        s = pat.sub("<redacted>", s)
+    return s
+
+
+def log(msg: str) -> None:
+    line = "%s: %s" % (APP_NAME, redact(msg))
+    try:
+        syslog.syslog(syslog.LOG_INFO, line)
+    except Exception:
+        pass
+    # Under systemd, stdout is the journal; skip the print to avoid
+    # duplicate lines. Keep prints on a terminal (tests, status).
+    if sys.stdout.isatty():
+        print(line, flush=True)
+
+
+def default_state_dir() -> Path:
+    raw = os.environ.get("FP5_REPEAT_CALLER_STATE")
+    return Path(raw) if raw else DEFAULT_STATE
+
+
+# --- number handling (clear text never leaves these helpers) ---
+
+def normalize_number(raw: str | None) -> str | None:
+    """Return a canonical identity, or None if anonymous/unusable."""
+    if raw is None:
+        return None
+    s = raw.strip()
+    lower = s.lower()
+    if lower.startswith("sip:"):
+        rest = s[4:]
+        if "@" in rest:
+            rest = rest.split("@", 1)[0]
+        s = rest.strip()
+        lower = s.lower()
+    elif lower.startswith("tel:"):
+        s = s[4:].strip()
+        lower = s.lower()
+    compact = re.sub(r"[\s\-().]", "", lower)
+    if lower in ANON_TOKENS or compact in ANON_TOKENS:
+        return None
+    if compact.startswith("sip:"):
+        compact = compact[4:]
+    plus = compact.startswith("+") or compact.startswith("00")
+    if compact.startswith("00"):
+        compact = "+" + compact[2:]
+    digits = "".join(c for c in compact if c.isdigit())
+    if len(digits) < 3:
+        return None
+    return ("+" + digits) if compact.startswith("+") or plus else digits
+
+
+def hash_identity(salt: bytes, identity: str) -> str:
+    return sha256(salt + b"\0" + identity.encode("utf-8")).hexdigest()
+
+
+def is_mm_incoming(direction: int | None, state: int | None) -> bool:
+    if direction == MM_DIR_OUTGOING:
+        return False
+    if state in MM_RINGING_STATES:
+        return True
+    return direction == MM_DIR_INCOMING and state not in (
+        MM_STATE_TERMINATED,
+        None,
+    ) and state not in (1, 2)  # dialing / alerting = outbound progress
+
+
+def mm_is_ringing(direction: int | None, state: int | None) -> bool:
+    if direction == MM_DIR_OUTGOING:
+        return False
+    return state in MM_RINGING_STATES
+
+
+def ofono_is_incoming(state: str | None) -> bool:
+    return (state or "").lower() in OFONO_RINGING
+
+
+# --- persisted hashed history ---
+
+class SeenStore:
+    def __init__(self, state_dir: Path, window: int = WINDOW_SEC, clock=time.time):
+        self.dir = Path(state_dir)
+        self.window = window
+        self.clock = clock
+        self.salt_path = self.dir / "salt"
+        self.seen_path = self.dir / "seen"
+        self.salt = b""
+        self.entries: list[dict] = []
+
+    def setup(self) -> None:
+        self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.dir, 0o700)
+        self.salt = self._load_or_create_salt()
+        self.entries = self._load_seen()
+        self.prune()
+
+    def _load_or_create_salt(self) -> bytes:
+        if self.salt_path.exists():
+            data = self.salt_path.read_bytes().strip()
+            try:
+                salt = bytes.fromhex(data.decode("ascii"))
+            except Exception:
+                salt = b""
+            if len(salt) >= 16:
+                os.chmod(self.salt_path, 0o600)
+                return salt
+        salt = secrets.token_bytes(32)
+        self._write_private(self.salt_path, salt.hex() + "\n")
+        return salt
+
+    def _load_seen(self) -> list[dict]:
+        if not self.seen_path.exists():
+            return []
+        try:
+            os.chmod(self.seen_path, 0o600)
+            data = json.loads(self.seen_path.read_text())
+        except Exception:
+            return []
+        out = []
+        for item in data if isinstance(data, list) else []:
+            if not isinstance(item, dict):
+                continue
+            digest = item.get("h")
+            ts = item.get("t")
+            if isinstance(digest, str) and len(digest) == 64 and isinstance(ts, (int, float)):
+                out.append({"h": digest, "t": float(ts)})
+        return out
+
+    def _write_private(self, path: Path, text: str) -> None:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def prune(self, now: float | None = None) -> None:
+        now = self.clock() if now is None else now
+        self.entries = [e for e in self.entries if now - e["t"] <= self.window]
+
+    def save(self) -> None:
+        self.prune()
+        self._write_private(self.seen_path, json.dumps(self.entries) + "\n")
+
+    def remember(self, digest: str, now: float | None = None) -> None:
+        now = self.clock() if now is None else now
+        self.prune(now)
+        self.entries.append({"h": digest, "t": now})
+        self.save()
+
+    def is_repeat(self, digest: str, now: float | None = None) -> bool:
+        now = self.clock() if now is None else now
+        self.prune(now)
+        return any(e["h"] == digest and now - e["t"] <= self.window for e in self.entries)
+
+    def seen_count(self) -> int:
+        self.prune()
+        return len(self.entries)
+
+
+# --- ringtone player ---
+
+def find_ringtone() -> str | None:
+    for path in SOUND_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+class PaplayPlayer:
+    def __init__(self, sound: str | None = None, paplay: str = "paplay"):
+        self.sound = sound if sound is not None else find_ringtone()
+        self.paplay = paplay
+        self.proc: subprocess.Popen | None = None
+        self.wanted = False
+        self._on_spawn = None  # test hook
+
+    def start(self) -> bool:
+        self.wanted = True
+        if self.proc and self.proc.poll() is None:
+            return True
+        return self._spawn()
+
+    def stop(self) -> None:
+        self.wanted = False
+        proc = self.proc
+        self.proc = None
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def _spawn(self) -> bool:
+        if not self.wanted:
+            return False
+        if not self.sound:
+            log("no ringtone sound file found")
+            return False
+        cmd = [
+            self.paplay,
+            "--property=media.role=Ringtone",
+            "--property=media.name=phone-incoming-call",
+            self.sound,
+        ]
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            log("paplay not found")
+            return False
+        except Exception as e:
+            log("paplay failed: %s" % type(e).__name__)
+            return False
+        if self._on_spawn:
+            self._on_spawn()
+        return True
+
+    def pump(self) -> None:
+        """Restart paplay if it finished while we still need ringing."""
+        if not self.wanted:
+            return
+        if self.proc is None or self.proc.poll() is not None:
+            self._spawn()
+
+
+class NullPlayer:
+    def __init__(self):
+        self.started = 0
+        self.stopped = 0
+        self.wanted = False
+
+    def start(self) -> bool:
+        if not self.wanted:
+            self.started += 1
+        self.wanted = True
+        return True
+
+    def stop(self) -> None:
+        if self.wanted:
+            self.stopped += 1
+        self.wanted = False
+
+    def pump(self) -> None:
+        return
+
+
+# --- core engine ---
+
+class Engine:
+    def __init__(
+        self,
+        store: SeenStore,
+        get_profile,
+        player,
+        window: int = WINDOW_SEC,
+        dedup_grace: float = DEDUP_GRACE_SEC,
+        clock=None,
+    ):
+        self.store = store
+        self.get_profile = get_profile
+        self.player = player
+        self.window = window
+        self.dedup_grace = dedup_grace
+        self.clock = clock or store.clock
+        self.live: dict[tuple[str, str], dict] = {}
+        self.ended_at: dict[str, float] = {}
+
+    def _live_hashes(self) -> set[str]:
+        return {v["h"] for v in self.live.values() if v.get("h")}
+
+    def _is_duplicate(self, digest: str, now: float) -> bool:
+        # Only treat as the same call when another source still has it live.
+        # A new incoming after every path has gone is a redial (may break
+        # through). Late D-Bus adds for a finished call are rare; both
+        # sources normally appear while the call is still ringing.
+        return digest in self._live_hashes()
+
+    def _any_breakthrough_ringing(self) -> bool:
+        return any(v.get("breakthrough") and v.get("ringing") for v in self.live.values())
+
+    def _sync_player(self) -> None:
+        if self._any_breakthrough_ringing():
+            if not getattr(self.player, "wanted", False):
+                self.player.start()
+            else:
+                self.player.pump()
+        else:
+            if getattr(self.player, "wanted", False):
+                self.player.stop()
+
+    def on_event(
+        self,
+        source: str,
+        path: str,
+        *,
+        number: str | None,
+        incoming_ringing: bool,
+        ended: bool,
+        outbound: bool = False,
+    ) -> str:
+        """Handle one call-object update. Returns a short action tag.
+
+        `number` is used only to hash; it is never stored or logged.
+        """
+        now = self.clock()
+        key = (source, path)
+        rec = self.live.get(key)
+
+        if ended or outbound:
+            if rec:
+                digest = rec.get("h")
+                self.live.pop(key, None)
+                if digest and digest not in self._live_hashes():
+                    self.ended_at[digest] = now
+                self._sync_player()
+                return "ended" if rec else "ignore"
+            return "ignore"
+
+        if not incoming_ringing:
+            if rec:
+                rec["ringing"] = False
+                self._sync_player()
+                return "state"
+            return "ignore"
+
+        # Incoming and ringing.
+        ident = normalize_number(number)
+        if ident is None:
+            if rec is None:
+                log("ignored anonymous")
+            return "anonymous"
+
+        digest = hash_identity(self.store.salt, ident)
+        if rec is not None:
+            rec["ringing"] = True
+            rec["h"] = digest
+            self._sync_player()
+            return "state"
+
+        if self._is_duplicate(digest, now):
+            self.live[key] = {
+                "h": digest,
+                "ringing": True,
+                "breakthrough": any(
+                    v.get("breakthrough") and v.get("h") == digest
+                    for v in self.live.values()
+                ),
+                "dup": True,
+            }
+            self._sync_player()
+            return "dup"
+
+        was_repeat = self.store.is_repeat(digest, now)
+        self.store.remember(digest, now)
+        profile = (self.get_profile() or "full").strip().strip("'") or "full"
+        do_break = was_repeat and profile != "full"
+        self.live[key] = {
+            "h": digest,
+            "ringing": True,
+            "breakthrough": do_break,
+            "dup": False,
+        }
+        if do_break:
+            log("repeat caller -> breakthrough")
+            self._sync_player()
+            return "breakthrough"
+        self._sync_player()
+        return "recorded"
+
+    def on_removed(self, source: str, path: str) -> str:
+        return self.on_event(
+            source, path, number=None, incoming_ringing=False, ended=True
+        )
+
+
+# --- D-Bus watcher (only imported for `run`) ---
+
+def _load_gi():
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+    return Gio, GLib
+
+
+class BusWatcher:
+    def __init__(self, engine: Engine, Gio, GLib):
+        self.engine = engine
+        self.Gio = Gio
+        self.GLib = GLib
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        self.subs: list[int] = []
+        # MM-like objects: (service, path) -> last (dir, state)
+        self.mm_calls: dict[tuple[str, str], tuple[int | None, int | None]] = {}
+        self.ofono_states: dict[str, str] = {}
+        self._pump_id = None
+
+    def start(self) -> None:
+        Gio, GLib = self.Gio, self.GLib
+        self.subs.append(self.bus.signal_subscribe(
+            "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+            "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE,
+            self._on_name_owner, None,
+        ))
+        for svc in (MM_SERVICE, HFP_SERVICE):
+            self._watch_mm_service(svc)
+            if self._name_has_owner(svc):
+                self._scan_mm(svc)
+        self._watch_ofono()
+        if self._name_has_owner(OFONO_SERVICE):
+            self._scan_ofono()
+        self._pump_id = GLib.timeout_add_seconds(1, self._pump)
+        log("watching MM, HFP bridge and oFono (v%s)" % VERSION)
+
+    def _name_has_owner(self, name: str) -> bool:
+        try:
+            res = self.bus.call_sync(
+                "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                "org.freedesktop.DBus", "NameHasOwner",
+                self.GLib.Variant("(s)", (name,)),
+                self.GLib.VariantType("(b)"),
+                self.Gio.DBusCallFlags.NONE, 2000, None,
+            )
+            return bool(res.unpack()[0])
+        except Exception:
+            return False
+
+    def _on_name_owner(self, _conn, _sender, _path, _iface, _sig, params, _data):
+        name, old, new = params.unpack()
+        if name == OFONO_SERVICE:
+            if new:
+                self._scan_ofono()
+            else:
+                for path in list(self.ofono_states):
+                    self.engine.on_removed("ofono", path)
+                self.ofono_states.clear()
+        elif name in (MM_SERVICE, HFP_SERVICE):
+            src = "mm" if name == MM_SERVICE else "hfp"
+            if new:
+                self._scan_mm(name)
+            else:
+                for (svc, path) in list(self.mm_calls):
+                    if svc == name:
+                        self.engine.on_removed(src, path)
+                        self.mm_calls.pop((svc, path), None)
+
+    def _call(self, dest, path, iface, method, args, rtype, timeout=3000):
+        try:
+            return self.bus.call_sync(
+                dest, path, iface, method, args,
+                self.GLib.VariantType(rtype) if rtype else None,
+                self.Gio.DBusCallFlags.NONE, timeout, None,
+            )
+        except Exception:
+            return None
+
+    def _watch_mm_service(self, service: str) -> None:
+        Gio = self.Gio
+        self.subs.append(self.bus.signal_subscribe(
+            service, IF_OM, "InterfacesAdded", None, None,
+            Gio.DBusSignalFlags.NONE, self._on_mm_if_added, service,
+        ))
+        self.subs.append(self.bus.signal_subscribe(
+            service, IF_OM, "InterfacesRemoved", None, None,
+            Gio.DBusSignalFlags.NONE, self._on_mm_if_removed, service,
+        ))
+        self.subs.append(self.bus.signal_subscribe(
+            service, IF_VOICE, "CallAdded", None, None,
+            Gio.DBusSignalFlags.NONE, self._on_mm_call_added, service,
+        ))
+        self.subs.append(self.bus.signal_subscribe(
+            service, IF_VOICE, "CallDeleted", None, None,
+            Gio.DBusSignalFlags.NONE, self._on_mm_call_deleted, service,
+        ))
+        self.subs.append(self.bus.signal_subscribe(
+            service, IF_CALL, "StateChanged", None, None,
+            Gio.DBusSignalFlags.NONE, self._on_mm_state_changed, service,
+        ))
+        self.subs.append(self.bus.signal_subscribe(
+            service, IF_PROPS, "PropertiesChanged", None, None,
+            Gio.DBusSignalFlags.NONE, self._on_mm_props, service,
+        ))
+
+    def _watch_ofono(self) -> None:
+        Gio = self.Gio
+        self.subs.append(self.bus.signal_subscribe(
+            OFONO_SERVICE, IF_OFONO_VCM, "CallAdded", None, None,
+            Gio.DBusSignalFlags.NONE, self._on_ofono_added, None,
+        ))
+        self.subs.append(self.bus.signal_subscribe(
+            OFONO_SERVICE, IF_OFONO_VCM, "CallRemoved", None, None,
+            Gio.DBusSignalFlags.NONE, self._on_ofono_removed, None,
+        ))
+        self.subs.append(self.bus.signal_subscribe(
+            OFONO_SERVICE, IF_OFONO_VC, "PropertyChanged", None, None,
+            Gio.DBusSignalFlags.NONE, self._on_ofono_prop, None,
+        ))
+
+    def _scan_mm(self, service: str) -> None:
+        res = self._call(service, MM_ROOT, IF_OM, "GetManagedObjects", None,
+                         "(a{oa{sa{sv}}})")
+        if res is None:
+            return
+        objs = res.unpack()[0]
+        for path, ifaces in objs.items():
+            if IF_CALL in ifaces:
+                self._ingest_mm(service, path, ifaces[IF_CALL])
+
+    def _get_mm_props(self, service: str, path: str) -> dict:
+        res = self._call(service, path, IF_PROPS, "GetAll",
+                         self.GLib.Variant("(s)", (IF_CALL,)), "(a{sv})")
+        if res is None:
+            return {}
+        return res.unpack()[0]
+
+    def _ingest_mm(self, service: str, path: str, props: dict) -> None:
+        src = "mm" if service == MM_SERVICE else "hfp"
+        direction = props.get("Direction")
+        state = props.get("State")
+        try:
+            direction = int(direction) if direction is not None else None
+        except (TypeError, ValueError):
+            direction = None
+        try:
+            state = int(state) if state is not None else None
+        except (TypeError, ValueError):
+            state = None
+        number = props.get("Number")
+        if number is not None:
+            number = str(number)
+        self.mm_calls[(service, path)] = (direction, state)
+        outbound = direction == MM_DIR_OUTGOING
+        ringing = mm_is_ringing(direction, state)
+        ended = state == MM_STATE_TERMINATED
+        self.engine.on_event(
+            src, path, number=number,
+            incoming_ringing=ringing and not outbound,
+            ended=ended, outbound=outbound,
+        )
+
+    def _on_mm_if_added(self, _c, _s, _p, _i, _sig, params, service):
+        path, ifaces = params.unpack()
+        if IF_CALL in ifaces:
+            self._ingest_mm(service, path, ifaces[IF_CALL])
+
+    def _on_mm_if_removed(self, _c, _s, _p, _i, _sig, params, service):
+        path, ifaces = params.unpack()
+        if IF_CALL in ifaces or (service, path) in self.mm_calls:
+            src = "mm" if service == MM_SERVICE else "hfp"
+            self.mm_calls.pop((service, path), None)
+            self.engine.on_removed(src, path)
+
+    def _on_mm_call_added(self, _c, _s, _p, _i, _sig, params, service):
+        path = params.unpack()[0]
+        props = self._get_mm_props(service, path)
+        if props:
+            self._ingest_mm(service, path, props)
+
+    def _on_mm_call_deleted(self, _c, _s, _p, _i, _sig, params, service):
+        path = params.unpack()[0]
+        src = "mm" if service == MM_SERVICE else "hfp"
+        self.mm_calls.pop((service, path), None)
+        self.engine.on_removed(src, path)
+
+    def _on_mm_state_changed(self, conn, _s, path, _i, _sig, params, service):
+        _old, new, _reason = params.unpack()
+        props = self._get_mm_props(service, path)
+        if "State" not in props:
+            props["State"] = int(new)
+        self._ingest_mm(service, path, props)
+
+    def _on_mm_props(self, _c, _s, path, _i, _sig, params, service):
+        iface, changed, _inv = params.unpack()
+        if iface != IF_CALL:
+            return
+        prev = self.mm_calls.get((service, path), (None, None))
+        props = self._get_mm_props(service, path) or {}
+        if "Direction" not in props and prev[0] is not None:
+            props["Direction"] = prev[0]
+        if "State" not in props and prev[1] is not None:
+            props["State"] = prev[1]
+        if "Number" not in props:
+            # GetAll should have it; if a stale cache, still ingest state
+            pass
+        self._ingest_mm(service, path, props)
+
+    def _scan_ofono(self) -> None:
+        res = self._call(OFONO_SERVICE, "/", IF_OFONO_MGR, "GetModems", None,
+                         "(a(oa{sv}))")
+        if res is None:
+            return
+        for path, props in res.unpack()[0]:
+            ifaces = props.get("Interfaces") or []
+            if IF_OFONO_VCM in ifaces or path == "/imsd":
+                self._scan_ofono_modem(path)
+
+    def _scan_ofono_modem(self, modem: str) -> None:
+        res = self._call(OFONO_SERVICE, modem, IF_OFONO_VCM, "GetCalls", None,
+                         "(a(oa{sv}))")
+        if res is None:
+            return
+        for path, props in res.unpack()[0]:
+            self._ingest_ofono(path, props)
+
+    def _ingest_ofono(self, path: str, props: dict) -> None:
+        state = str(props.get("State") or "")
+        number = props.get("LineIdentification")
+        if number is None:
+            number = props.get("IncomingLine")
+        if number is not None:
+            number = str(number)
+        self.ofono_states[path] = state
+        lower = state.lower()
+        outbound = lower in ("dialing", "alerting")
+        ringing = ofono_is_incoming(state)
+        ended = lower in OFONO_ENDED
+        self.engine.on_event(
+            "ofono", path, number=number,
+            incoming_ringing=ringing, ended=ended, outbound=outbound,
+        )
+
+    def _on_ofono_added(self, _c, _s, _p, _i, _sig, params, _d):
+        path, props = params.unpack()
+        self._ingest_ofono(path, props)
+
+    def _on_ofono_removed(self, _c, _s, _p, _i, _sig, params, _d):
+        path = params.unpack()[0]
+        self.ofono_states.pop(path, None)
+        self.engine.on_removed("ofono", path)
+
+    def _on_ofono_prop(self, _c, _s, path, _i, _sig, params, _d):
+        name, value = params.unpack()
+        state = self.ofono_states.get(path, "")
+        number = None
+        if name == "State":
+            state = str(value)
+        elif name == "LineIdentification":
+            number = str(value)
+        # Re-fetch would include the number; do a Get if we still need it.
+        if number is None or name == "State":
+            res = self._call(OFONO_SERVICE, path, IF_PROPS, "Get",
+                             self.GLib.Variant("(s)", ("LineIdentification",)),
+                             "(v)", timeout=2000)
+            # oFono uses PropertyChanged, not Properties.Get on org.freedesktop
+            # Properties. VoiceCall uses GetProperties.
+            if res is None:
+                res2 = self._call(OFONO_SERVICE, path, IF_OFONO_VC,
+                                  "GetProperties", None, "(a{sv})", timeout=2000)
+                if res2 is not None:
+                    props = dict(res2.unpack()[0])
+                    if name == "State":
+                        props["State"] = state
+                    self._ingest_ofono(path, props)
+                    return
+        props = {"State": state}
+        if number is not None:
+            props["LineIdentification"] = number
+        self._ingest_ofono(path, props)
+
+    def _pump(self):
+        self.engine.player.pump()
+        return True
+
+
+def current_profile() -> str:
+    try:
+        out = subprocess.check_output(
+            ["gsettings", "get", "org.sigxcpu.feedbackd", "profile"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip().strip("'")
+        return out or "full"
+    except Exception:
+        return "full"
+
+
+def cmd_run(dry_run: bool = False) -> int:
+    syslog.openlog(APP_NAME, syslog.LOG_PID, syslog.LOG_USER)
+    store = SeenStore(default_state_dir())
+    store.setup()
+    if dry_run:
+        player = NullPlayer()
+        log("dry-run: watching only, will not play")
+    else:
+        player = PaplayPlayer()
+        if not player.sound:
+            log("warning: no ringtone file, breakthrough will be silent")
+    engine = Engine(store, current_profile, player)
+    Gio, GLib = _load_gi()
+    loop = GLib.MainLoop()
+    watcher = BusWatcher(engine, Gio, GLib)
+    watcher.start()
+
+    def _stop(*_a):
+        player.stop()
+        loop.quit()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    loop.run()
+    player.stop()
+    return 0
+
+
+def cmd_status() -> int:
+    store = SeenStore(default_state_dir())
+    store.setup()
+    print("version", VERSION)
+    print("profile", current_profile())
+    print("window_sec", WINDOW_SEC)
+    print("seen_hashed", store.seen_count())
+    print("salt", "present" if store.salt else "missing")
+    print("ringtone", find_ringtone() or "missing")
+    try:
+        Gio, GLib = _load_gi()
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+
+        def has(name):
+            try:
+                return bool(bus.call_sync(
+                    "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus", "NameHasOwner",
+                    GLib.Variant("(s)", (name,)), GLib.VariantType("(b)"),
+                    Gio.DBusCallFlags.NONE, 2000, None,
+                ).unpack()[0])
+            except Exception:
+                return False
+
+        print("source_mm", "yes" if has(MM_SERVICE) else "no")
+        print("source_hfp", "yes" if has(HFP_SERVICE) else "no")
+        print("source_ofono", "yes" if has(OFONO_SERVICE) else "no")
+    except Exception as e:
+        print("source_probe", type(e).__name__)
+    mode = stat.S_IMODE(store.dir.stat().st_mode)
+    print("state_dir_mode", oct(mode))
+    if store.seen_path.exists():
+        print("seen_mode", oct(stat.S_IMODE(store.seen_path.stat().st_mode)))
+    if store.salt_path.exists():
+        print("salt_mode", oct(stat.S_IMODE(store.salt_path.stat().st_mode)))
+    return 0
+
+
+def cmd_simulate(argv: list[str]) -> int:
+    """Feed synthetic identities (not phone numbers) through the engine."""
+    parser = argparse.ArgumentParser(prog="fp5-repeat-caller simulate")
+    parser.add_argument("action", choices=["first", "repeat", "anon", "end", "reset"])
+    parser.add_argument("--id", default="A", help="synthetic identity token")
+    parser.add_argument("--profile", default="silent")
+    parser.add_argument("--source", default="hfp")
+    parser.add_argument("--path", default="/call/1")
+    parser.add_argument("--state-dir", default=None)
+    args = parser.parse_args(argv)
+    state = Path(args.state_dir) if args.state_dir else default_state_dir()
+    store = SeenStore(state)
+    store.setup()
+    profile = {"value": args.profile}
+    player = NullPlayer()
+    engine = Engine(store, lambda: profile["value"], player)
+    if args.action == "reset":
+        store.entries = []
+        store.save()
+        print("action reset")
+        return 0
+    if args.action == "end":
+        tag = engine.on_removed(args.source, args.path)
+        print("action", tag)
+        print("playing", int(player.wanted))
+        return 0
+    number = None if args.action == "anon" else "sim:%s" % args.id
+    # sim:X will fail normalize (no 3 digits). Map tokens to fake identities
+    # that are not telephone numbers: use a 3+ digit synthetic like 000+id hash
+    # via normalize of a reserved-looking dummy that tests also use.
+    if args.action != "anon":
+        # Identity is not a real number; prefix with a clearly fake block.
+        number = "+00000%s" % "".join(c for c in args.id if c.isalnum() or c == "_")
+        if len(re.sub(r"\D", "", number)) < 3:
+            number = "+000001"
+    tag = engine.on_event(
+        args.source, args.path, number=number,
+        incoming_ringing=True, ended=False,
+    )
+    print("action", tag)
+    print("playing", int(player.wanted))
+    return 0
+
+
+# --- tests (no D-Bus, no real numbers, no sound) ---
+
+class _Clock:
+    def __init__(self, start: float = 1_000_000.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class TestRepeatCaller(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="fp5-rc-"))
+        self.clock = _Clock()
+        self.store = SeenStore(self.tmp, window=WINDOW_SEC, clock=self.clock)
+        self.store.setup()
+        self.profile = "silent"
+        self.player = NullPlayer()
+        self.engine = Engine(
+            self.store, lambda: self.profile, self.player, clock=self.clock
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def ev(self, source, path, number, ringing=True, ended=False, outbound=False):
+        return self.engine.on_event(
+            source, path, number=number,
+            incoming_ringing=ringing, ended=ended, outbound=outbound,
+        )
+
+    def test_anonymous_tokens(self):
+        for raw in (
+            "", " ", "withheld", "Withheld", "UNKNOWN", "anonymous",
+            "restricted", "private", "sip:anonymous@anonymous.invalid",
+            "tel:unknown", "n/a", "12", "+",
+        ):
+            self.assertIsNone(normalize_number(raw), raw)
+
+    def test_normalize_equivalent_forms(self):
+        a = normalize_number("+10000222000")
+        b = normalize_number("0010000222000")
+        c = normalize_number("+1 000 022 2000")
+        d = normalize_number("tel:+10000222000")
+        self.assertEqual(a, b)
+        self.assertEqual(a, c)
+        self.assertEqual(a, d)
+        self.assertIsNotNone(a)
+
+    def test_hash_stable_and_salted(self):
+        ident = normalize_number("+10000222000")
+        h1 = hash_identity(self.store.salt, ident)
+        h2 = hash_identity(self.store.salt, ident)
+        self.assertEqual(h1, h2)
+        other = SeenStore(self.tmp / "other", clock=self.clock)
+        other.setup()
+        self.assertNotEqual(h1, hash_identity(other.salt, ident))
+
+    def test_first_call_recorded_no_sound(self):
+        tag = self.ev("hfp", "/c/1", "+10000222000")
+        self.assertEqual(tag, "recorded")
+        self.assertFalse(self.player.wanted)
+        self.assertEqual(self.store.seen_count(), 1)
+
+    def test_repeat_within_window_silent_breakthrough(self):
+        self.ev("hfp", "/c/1", "+10000222000")
+        self.engine.on_removed("hfp", "/c/1")
+        self.clock.advance(60)
+        tag = self.ev("hfp", "/c/2", "+10000222000")
+        self.assertEqual(tag, "breakthrough")
+        self.assertTrue(self.player.wanted)
+
+    def test_repeat_quiet_also_breaks(self):
+        self.profile = "quiet"
+        self.ev("ofono", "/imsd/a", "+10000222000")
+        self.engine.on_removed("ofono", "/imsd/a")
+        tag = self.ev("ofono", "/imsd/b", "+10000222000")
+        self.assertEqual(tag, "breakthrough")
+
+    def test_no_breakthrough_when_full(self):
+        self.profile = "full"
+        self.ev("mm", "/c/1", "+10000222000")
+        self.engine.on_removed("mm", "/c/1")
+        tag = self.ev("mm", "/c/2", "+10000222000")
+        self.assertEqual(tag, "recorded")
+        self.assertFalse(self.player.wanted)
+
+    def test_after_window_is_new_first(self):
+        self.ev("hfp", "/c/1", "+10000222000")
+        self.engine.on_removed("hfp", "/c/1")
+        self.clock.advance(WINDOW_SEC + 1)
+        tag = self.ev("hfp", "/c/2", "+10000222000")
+        self.assertEqual(tag, "recorded")
+        self.assertFalse(self.player.wanted)
+
+    def test_dedup_same_call_two_sources(self):
+        t1 = self.ev("ofono", "/imsd/voicecall03", "+10000222000")
+        t2 = self.ev("hfp", "/Call/fp5imsd2", "+10000222000")
+        self.assertEqual(t1, "recorded")
+        self.assertEqual(t2, "dup")
+        self.assertEqual(self.store.seen_count(), 1)
+        self.assertFalse(self.player.wanted)
+        # ending one source must not count the other as a new first/repeat
+        self.engine.on_removed("ofono", "/imsd/voicecall03")
+        self.assertFalse(self.player.wanted)
+        self.assertEqual(self.store.seen_count(), 1)
+
+    def test_dedup_does_not_false_breakthrough(self):
+        self.ev("ofono", "/a", "+10000222000")
+        self.ev("hfp", "/b", "+10000222000")
+        self.engine.on_removed("ofono", "/a")
+        self.engine.on_removed("hfp", "/b")
+        self.clock.advance(30)
+        tag = self.ev("ofono", "/c", "+10000222000")
+        self.assertEqual(tag, "breakthrough")
+
+    def test_anonymous_not_recorded(self):
+        tag = self.ev("hfp", "/c/1", "withheld")
+        self.assertEqual(tag, "anonymous")
+        self.assertEqual(self.store.seen_count(), 0)
+        tag = self.ev("hfp", "/c/2", "withheld")
+        self.assertEqual(tag, "anonymous")
+        self.assertFalse(self.player.wanted)
+
+    def test_stop_player_when_answered_or_ended(self):
+        self.ev("hfp", "/c/1", "+10000222000")
+        self.engine.on_removed("hfp", "/c/1")
+        self.ev("hfp", "/c/2", "+10000222000")
+        self.assertTrue(self.player.wanted)
+        self.ev("hfp", "/c/2", "+10000222000", ringing=False)
+        self.assertFalse(self.player.wanted)
+
+    def test_equivalent_number_forms_match(self):
+        self.ev("hfp", "/c/1", "+10000222000")
+        self.engine.on_removed("hfp", "/c/1")
+        tag = self.ev("hfp", "/c/2", "0010000222000")
+        self.assertEqual(tag, "breakthrough")
+
+    def test_seen_file_has_no_cleartext_and_is_private(self):
+        self.ev("hfp", "/c/1", "+10000222000")
+        text = self.store.seen_path.read_text()
+        self.assertNotIn("10000222000", text)
+        self.assertNotIn("+10000", text)
+        self.assertEqual(stat.S_IMODE(self.store.seen_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.store.salt_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.tmp.stat().st_mode), 0o700)
+
+    def test_salt_persists(self):
+        salt = self.store.salt
+        again = SeenStore(self.tmp, clock=self.clock)
+        again.setup()
+        self.assertEqual(salt, again.salt)
+
+    def test_outbound_ignored(self):
+        tag = self.ev("hfp", "/c/1", "+10000222000", ringing=False, outbound=True)
+        self.assertEqual(tag, "ignore")
+        self.assertEqual(self.store.seen_count(), 0)
+
+    def test_redact_strips_digits(self):
+        self.assertNotIn("1234567", redact("call to +1234567 done"))
+
+    def test_mm_ringing_helpers(self):
+        self.assertTrue(mm_is_ringing(MM_DIR_INCOMING, MM_STATE_INCOMING))
+        self.assertTrue(mm_is_ringing(MM_DIR_INCOMING, MM_STATE_WAITING))
+        self.assertFalse(mm_is_ringing(MM_DIR_OUTGOING, MM_STATE_INCOMING))
+        self.assertFalse(mm_is_ringing(MM_DIR_INCOMING, 4))
+        self.assertTrue(ofono_is_incoming("incoming"))
+        self.assertTrue(ofono_is_incoming("waiting"))
+        self.assertFalse(ofono_is_incoming("active"))
+
+
+def cmd_test(argv: list[str]) -> int:
+    prog = sys.argv[0]
+    return 0 if unittest.main(argv=[prog, "TestRepeatCaller"] + argv, exit=False).result.wasSuccessful() else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ("-h", "--help"):
+        print(
+            "usage: fp5-repeat-caller run [--dry-run] | status | test | simulate ...",
+            file=sys.stderr,
+        )
+        return 0 if argv else 2
+    cmd = argv[0]
+    rest = argv[1:]
+    if cmd == "run":
+        return cmd_run(dry_run=("--dry-run" in rest))
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "test":
+        return cmd_test(rest)
+    if cmd == "simulate":
+        return cmd_simulate(rest)
+    print("unknown command", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

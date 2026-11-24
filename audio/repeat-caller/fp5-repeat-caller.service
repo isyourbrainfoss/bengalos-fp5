@@ -1,0 +1,15 @@
+[Unit]
+Description=FP5: ring through silent/quiet for a repeated caller
+After=graphical-session.target pipewire-pulse.service
+PartOf=graphical-session.target
+Wants=pipewire-pulse.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/fp5-repeat-caller run
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target
