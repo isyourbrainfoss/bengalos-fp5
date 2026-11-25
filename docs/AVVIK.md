@@ -330,3 +330,9 @@ Anropsnumre lagres bare som sha256 med lokal salt under `~/.local/state/fp5-repe
 - Hvorfor: bilen sendte AVRCP Pause og satte A2DP-volum til 0 kl. 08:24:27 og 08:36:33 uten at Kristian trykket noe; vi må se om det er tastetrykk, kildebytte eller fokus.
 - Ikke med: btmon (rå AVRCP-PDU-er) krever root og venter på «nå».
 - Tilbakestilling: systemctl --user stop fp5-avrcp-log-keys fp5-avrcp-log-pw fp5-avrcp-log-journal (eller omstart).
+
+## 2026-11-25 08:48 – btmon-opptak av rå Bluetooth-trafikk (Kristians ja + «nå», t1003u/t1004u)
+- Hva: run0 systemd-run --unit=fp5-btmon-log btmon -w /var/log/fp5-btmon-20261125T084838.snoop på lab-FP5. Kun opptak, ingen konfig endret. Forsvinner ved omstart (filen blir liggende).
+- Hvorfor: avgjøre om bilen eller telefonen stopper A2DP-strømmen / sender AVRCP pause (uforklarte pauser 08:24, 08:36:33, 08:45:19).
+- Merk: snoop-fila kan inneholde BT-adresser; deles aldri ufiltrert.
+- Tilbakestilling: run0 systemctl stop fp5-btmon-log (eller omstart); slett fila etter analyse.
