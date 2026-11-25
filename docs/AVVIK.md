@@ -395,3 +395,10 @@ Anropsnumre lagres bare som sha256 med lokal salt under `~/.local/state/fp5-repe
 - Vise: Lås telefonen og sveip til billettboksen (Ticket Box) på låseskjermen. Pluginet lister PDF-er når det vises (`g_file_enumerate_children_async`); det ble ikke funnet noen filmonitor, så en ny låsing kan være nødvendig hvis listen er tom. Phosh-omstart er ikke gjort og trengs sannsynligvis ikke.
 - Backup: `~/.local/state/fp5-ticket-box/backup-20261125T171158/` (gsettings-snapshot, SHA256SUMS og rollback.sh).
 - Tilbake: `sh ~/.local/state/fp5-ticket-box/rollback.sh` (fjerner bare de to PDF-ene, gjenoppretter gsettings, sletter mappen bare hvis den er tom, restarter ikke Phosh).
+
+## 2026-11-25 19:58 — console_suspend=N alene (midlertidig, DES-4)
+
+**Hva:** Satt som root over SSH fra desk (run0 --no-ask-password, én gang). Kristian sa «nå» kl. 19:57. Bare `/sys/module/printk/parameters/console_suspend`: Y → N. Det er en runtime-endring som forsvinner ved neste omstart. Resten er uendret og lest tilbake: printk `4 4 1 8`, pm_debug_messages 0, pm_print_times 1. Ingen tmpfiles, sysctl.d, enheter eller cmdline. Ingen tjenester restartet. pstore er ikke rørt.
+**Hvorfor:** Telefonen døde i dvale uten lader 25.11 ca. 19:34–19:41 (varm PS_HOLD-reset) med standard logging. Mens tung logging (med console_suspend=N) var på, døde den aldri uten lader. Det eneste dødsfallet med console_suspend=N hittil (23.11 15:09) var med lader. Testen skal vise om dødsfallene uten lader henger sammen med console_suspend=Y (GENI-konsollen slås av under dvale) og ikke bare med timing.
+**Backup:** `/var/lib/fp5-backup/20261125T195802-console-suspend-N/` (før-verdier og rollback.sh).
+**Tilbake:** `run0 sh /var/lib/fp5-backup/20261125T195802-console-suspend-N/rollback.sh` (setter Y), eller ta en omstart.
