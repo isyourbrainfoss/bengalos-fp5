@@ -1,0 +1,505 @@
+#!/usr/bin/python3
+# fp5-car-hotspot (FP5 BengalOS avvik, 2026-11-25): turn the phone's Wi-Fi
+# hotspot on when the Tesla's classic audio link (A2DP/AVRCP) connects, turn
+# it off one minute after that link drops, and hold a sleep:idle inhibitor
+# from car-connect until the off-debounce ends.
+#
+# Off at once without stopping: touch ~/.config/fp5-car-hotspot.off
+# A manual hotspot-off is respected until the next car connect.
+# Logs to the journal (stdout) without BT addresses, SSIDs or IPs.
+#
+# Never touches mobile data, ModemManager, or the wifi-preferred dispatcher.
+# Does not restart NetworkManager, bluetooth, PipeWire, WirePlumber or Phosh.
+
+from __future__ import annotations
+
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+VERSION = "1.0"
+AUDIO_UUID_PREFIXES = ("0000110b", "0000110c", "0000110e")  # A2DP sink, AVRCP
+ALIAS_NEEDLE = "tesla"
+DEFAULT_DEBOUNCE_SEC = 60
+HOTSPOT_NAME = "Hotspot"
+OFF_FILE_NAME = "fp5-car-hotspot.off"
+POLL_SEC = 1.0
+NM_RETRY_SEC = 10.0
+
+# Redact secrets if a command ever echoes one into a message we log.
+_REDACT = [
+    (re.compile(r"([0-9A-Fa-f]{2}[:_]){5}[0-9A-Fa-f]{2}"), "XX:XX"),
+    (re.compile(r"dev_[0-9A-F_]+"), "dev_X"),
+    (re.compile(r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}\b"), "<ip>"),
+    (re.compile(r"\b[0-9a-f]{1,4}(?::[0-9a-f]{0,4}){3,7}(?:/[0-9]+)?\b", re.I), "<ip6>"),
+    (re.compile(r"\b(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?\b", re.I), "<ip6>"),
+    (re.compile(r'(Started Wi-Fi Hotspot )"[^"]+"', re.I), r'\1"<ssid>"'),
+    (re.compile(r'SSID[: ]+\S+', re.I), "SSID <ssid>"),
+    (re.compile(r"SSID ['\"][^'\"]+['\"]", re.I), "SSID <ssid>"),
+]
+
+
+def redact(text: str) -> str:
+    if not text:
+        return text
+    for pat, repl in _REDACT:
+        text = pat.sub(repl, text)
+    return text
+
+
+def is_audio_uuid_list(uuids) -> bool:
+    """True if a BlueZ UUID list has A2DP sink or AVRCP."""
+    for u in uuids or ():
+        if str(u).lower().startswith(AUDIO_UUID_PREFIXES):
+            return True
+    return False
+
+
+def is_tesla_audio(uuids, alias) -> bool:
+    """Tesla classic audio device: A2DP/AVRCP UUIDs and alias containing 'tesla'."""
+    if not is_audio_uuid_list(uuids):
+        return False
+    return ALIAS_NEEDLE in (alias or "").lower()
+
+
+# Actions the policy can request. The daemon applies them.
+HOTSPOT_UP = "hotspot-up"
+HOTSPOT_DOWN = "hotspot-down"
+INHIBIT_ON = "inhibit-on"
+INHIBIT_OFF = "inhibit-off"
+
+
+class HotspotPolicy:
+    """Pure state machine. No D-Bus, NM or inhibitors — those are injected."""
+
+    def __init__(self, debounce_sec=DEFAULT_DEBOUNCE_SEC, log=None):
+        self.debounce_sec = debounce_sec
+        self._log = log or (lambda _m: None)
+        self.car = False
+        self.hotspot_up = False
+        self.disabled = False
+        self.manual_off = False
+        self.inhibit = False
+        self.seen_car = False
+        self.debounce_until = None  # monotonic deadline, or None
+        self._prev_car = False
+        self._prev_hotspot = False
+        self._own_down = False  # last down was ours, not a manual off
+        self._started = False
+
+    def log(self, msg: str) -> None:
+        self._log(redact(msg))
+
+    def debounce_active(self, now: float) -> bool:
+        return self.debounce_until is not None and now < self.debounce_until
+
+    def in_session(self, now: float) -> bool:
+        """Car is connected, or we are still in the off-debounce window."""
+        return self.car or self.debounce_active(now)
+
+    def step(self, *, car_connected: bool, hotspot_up: bool, disabled: bool, now: float) -> list[str]:
+        actions: list[str] = []
+
+        def want(action: str) -> None:
+            actions.append(action)
+
+        if disabled:
+            if not self.disabled:
+                self.log("disabled via off-file; not managing the hotspot")
+            self.disabled = True
+            self.debounce_until = None
+            self._prev_car = car_connected
+            self._prev_hotspot = hotspot_up
+            self.car = car_connected
+            self.hotspot_up = hotspot_up
+            self._started = True
+            self._own_down = False
+            if self.inhibit:
+                self.inhibit = False
+                want(INHIBIT_OFF)
+            return actions
+        if self.disabled:
+            self.log("off-file gone; managing the hotspot again")
+        self.disabled = False
+
+        # First observation: do not treat a leftover home hotspot as a session.
+        if not self._started:
+            self._started = True
+            self.car = car_connected
+            self.hotspot_up = hotspot_up
+            self._prev_car = car_connected
+            self._prev_hotspot = hotspot_up
+            if car_connected:
+                self.seen_car = True
+                self.log("car audio already connected at start")
+                if not self.inhibit:
+                    self.inhibit = True
+                    want(INHIBIT_ON)
+                if not hotspot_up:
+                    want(HOTSPOT_UP)
+                else:
+                    self.log("hotspot already on")
+            else:
+                self.log("waiting for the car")
+            return actions
+
+        # Manual off: hotspot went down while we still wanted it, and we did not
+        # request that down. Remember it until the next car-connect edge.
+        if self._own_down:
+            if not hotspot_up:
+                self._own_down = False
+        elif (
+            self.in_session(now)
+            and not self.manual_off
+            and self._prev_hotspot
+            and not hotspot_up
+        ):
+            self.manual_off = True
+            self.log("manual hotspot off; will not re-enable until the next car connect")
+
+        # User turned the hotspot back on while still in the session.
+        if self.manual_off and hotspot_up and self.in_session(now):
+            self.manual_off = False
+            self.log("hotspot on again; resuming automatic management")
+
+        # Connect / disconnect edges.
+        if car_connected and not self._prev_car:
+            self.seen_car = True
+            self.manual_off = False
+            self.debounce_until = None
+            self.log("car audio connected")
+        if (not car_connected) and self._prev_car:
+            self.debounce_until = now + self.debounce_sec
+            self.log("car audio disconnected; hotspot off in %ds" % self.debounce_sec)
+
+        if car_connected:
+            self.debounce_until = None
+
+        # Debounce just expired.
+        if self.debounce_until is not None and now >= self.debounce_until:
+            self.log("off-debounce ended")
+            self.debounce_until = None
+
+        self.car = car_connected
+        self.hotspot_up = hotspot_up
+        self._prev_car = car_connected
+        self._prev_hotspot = hotspot_up
+
+        session = self.in_session(now)
+        # Inhibit follows the car session, including during a manual off.
+        if session and not self.inhibit:
+            self.inhibit = True
+            want(INHIBIT_ON)
+        if (not session) and self.inhibit:
+            self.inhibit = False
+            want(INHIBIT_OFF)
+
+        want_hotspot = session and not self.manual_off
+        if want_hotspot and not hotspot_up:
+            want(HOTSPOT_UP)
+        if (not want_hotspot) and hotspot_up and self.seen_car and not session:
+            # Left the car and debounce has ended. Auto-off even if we did not
+            # turn the hotspot on (manual-on-before-BT, leftover after a drive).
+            self._own_down = True
+            want(HOTSPOT_DOWN)
+
+        return actions
+
+
+def default_off_path() -> str:
+    return os.path.join(os.path.expanduser("~"), ".config", OFF_FILE_NAME)
+
+
+# --- daemon helpers (not used by unit tests) ---------------------------------
+
+def run_cmd(argv, timeout=20) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def find_hotspot_uuid(nmcli="nmcli") -> str | None:
+    """Return the UUID of the AP connection named Hotspot, or None. No SSIDs logged."""
+    listing = run_cmd([nmcli, "-t", "-f", "NAME,UUID,TYPE", "connection", "show"])
+    if listing.returncode != 0:
+        return None
+    candidates = []
+    for line in listing.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) < 3:
+            continue
+        name, uuid, typ = parts[0], parts[1], parts[2]
+        if typ not in ("802-11-wireless", "wifi"):
+            continue
+        if name != HOTSPOT_NAME:
+            continue
+        candidates.append(uuid)
+    for uuid in candidates:
+        mode = run_cmd([nmcli, "-g", "802-11-wireless.mode", "connection", "show", uuid])
+        if mode.returncode == 0 and mode.stdout.strip() == "ap":
+            return uuid
+    return None
+
+
+def hotspot_is_up(nmcli="nmcli", uuid=None) -> bool:
+    if not uuid:
+        return False
+    p = run_cmd([nmcli, "-t", "-f", "UUID,TYPE,DEVICE,STATE", "connection", "show", "--active"])
+    if p.returncode != 0:
+        return False
+    for line in p.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 4 and parts[0] == uuid and parts[3] in ("activated", "activating"):
+            return parts[3] == "activated"
+    return False
+
+
+def list_bluez_devices() -> list[tuple[list[str], str, bool]]:
+    """[(uuids, alias, connected), ...] via busctl. Paths/addresses are not returned."""
+    devices: list[tuple[list[str], str, bool]] = []
+    tree = run_cmd(["busctl", "--system", "tree", "org.bluez"])
+    if tree.returncode != 0:
+        return devices
+    paths = []
+    for line in tree.stdout.splitlines():
+        if "/org/bluez/" not in line or "/dev_" not in line:
+            continue
+        idx = line.find("/org/bluez/")
+        path = line[idx:].split()[0]
+        # Device node: /org/bluez/hciN/dev_XX — not sep/fd/player children.
+        if path.count("/") == 4:
+            paths.append(path)
+    paths = sorted(set(paths))
+
+    def prop(path, name) -> str:
+        p = run_cmd(
+            ["busctl", "--system", "get-property", "org.bluez", path, "org.bluez.Device1", name]
+        )
+        return p.stdout.strip() if p.returncode == 0 else ""
+
+    def parse_s(raw: str) -> str:
+        # s "Foo"
+        m = re.match(r'^s\s+"(.*)"\s*$', raw)
+        return m.group(1) if m else ""
+
+    def parse_b(raw: str) -> bool:
+        return raw.split()[-1:] == ["true"] or raw.endswith(" true")
+
+    def parse_as(raw: str) -> list[str]:
+        # as N "uuid" "uuid" ...
+        return re.findall(r'"([^"]+)"', raw)
+
+    for path in paths:
+        alias = parse_s(prop(path, "Alias")) or parse_s(prop(path, "Name"))
+        connected = parse_b(prop(path, "Connected"))
+        uuids = parse_as(prop(path, "UUIDs"))
+        devices.append((uuids, alias, connected))
+    return devices
+
+
+def tesla_audio_connected() -> bool:
+    for uuids, alias, connected in list_bluez_devices():
+        if connected and is_tesla_audio(uuids, alias):
+            return True
+    return False
+
+
+class InhibitHolder:
+    """Hold a logind sleep:idle block via systemd-inhibit until release()."""
+
+    def __init__(self, log):
+        self._log = log
+        self.proc = None
+
+    @property
+    def held(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def acquire(self) -> bool:
+        if self.held:
+            return True
+        try:
+            self.proc = subprocess.Popen(
+                [
+                    "systemd-inhibit",
+                    "--what=sleep:idle",
+                    "--mode=block",
+                    "--who=fp5-car-hotspot",
+                    "--why=in the car",
+                    "sleep",
+                    "infinity",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            time.sleep(0.15)
+            if self.proc.poll() is not None:
+                err = ""
+                try:
+                    err = (self.proc.stderr.read() or "") if self.proc.stderr else ""
+                except Exception:
+                    err = ""
+                self._log("inhibit failed: " + redact(err.strip() or "systemd-inhibit exited"))
+                self.proc = None
+                return False
+            self._log("sleep:idle inhibit acquired")
+            return True
+        except Exception as e:
+            self._log("inhibit failed: " + redact(str(e)))
+            self.proc = None
+            return False
+
+    def release(self) -> None:
+        if self.proc is None:
+            return
+        proc = self.proc
+        self.proc = None
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._log("sleep:idle inhibit released")
+
+
+class Daemon:
+    def __init__(self, policy: HotspotPolicy, off_path: str, nmcli="nmcli"):
+        self.policy = policy
+        self.off_path = off_path
+        self.nmcli = nmcli
+        self.inhibit = InhibitHolder(policy.log)
+        self.uuid = None
+        self._stop = False
+        self._last_nm = 0.0
+        self._pending = None  # HOTSPOT_UP / HOTSPOT_DOWN until observed
+
+    def log(self, msg: str) -> None:
+        self.policy.log(msg)
+
+    def stop(self, *_a) -> None:
+        self._stop = True
+
+    def apply(self, actions: list[str], now: float) -> None:
+        for a in actions:
+            if a == INHIBIT_ON:
+                if not self.inhibit.acquire():
+                    self.policy.inhibit = False
+            elif a == INHIBIT_OFF:
+                self.inhibit.release()
+            elif a == HOTSPOT_UP:
+                self._nm_up(now)
+            elif a == HOTSPOT_DOWN:
+                self._nm_down(now)
+
+    def _nm_up(self, now: float) -> None:
+        if self._pending == HOTSPOT_UP and (now - self._last_nm) < NM_RETRY_SEC:
+            return
+        if not self.uuid:
+            self.uuid = find_hotspot_uuid(self.nmcli)
+        if not self.uuid:
+            self.log("no Hotspot AP connection found; will retry")
+            return
+        self._last_nm = now
+        self._pending = HOTSPOT_UP
+        p = run_cmd([self.nmcli, "connection", "up", "uuid", self.uuid], timeout=30)
+        if p.returncode == 0:
+            self.log("hotspot on")
+        else:
+            err = redact((p.stderr or p.stdout or "nmcli failed").strip().splitlines()[:1][0] if (p.stderr or p.stdout) else "nmcli failed")
+            # Never include raw nmcli text if it might have an SSID — already redacted.
+            self.log("hotspot on failed: " + err)
+            self._pending = None
+
+    def _nm_down(self, now: float) -> None:
+        if self._pending == HOTSPOT_DOWN and (now - self._last_nm) < NM_RETRY_SEC:
+            return
+        if not self.uuid:
+            self.uuid = find_hotspot_uuid(self.nmcli)
+        if not self.uuid:
+            self.log("no Hotspot AP connection found; will retry")
+            return
+        self._last_nm = now
+        self._pending = HOTSPOT_DOWN
+        p = run_cmd([self.nmcli, "connection", "down", "uuid", self.uuid], timeout=30)
+        if p.returncode == 0:
+            self.log("hotspot off")
+        else:
+            err = redact((p.stderr or p.stdout or "nmcli failed").strip().splitlines()[:1][0] if (p.stderr or p.stdout) else "nmcli failed")
+            self.log("hotspot off failed: " + err)
+            self._pending = None
+
+    def once(self, now: float) -> None:
+        disabled = os.path.exists(self.off_path)
+        try:
+            car = tesla_audio_connected()
+        except Exception as e:
+            self.log("bluez query failed: " + redact(str(e)))
+            car = self.policy.car
+        if not self.uuid:
+            self.uuid = find_hotspot_uuid(self.nmcli)
+        try:
+            up = hotspot_is_up(self.nmcli, self.uuid)
+        except Exception as e:
+            self.log("nm query failed: " + redact(str(e)))
+            up = self.policy.hotspot_up
+        if self._pending == HOTSPOT_UP and up:
+            self._pending = None
+        if self._pending == HOTSPOT_DOWN and not up:
+            self._pending = None
+        actions = self.policy.step(car_connected=car, hotspot_up=up, disabled=disabled, now=now)
+        self.apply(actions, now)
+
+    def run(self) -> int:
+        self.log("fp5-car-hotspot %s starting (debounce %ds)" % (VERSION, self.policy.debounce_sec))
+        self.uuid = find_hotspot_uuid(self.nmcli)
+        if self.uuid:
+            self.log("using AP connection %s" % HOTSPOT_NAME)
+        else:
+            self.log("no Hotspot AP connection found yet; will keep looking")
+        while not self._stop:
+            try:
+                self.once(time.monotonic())
+            except Exception as e:
+                self.log("tick failed: " + redact(str(e)))
+            # Short sleep, but wake early on stop.
+            for _ in range(int(POLL_SEC * 10)):
+                if self._stop:
+                    break
+                time.sleep(0.1)
+        self.inhibit.release()
+        self.log("stopped")
+        return 0
+
+
+def main(argv=None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    debounce = int(os.environ.get("FP5_CAR_HOTSPOT_DEBOUNCE", str(DEFAULT_DEBOUNCE_SEC)))
+    off_path = os.environ.get("FP5_CAR_HOTSPOT_OFF", default_off_path())
+    nmcli = os.environ.get("FP5_NMCLI", "nmcli")
+
+    def log(msg: str) -> None:
+        sys.stdout.write(msg + "\n")
+        sys.stdout.flush()
+
+    policy = HotspotPolicy(debounce_sec=debounce, log=log)
+    daemon = Daemon(policy, off_path=off_path, nmcli=nmcli)
+    signal.signal(signal.SIGTERM, daemon.stop)
+    signal.signal(signal.SIGINT, daemon.stop)
+    return daemon.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

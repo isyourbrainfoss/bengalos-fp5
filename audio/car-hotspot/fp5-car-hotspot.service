@@ -1,0 +1,19 @@
+# fp5-car-hotspot (FP5 avvik 2026-11-25): turn the Wi-Fi hotspot on when the
+# Tesla's classic audio link connects, off one minute after it drops, and
+# hold sleep:idle from car-connect until that debounce ends.
+# Off at once without stopping: touch ~/.config/fp5-car-hotspot.off
+# Not PartOf=graphical-session.target: a Phosh crash must not drop the AP
+# or the inhibitor.
+[Unit]
+Description=FP5: Wi-Fi hotspot on in the Tesla, off one minute after leaving
+After=network.target bluetooth.target default.target
+
+[Service]
+ExecStart=%h/.local/bin/fp5-car-hotspot
+Environment=FP5_CAR_HOTSPOT_DEBOUNCE=60
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
