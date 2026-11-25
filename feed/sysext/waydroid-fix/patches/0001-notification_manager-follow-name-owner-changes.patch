@@ -1,0 +1,11 @@
+--- a/usr/lib/waydroid/tools/services/notification_manager.py
++++ b/usr/lib/waydroid/tools/services/notification_manager.py
+@@ -71,7 +71,7 @@
+             INotifications.add_service(args, registerListener, notify, closeNotification)
+ 
+     try:
+-        dbus_proxy = dbus.Interface(dbus.SessionBus().get_object("org.freedesktop.Notifications", "/org/freedesktop/Notifications"),
++        dbus_proxy = dbus.Interface(dbus.SessionBus().get_object("org.freedesktop.Notifications", "/org/freedesktop/Notifications", follow_name_owner_changes=True),
+                                     "org.freedesktop.Notifications")
+     except dbus.DBusException as e:
+         logging.info("Skipping notification manager service because we could not connect to the notifications server: %s", str(e))
