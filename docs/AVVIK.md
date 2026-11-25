@@ -402,3 +402,16 @@ Anropsnumre lagres bare som sha256 med lokal salt under `~/.local/state/fp5-repe
 **Hvorfor:** Telefonen døde i dvale uten lader 25.11 ca. 19:34–19:41 (varm PS_HOLD-reset) med standard logging. Mens tung logging (med console_suspend=N) var på, døde den aldri uten lader. Det eneste dødsfallet med console_suspend=N hittil (23.11 15:09) var med lader. Testen skal vise om dødsfallene uten lader henger sammen med console_suspend=Y (GENI-konsollen slås av under dvale) og ikke bare med timing.
 **Backup:** `/var/lib/fp5-backup/20261125T195802-console-suspend-N/` (før-verdier og rollback.sh).
 **Tilbake:** `run0 sh /var/lib/fp5-backup/20261125T195802-console-suspend-N/rollback.sh` (setter Y), eller ta en omstart.
+
+## 2026-11-25 20:19 — Tung dvalelogging som omvei (midlertidig, DES-4)
+
+**Hva:** Satt som root over SSH fra desk (run0 --no-ask-password, én gang). Kristian sa «skru på litt mer logging» og «nå» kl. 20:19. Bare runtime-endringer som forsvinner ved neste omstart:
+- `/proc/sys/kernel/printk`: `4 4 1 8` → `8 4 1 8`.
+- `/sys/module/printk/parameters/console_suspend`: Y → N.
+- `/sys/power/pm_debug_messages`: 0 → 1.
+- `pm_print_times`: uendret 1.
+
+Lest tilbake: printk `8 4 1 8`, console_suspend N, pm_debug_messages 1, pm_print_times 1. Ingen tmpfiles, sysctl.d, enheter eller cmdline. Ingen tjenester restartet. I samme run0 ble console-ramoops-0 fra dødsfallet 20:08 lest (bare lesing, sendt redigert til desk, ingen kopi på telefonen). pstore er ikke tømt, pmsg er ikke lest.
+**Hvorfor:** Telefonen døde i dvale uten lader 25.11 ca. 19:34 og ca. 20:08. Det siste skjedde med console_suspend=N alene (printk 4), så console_suspend=Y er ikke eneste årsak. Tung logging er den eneste oppsettet der det aldri har vært dødsfall uten lader. Det tyder på et timing-kappløp som den trege loggingen skjuler. Brukes nå som omvei, og et nytt dødsfall vil vise siste «PM: calling …» i ramoops.
+**Backup:** `/var/lib/fp5-backup/20261125T201937-suspend-logging-heavy/` (før-verdier og rollback.sh).
+**Tilbake:** `run0 sh /var/lib/fp5-backup/20261125T201937-suspend-logging-heavy/rollback.sh` (setter `4 4 1 8`, pm_debug 0, console_suspend Y, pm_print_times 1), eller ta en omstart.
