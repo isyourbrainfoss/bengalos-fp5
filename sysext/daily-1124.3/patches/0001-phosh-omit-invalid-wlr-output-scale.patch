@@ -1,0 +1,305 @@
+diff --git a/src/monitor-manager.c b/src/monitor-manager.c
+index e7b416fa..e99c9443 100644
+--- a/src/monitor-manager.c
++++ b/src/monitor-manager.c
+@@ -14,6 +14,7 @@
+ #include "monitor-manager.h"
+ #include "monitor/head-priv.h"
+ #include "monitor/monitor.h"
++#include "monitor/output-scale.h"
+ 
+ #include "wlr-gamma-control-unstable-v1-client-protocol.h"
+ #include "phosh-wayland.h"
+@@ -660,7 +661,10 @@ config_head_config_from_logical_monitor_variant (PhoshMonitorManager *self,
+       head->pending.mode = mode;
+     else
+       g_warning ("Mode %s not found on head %s", mode_name, head->name);
+-    head->pending.scale = scale;
++    if (phosh_output_scale_to_fixed (scale, NULL))
++      head->pending.scale = scale;
++    else
++      g_warning ("Ignoring invalid scale %f for head %s", scale, head->name);
+     head->pending.x = x;
+     head->pending.y = y;
+     head->pending.transform = transform;
+@@ -1573,21 +1577,52 @@ phosh_monitor_manager_apply_monitor_config (PhoshMonitorManager *self)
+       continue;
+     }
+ 
+-    config_head = zwlr_output_configuration_v1_enable_head (config, wlr_head);
++    {
++      PhoshHeadMode *head_mode = head->pending.mode;
++      wl_fixed_t scale_fixed = 0;
++      gboolean send_scale;
++
++      /* A disabled head has no current mode event. Prefer pending, else
++       * the preferred mode advertised with the head. */
++      if (!head_mode)
++        head_mode = phosh_head_get_preferred_mode (head);
++
++      /* Every head has to be in the configuration. Enabling without a mode
++       * would pass a NULL zwlr_output_mode_v1 (or crash on the old
++       * preferred->wlr_mode dereference). Disable this round; a later done
++       * event retries once the compositor has modes. */
++      if (!head_mode || !head_mode->wlr_mode) {
++        g_warning ("Head %s has no mode yet; disabling it in this configuration",
++                   head->name);
++        zwlr_output_configuration_v1_disable_head (config, wlr_head);
++        continue;
++      }
+ 
+-    /* A disabled head might not have a mode when set */
+-    if (head->pending.mode) {
+-      wlr_mode = head->pending.mode->wlr_mode;
+-    } else {
+-      wlr_mode = phosh_head_get_preferred_mode (head)->wlr_mode;
+-    }
++      config_head = zwlr_output_configuration_v1_enable_head (config, wlr_head);
++      wlr_mode = head_mode->wlr_mode;
++
++      zwlr_output_configuration_head_v1_set_mode (config_head, wlr_mode);
++      zwlr_output_configuration_head_v1_set_position (config_head,
++                                                      head->pending.x, head->pending.y);
++      zwlr_output_configuration_head_v1_set_transform (config_head, head->pending.transform);
+ 
+-    zwlr_output_configuration_head_v1_set_mode (config_head, wlr_mode);
+-    zwlr_output_configuration_head_v1_set_position (config_head,
+-                                                    head->pending.x, head->pending.y);
+-    zwlr_output_configuration_head_v1_set_transform (config_head, head->pending.transform);
+-    zwlr_output_configuration_head_v1_set_scale (config_head,
+-                                                 wl_fixed_from_double (head->pending.scale));
++      send_scale = phosh_output_scale_to_fixed (head->pending.scale, &scale_fixed);
++      if (!send_scale && phosh_output_scale_to_fixed (head->scale, &scale_fixed)) {
++        g_warning ("Head %s pending scale %f is invalid; using current scale %f",
++                   head->name, head->pending.scale, head->scale);
++        send_scale = TRUE;
++      }
++      if (send_scale) {
++        zwlr_output_configuration_head_v1_set_scale (config_head, scale_fixed);
++      } else {
++        /* enable_head already copied the compositor's scale onto the
++         * configuration head (wlroots initialises a new output to 1).
++         * Sending <= 0 is protocol error 5 and disconnects us. */
++        g_warning ("Head %s has no positive scale (pending %f, current %f); "
++                   "omitting set_scale",
++                   head->name, head->pending.scale, head->scale);
++      }
++    }
+   }
+ 
+   zwlr_output_configuration_v1_apply (config);
+diff --git a/src/monitor/head.c b/src/monitor/head.c
+index 38e41f7c..fda03484 100644
+--- a/src/monitor/head.c
++++ b/src/monitor/head.c
+@@ -9,6 +9,7 @@
+ #define G_LOG_DOMAIN "phosh-head"
+ 
+ #include "head-priv.h"
++#include "output-scale.h"
+ 
+ #include <gdk/gdkwayland.h>
+ 
+@@ -264,7 +265,17 @@ head_handle_scale (void                       *data,
+   PhoshHead *self = PHOSH_HEAD (data);
+ 
+   g_return_if_fail (PHOSH_IS_HEAD (self));
+-  self->scale = self->pending.scale = wl_fixed_to_double(scale);
++  {
++    double new_scale = wl_fixed_to_double (scale);
++
++    /* A non-positive scale must not be stored. The next apply would echo
++     * it and the compositor would post invalid_scale (error 5). */
++    if (!phosh_output_scale_to_fixed (new_scale, NULL)) {
++      g_warning ("Head %p ignored non-positive scale %f", self, new_scale);
++      return;
++    }
++    self->scale = self->pending.scale = new_scale;
++  }
+   g_debug ("Head %p has scale %f", self, self->scale);
+ 
+ }
+@@ -490,7 +501,13 @@ phosh_head_set_pending_transform (PhoshHead             *self,
+     return;
+ 
+   g_return_if_fail (self->pending.mode);
+-  g_return_if_fail (self->pending.scale >= 0.0);
++  /* Scale 0 is "not yet known" (disabled head). Dividing by it would
++   * push the layout to infinity and the following apply would send it. */
++  if (!(self->pending.scale > 0.0)) {
++    g_warning ("Head %s has no positive scale (%f); not shifting the layout",
++               self->name, self->pending.scale);
++    return;
++  }
+   dx = (self->pending.mode->height - self->pending.mode->width) / self->pending.scale;
+   dy = (self->pending.mode->width - self->pending.mode->height) / self->pending.scale;
+   if (was_tilted) {
+@@ -530,8 +547,16 @@ phosh_head_set_pending_scale (PhoshHead *self, double scale, GPtrArray *heads)
+ 
+   g_return_if_fail (self);
+ 
+-  g_return_if_fail (self->pending.mode);
+-  g_return_if_fail (self->pending.scale >= 0.0);
++  if (!phosh_output_scale_to_fixed (scale, NULL)) {
++    g_warning ("Refusing non-positive scale %f on head %s", scale, self->name);
++    return;
++  }
++
++  /* No current scale or mode yet: store the new scale, skip the layout shift. */
++  if (!self->pending.mode || !(self->pending.scale > 0.0)) {
++    self->pending.scale = scale;
++    return;
++  }
+ 
+   dx = (self->pending.mode->height * ( 1.0 / self->pending.scale) - 1.0 / scale);
+   dy = (self->pending.mode->width * ( 1.0 / self->pending.scale) - 1.0 / scale);
+diff --git a/src/monitor/output-scale.h b/src/monitor/output-scale.h
+new file mode 100644
+index 00000000..1c5e479b
+--- /dev/null
++++ b/src/monitor/output-scale.h
+@@ -0,0 +1,56 @@
++/*
++ * Copyright (C) 2026 The Phosh Developers
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * Decide whether a scale may be sent with
++ * zwlr_output_configuration_head_v1.set_scale.
++ *
++ * wlroots 0.20 (types/wlr_output_management_v1.c,
++ * config_head_handle_set_scale) posts error 5, "invalid scale", when the
++ * fixed-point value is <= 0. That is a protocol error: libwayland drops
++ * the client, so phosh exits. A disabled head never receives a scale
++ * event (the protocol sends scale only while the head is enabled), so
++ * PhoshHead.pending.scale stays 0. Enabling that head and echoing 0 —
++ * phosh_monitor_manager_enable_fallback does this after the primary
++ * monitor goes NULL — kills the shell.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include <wayland-util.h>
++
++/**
++ * phosh_output_scale_to_fixed:
++ * @scale: candidate scale
++ * @out_fixed: (out) (nullable): wl_fixed value, written only on success
++ *
++ * Returns: %TRUE if @scale is strictly positive and survives the
++ * round-trip through wl_fixed (24.8). NaN, 0, negatives, and positive
++ * values that round to fixed 0 are rejected. A rejected value must not
++ * be passed to set_scale; the caller omits the request and the
++ * compositor keeps the scale it already copied into the configuration
++ * head (wlroots defaults a fresh output to 1).
++ *
++ * Valid scales (1, 1.25, 1.5, 2, 2.5, 3, …) are returned unchanged.
++ */
++static inline bool
++phosh_output_scale_to_fixed (double scale, int32_t *out_fixed)
++{
++  int32_t fixed;
++
++  /* NaN compares false against every relational operator. */
++  if (!(scale > 0.0))
++    return false;
++
++  fixed = (int32_t) wl_fixed_from_double (scale);
++  if (fixed <= 0)
++    return false;
++
++  if (out_fixed)
++    *out_fixed = fixed;
++  return true;
++}
+diff --git a/tests/meson.build b/tests/meson.build
+index 34cc6ee7..856a4df1 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -133,6 +133,7 @@ tests_unit = [
+   'notification-list',
+   'notification-source',
+   'notify-feedback',
++  'output-scale',
+   'overview',
+   'plugin-loader',
+   'quick-setting',
+diff --git a/tests/test-output-scale.c b/tests/test-output-scale.c
+new file mode 100644
+index 00000000..f00e29a4
+--- /dev/null
++++ b/tests/test-output-scale.c
+@@ -0,0 +1,70 @@
++/*
++ * Copyright (C) 2026 The Phosh Developers
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * Unit test for phosh_output_scale_to_fixed(). The helper is what
++ * monitor-manager uses before zwlr_output_configuration_head_v1.set_scale.
++ */
++
++#include "output-scale.h"
++
++#include <glib.h>
++#include <math.h>
++
++static void
++test_rejects_non_positive (void)
++{
++  int32_t fixed = 42;
++
++  g_assert_false (phosh_output_scale_to_fixed (0.0, &fixed));
++  g_assert_cmpint (fixed, ==, 42);
++  g_assert_false (phosh_output_scale_to_fixed (-1.0, &fixed));
++  g_assert_false (phosh_output_scale_to_fixed (-0.25, &fixed));
++  g_assert_false (phosh_output_scale_to_fixed (NAN, &fixed));
++  g_assert_cmpint (fixed, ==, 42);
++  g_assert_false (phosh_output_scale_to_fixed (0.0, NULL));
++}
++
++static void
++test_accepts_known_scales (void)
++{
++  static const double scales[] = { 1.0, 1.25, 1.5, 2.0, 2.5, 3.0 };
++  guint i;
++
++  g_assert_true (phosh_output_scale_to_fixed (2.0, NULL));
++
++  for (i = 0; i < G_N_ELEMENTS (scales); i++) {
++    int32_t fixed = 0;
++
++    g_assert_true (phosh_output_scale_to_fixed (scales[i], &fixed));
++    g_assert_cmpint (fixed, ==, (int32_t) wl_fixed_from_double (scales[i]));
++    g_assert_cmpint (fixed, >, 0);
++  }
++}
++
++static void
++test_tiny_positive_that_rounds_to_zero (void)
++{
++  /* 24.8 fixed cannot represent 1e-6; wl_fixed_from_double rounds it to 0
++   * and wlroots would post invalid_scale. */
++  double tiny = 1.0 / 1000000.0;
++  int32_t fixed = 42;
++  wl_fixed_t raw = wl_fixed_from_double (tiny);
++
++  g_assert_cmpint (raw, <=, 0);
++  g_assert_false (phosh_output_scale_to_fixed (tiny, &fixed));
++  g_assert_cmpint (fixed, ==, 42);
++}
++
++int
++main (int argc, char *argv[])
++{
++  g_test_init (&argc, &argv, NULL);
++
++  g_test_add_func ("/phosh/output-scale/rejects-non-positive", test_rejects_non_positive);
++  g_test_add_func ("/phosh/output-scale/accepts-known-scales", test_accepts_known_scales);
++  g_test_add_func ("/phosh/output-scale/tiny-positive", test_tiny_positive_that_rounds_to_zero);
++
++  return g_test_run ();
++}

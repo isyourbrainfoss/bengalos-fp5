@@ -1,0 +1,770 @@
+diff --git a/plugins/provider/ofono/calls-ofono-provider.c b/plugins/provider/ofono/calls-ofono-provider.c
+index 7e6a7dd..fce5579 100644
+--- a/plugins/provider/ofono/calls-ofono-provider.c
++++ b/plugins/provider/ofono/calls-ofono-provider.c
+@@ -29,6 +29,7 @@
+ #include "calls-ofono-origin.h"
+ #include "calls-message-source.h"
+ #include "calls-util.h"
++#include "calls-default-origin.h"
+ 
+ #include <libgdbofono/gdbo-manager.h>
+ #include <libgdbofono/gdbo-modem.h>
+@@ -153,6 +154,51 @@ object_array_includes (GVariantIter *iter,
+ }
+ 
+ 
++/* 0 = unknown (treat as online), 1 = online, 2 = offline. */
++static void
++modem_set_online (GDBOModem *modem,
++                  gboolean   online)
++{
++  g_object_set_data (G_OBJECT (modem), "calls-online",
++                     GINT_TO_POINTER (online ? 1 : 2));
++}
++
++static gboolean
++modem_get_online (GDBOModem *modem)
++{
++  return GPOINTER_TO_INT (g_object_get_data (G_OBJECT (modem), "calls-online")) != 2;
++}
++
++static void
++modem_remember_ifaces (GDBOModem *modem,
++                       GVariant  *ifaces)
++{
++  if (!ifaces)
++    return;
++
++  g_object_set_data_full (G_OBJECT (modem), "calls-ifaces",
++                          g_variant_ref (ifaces),
++                          (GDestroyNotify) g_variant_unref);
++}
++
++static gboolean
++variant_bool (GVariant *value,
++              gboolean  fallback)
++{
++  if (!value)
++    return fallback;
++
++  if (g_variant_is_of_type (value, G_VARIANT_TYPE_VARIANT)) {
++    g_autoptr (GVariant) inner = g_variant_get_variant (value);
++    return variant_bool (inner, fallback);
++  }
++
++  if (g_variant_is_of_type (value, G_VARIANT_TYPE_BOOLEAN))
++    return g_variant_get_boolean (value);
++
++  return fallback;
++}
++
+ static void
+ modem_check_ifaces (CallsOfonoProvider *self,
+                     GDBOModem          *modem,
+@@ -168,6 +214,11 @@ modem_check_ifaces (CallsOfonoProvider *self,
+   g_variant_get (ifaces, "as", &iter);
+ 
+   voice = object_array_includes (iter, "org.ofono.VoiceCallManager");
++  modem_remember_ifaces (modem, ifaces);
++  /* VoiceCallManager with Online=false is not a usable IMS origin.
++   * Leaving it out of the list makes a tel: dial fall back to ModemManager. */
++  if (!modem_get_online (modem))
++    voice = FALSE;
+ 
+   path = g_dbus_proxy_get_object_path (G_DBUS_PROXY (modem));
+ 
+@@ -182,6 +233,8 @@ modem_check_ifaces (CallsOfonoProvider *self,
+   } else if (!voice && has_origin) {
+     g_list_store_remove (self->origins, index);
+   }
++
++  (void) modem_name;
+ }
+ 
+ 
+@@ -195,12 +248,22 @@ modem_property_changed_cb (GDBOModem          *modem,
+ 
+   g_debug ("Modem property `%s' changed", name);
+ 
+-  if (g_strcmp0 (name, "Interfaces") != 0)
+-    return;
+-
+   modem_name = g_object_get_data (G_OBJECT (modem),
+                                   "calls-modem-name");
+ 
++  if (g_strcmp0 (name, "Online") == 0) {
++    GVariant *ifaces;
++
++    modem_set_online (modem, variant_bool (value, TRUE));
++    ifaces = g_object_get_data (G_OBJECT (modem), "calls-ifaces");
++    if (ifaces)
++      modem_check_ifaces (self, modem, modem_name, ifaces);
++    return;
++  }
++
++  if (g_strcmp0 (name, "Interfaces") != 0)
++    return;
++
+   /* PropertyChanged gives us a variant gvariant containing a string array,
+      but modem_check_ifaces expects the inner string array gvariant */
+   value = g_variant_get_variant (value);
+@@ -212,6 +275,8 @@ struct CallsModemProxyNewData {
+   CallsOfonoProvider *self;
+   gchar              *name;
+   GVariant           *ifaces;
++  gboolean            online_set;
++  gboolean            online;
+ };
+ 
+ 
+@@ -243,6 +308,8 @@ modem_proxy_new_cb (GDBusConnection               *connection,
+      to our Origin when we create it */
+   g_object_set_data_full (G_OBJECT (modem), "calls-modem-name",
+                           data->name, g_free);
++  if (data->online_set)
++    modem_set_online (modem, data->online);
+ 
+   path = g_dbus_proxy_get_object_path (G_DBUS_PROXY (modem));
+ 
+@@ -307,13 +374,23 @@ modem_added_cb (GDBOManager        *manager,
+   g_debug ("Adding modem `%s'", path);
+ 
+   if (g_hash_table_lookup (self->modems, path)) {
+-    g_warning ("Modem `%s' already exists", path);
+-    return;
++    gboolean has_origin = ofono_find_origin_index (self, path, NULL);
++
++    if (!calls_ofono_modem_should_add (TRUE, has_origin)) {
++      g_warning ("Modem `%s' already exists", path);
++      return;
++    }
++
++    /* Vanish cleared the origin and left this path in the table, or the
++     * origin was dropped because the modem went offline. Add it again. */
++    g_debug ("Modem `%s' is known but has no origin; adding it again", path);
++    g_hash_table_remove (self->modems, path);
+   }
+ 
+   data = g_new0 (struct CallsModemProxyNewData, 1);
+   data->self = self;
+   data->name = modem_properties_get_name (properties);
++  data->online_set = g_variant_lookup (properties, "Online", "b", &data->online);
+ 
+   data->ifaces = g_variant_lookup_value
+                    (properties, "Interfaces", G_VARIANT_TYPE_ARRAY);
+@@ -459,8 +536,16 @@ ofono_vanished_cb (GDBusConnection    *connection,
+                    CallsOfonoProvider *self)
+ {
+   g_debug ("Ofono vanished from D-Bus");
+-  g_list_store_remove_all (self->origins);
++  /* Drop proxies and origins together. Leaving the path in the hash made
++   * the next GetModems return at "already exists" and the origin never
++   * came back onto the manager's list. */
++  calls_ofono_clear_on_vanish (self->modems, self->origins);
++  g_clear_object (&self->manager);
++  self->connection = NULL;
+   update_status (self);
++
++  (void) connection;
++  (void) name;
+ }
+ 
+ static void
+diff --git a/src/calls-default-origin.c b/src/calls-default-origin.c
+new file mode 100644
+index 0000000..a45bccc
+--- /dev/null
++++ b/src/calls-default-origin.c
+@@ -0,0 +1,103 @@
++/*
++ * Copyright (C) 2026 The Calls authors
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "calls-default-origin.h"
++
++gboolean
++calls_origin_name_is_imsd (const char *name,
++                           const char *id)
++{
++  if (g_strcmp0 (name, "imsd") == 0 || g_strcmp0 (name, "/imsd") == 0)
++    return TRUE;
++  if (g_strcmp0 (id, "imsd") == 0 || g_strcmp0 (id, "/imsd") == 0)
++    return TRUE;
++  return FALSE;
++}
++
++int
++calls_pick_tel_default_origin (const CallsOriginCandidate *candidates,
++                               guint                       n,
++                               gboolean                    prefer_imsd)
++{
++  int fallback = -1;
++
++  if (!candidates || n == 0)
++    return -1;
++
++  for (guint i = 0; i < n; i++) {
++    if (!candidates[i].usable)
++      continue;
++
++    if (fallback < 0)
++      fallback = (int) i;
++
++    if (prefer_imsd &&
++        candidates[i].kind == CALLS_ORIGIN_KIND_OFONO &&
++        calls_origin_name_is_imsd (candidates[i].name, candidates[i].id))
++      return (int) i;
++  }
++
++  return fallback;
++}
++
++gboolean
++calls_number_is_common_emergency (const char *number)
++{
++  if (g_strcmp0 (number, "112") == 0 ||
++      g_strcmp0 (number, "911") == 0 ||
++      g_strcmp0 (number, "999") == 0 ||
++      g_strcmp0 (number, "000") == 0)
++    return TRUE;
++
++  return FALSE;
++}
++
++int
++calls_pick_first_listed (const char              *target,
++                         const char * const * const *lists,
++                         guint                        n)
++{
++  if (!target || !lists)
++    return -1;
++
++  for (guint i = 0; i < n; i++) {
++    if (lists[i] && g_strv_contains (lists[i], target))
++      return (int) i;
++  }
++
++  return -1;
++}
++
++int
++calls_dial_origin_index (gboolean                    use_default,
++                         int                         explicit_index,
++                         const CallsOriginCandidate *candidates,
++                         guint                       n)
++{
++  if (!use_default)
++    return explicit_index;
++
++  return calls_pick_tel_default_origin (candidates, n, TRUE);
++}
++
++gboolean
++calls_ofono_modem_should_add (gboolean already_known,
++                              gboolean origin_present)
++{
++  return !already_known || !origin_present;
++}
++
++void
++calls_ofono_clear_on_vanish (GHashTable *modems,
++                             GListStore *origins)
++{
++  /* Origins hold their own modem ref. Drop them before the hash so
++   * dispose still has a live proxy if it looks at one. */
++  if (origins)
++    g_list_store_remove_all (origins);
++  if (modems)
++    g_hash_table_remove_all (modems);
++}
+diff --git a/src/calls-default-origin.h b/src/calls-default-origin.h
+new file mode 100644
+index 0000000..4dcbf80
+--- /dev/null
++++ b/src/calls-default-origin.h
+@@ -0,0 +1,77 @@
++/*
++ * Copyright (C) 2026 The Calls authors
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * Choose a default origin for a tel: dial, and decide whether an oFono
++ * modem must be added again after the name vanishes from the bus.
++ */
++
++#pragma once
++
++#include <gio/gio.h>
++
++G_BEGIN_DECLS
++
++typedef enum {
++  CALLS_ORIGIN_KIND_OTHER = 0,
++  CALLS_ORIGIN_KIND_MM,
++  CALLS_ORIGIN_KIND_OFONO,
++  CALLS_ORIGIN_KIND_SIP,
++} CallsOriginKind;
++
++typedef struct {
++  CallsOriginKind kind;
++  const char *name;
++  const char *id;
++  gboolean usable; /* FALSE for an offline SIP account, or an offline modem */
++} CallsOriginCandidate;
++
++gboolean calls_origin_name_is_imsd (const char *name,
++                                    const char *id);
++
++/* Index of the origin to dial when default origins are on.
++ * When prefer_imsd is TRUE, a usable oFono origin named imsd (or id
++ * imsd or /imsd) wins. Otherwise, and when no such origin is usable,
++ * the first usable origin. -1 when none are usable.
++ * prefer_imsd is FALSE for USSD, which stays on the first usable origin.
++ */
++int calls_pick_tel_default_origin (const CallsOriginCandidate *candidates,
++                                   guint                       n,
++                                   gboolean                    prefer_imsd);
++
++/* First origin whose list contains target, or -1. Used so a keypad
++ * emergency number stays on the origin that advertises it (ModemManager
++ * when that origin is first), instead of moving to imsd.
++ */
++int calls_pick_first_listed (const char              *target,
++                             const char * const * const *lists,
++                             guint                        n);
++
++/* 112, 911, 999 and 000. A keypad dial of one of these stays on the
++ * first usable origin when no origin has advertised it yet.
++ */
++gboolean calls_number_is_common_emergency (const char *number);
++
++/* explicit_index is returned unchanged when use_default is FALSE,
++ * including when it points at a non-imsd origin.
++ */
++int calls_dial_origin_index (gboolean                    use_default,
++                             int                         explicit_index,
++                             const CallsOriginCandidate *candidates,
++                             guint                       n);
++
++/* TRUE when GetModems should create the origin. A modem that is still
++ * in the hash but whose origin was removed (oFono vanished, list cleared)
++ * must be added again.
++ */
++gboolean calls_ofono_modem_should_add (gboolean already_known,
++                                       gboolean origin_present);
++
++/* Drop modem proxies and origins together. Clearing only the list leaves
++ * the hash behind, and the next GetModems then skips the modem.
++ */
++void calls_ofono_clear_on_vanish (GHashTable *modems,
++                                  GListStore *origins);
++
++G_END_DECLS
+diff --git a/src/calls-new-call-box.c b/src/calls-new-call-box.c
+index d6d3c64..28dd601 100644
+--- a/src/calls-new-call-box.c
++++ b/src/calls-new-call-box.c
+@@ -25,6 +25,7 @@
+ #define G_LOG_DOMAIN "CallsNewCallBox"
+ 
+ #include "calls-account.h"
++#include "calls-default-origin.h"
+ #include "calls-main-window.h"
+ #include "calls-manager.h"
+ #include "calls-new-call-box.h"
+@@ -80,46 +81,104 @@ get_selected_origin (CallsNewCallBox *self)
+ }
+ 
+ 
++static CallsOriginKind
++origin_kind (CallsOrigin *origin)
++{
++  const char *type = G_OBJECT_TYPE_NAME (origin);
++
++  if (g_strcmp0 (type, "CallsOfonoOrigin") == 0)
++    return CALLS_ORIGIN_KIND_OFONO;
++  if (g_strcmp0 (type, "CallsMMOrigin") == 0)
++    return CALLS_ORIGIN_KIND_MM;
++  if (CALLS_IS_ACCOUNT (origin))
++    return CALLS_ORIGIN_KIND_SIP;
++
++  return CALLS_ORIGIN_KIND_OTHER;
++}
++
++
+ static CallsOrigin *
+ get_origin (CallsNewCallBox *self,
+             const char      *target)
+ {
+   CallsManager *manager = calls_manager_get_default ();
+   CallsSettings *settings = calls_manager_get_settings (manager);
+-
+-  GListModel *model;
+   gboolean auto_use_def_origin =
+     calls_settings_get_use_default_origins (settings);
++  GListModel *model;
++  guint n_items;
++  g_autofree CallsOriginCandidate *cands = NULL;
++  g_autoptr (GPtrArray) held = NULL;
++  int index;
++
++  /* An explicit origin (default origins off) is the combo-row selection.
++   * The D-Bus emergency API does not come through here. A keypad number
++   * that an origin lists as emergency is handled below. */
++  if (!auto_use_def_origin)
++    return get_selected_origin (self);
+ 
+-  if (auto_use_def_origin) {
+-    guint n_items;
++  model = calls_manager_get_suitable_origins (manager, target);
++  if (!model)
++    return NULL;
+ 
+-    model = calls_manager_get_suitable_origins (calls_manager_get_default (),
+-                                                target);
+-    n_items = g_list_model_get_n_items (model);
++  n_items = g_list_model_get_n_items (model);
++  if (n_items == 0)
++    return NULL;
+ 
+-    if (n_items == 0)
+-      return NULL;
++  cands = g_new0 (CallsOriginCandidate, n_items);
++  held = g_ptr_array_new_with_free_func (g_free);
++
++  {
++    g_autoptr (GPtrArray) emergency_owned =
++      g_ptr_array_new_with_free_func ((GDestroyNotify) g_strfreev);
++    g_autofree GStrv *emergency_lists = g_new0 (GStrv, n_items);
++    int listed;
+ 
+     for (guint i = 0; i < n_items; i++) {
+       g_autoptr (CallsOrigin) origin = g_list_model_get_item (model, i);
+-      g_autofree char *origin_name = NULL;
+-
++      char *name = calls_origin_get_name (origin);
++      char *id = calls_origin_get_id (origin);
++      g_auto (GStrv) emergency = calls_origin_get_emergency_numbers (origin);
++
++      g_ptr_array_add (held, name);
++      g_ptr_array_add (held, id);
++      g_ptr_array_add (emergency_owned, g_steal_pointer (&emergency));
++      emergency_lists[i] = g_ptr_array_index (emergency_owned, i);
++
++      cands[i].kind = origin_kind (origin);
++      cands[i].name = name;
++      cands[i].id = id;
++      cands[i].usable = TRUE;
+       if (CALLS_IS_ACCOUNT (origin) &&
+           calls_account_get_state (CALLS_ACCOUNT (origin)) != CALLS_ACCOUNT_STATE_ONLINE)
+-        continue;
+-
+-      origin_name = calls_origin_get_name (origin);
+-      g_debug ("Using origin '%s' for call to '%s'",
+-               origin_name, target);
+-
+-      return g_steal_pointer (&origin);
++        cands[i].usable = FALSE;
+     }
+-  } else {
+-    return get_selected_origin (self);
++
++    /* Same rule as the emergency D-Bus API: the first origin that lists
++     * this number. Do not move 112 onto imsd. A common emergency number
++     * that nobody has advertised yet also stays on the first usable origin.
++     */
++    listed = calls_pick_first_listed (target,
++                                      (const char * const * const *) emergency_lists,
++                                      n_items);
++    if (listed >= 0)
++      index = listed;
++    else if (calls_number_is_ussd (target) ||
++             calls_number_is_common_emergency (target))
++      index = calls_pick_tel_default_origin (cands, n_items, FALSE);
++    else
++      index = calls_dial_origin_index (TRUE, -1, cands, n_items);
+   }
++  if (index < 0)
++    return NULL;
+ 
+-  return NULL;
++  {
++    g_autoptr (CallsOrigin) origin = g_list_model_get_item (model, (guint) index);
++    g_autofree char *origin_name = calls_origin_get_name (origin);
++
++    g_debug ("Using origin '%s' for call to '%s'", origin_name, target);
++    return g_steal_pointer (&origin);
++  }
+ }
+ 
+ 
+diff --git a/src/meson.build b/src/meson.build
+index 586ec78..6b9a566 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -100,6 +100,7 @@ calls_sources = files(
+   'calls-contacts-provider.c',
+   'calls-contacts-row.c',
+   'calls-dbus-manager.c',
++  'calls-default-origin.c',
+   'calls-emergency-call-types.c',
+   'calls-emergency-calls-manager.c',
+   'calls-history-box.c',
+diff --git a/tests/meson.build b/tests/meson.build
+index dc77a7a..c58c8ab 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -48,6 +48,7 @@ subdir('services')
+ 
+ tests = [
+   ['contacts', ['test-contacts.c']],
++  ['default-origin', ['test-default-origin.c']],
+   [
+     'dbus',
+     ['test-dbus.c', generated_dbus_sources],
+diff --git a/tests/test-default-origin.c b/tests/test-default-origin.c
+new file mode 100644
+index 0000000..cfdb4fa
+--- /dev/null
++++ b/tests/test-default-origin.c
+@@ -0,0 +1,237 @@
++/*
++ * Copyright (C) 2026 The Calls authors
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * Host test. Compiles with calls-default-origin.c and glib only.
++ */
++
++#include "calls-default-origin.h"
++
++static CallsOriginCandidate
++cand (CallsOriginKind kind,
++      const char     *name,
++      const char     *id,
++      gboolean        usable)
++{
++  CallsOriginCandidate c = { kind, name, id, usable };
++  return c;
++}
++
++static void
++test_imsd_online_beats_mm (void)
++{
++  CallsOriginCandidate c[] = {
++    cand (CALLS_ORIGIN_KIND_MM, "0", "0", TRUE),
++    cand (CALLS_ORIGIN_KIND_SIP, "sip", "sip", TRUE),
++    cand (CALLS_ORIGIN_KIND_OFONO, "imsd", "ofono", TRUE),
++  };
++
++  g_assert_cmpint (calls_pick_tel_default_origin (c, G_N_ELEMENTS (c), TRUE), ==, 2);
++  g_assert_cmpint (calls_dial_origin_index (TRUE, 0, c, G_N_ELEMENTS (c)), ==, 2);
++}
++
++static void
++test_imsd_path_id (void)
++{
++  CallsOriginCandidate c[] = {
++    cand (CALLS_ORIGIN_KIND_MM, "0", "0", TRUE),
++    cand (CALLS_ORIGIN_KIND_OFONO, "modem", "/imsd", TRUE),
++  };
++
++  g_assert_cmpint (calls_pick_tel_default_origin (c, G_N_ELEMENTS (c), TRUE), ==, 1);
++}
++
++static void
++test_imsd_absent_uses_mm (void)
++{
++  CallsOriginCandidate c[] = {
++    cand (CALLS_ORIGIN_KIND_MM, "0", "0", TRUE),
++    cand (CALLS_ORIGIN_KIND_SIP, "sip", "sip", TRUE),
++  };
++
++  g_assert_cmpint (calls_pick_tel_default_origin (c, G_N_ELEMENTS (c), TRUE), ==, 0);
++}
++
++static void
++test_imsd_offline_uses_mm (void)
++{
++  CallsOriginCandidate c[] = {
++    cand (CALLS_ORIGIN_KIND_MM, "0", "0", TRUE),
++    cand (CALLS_ORIGIN_KIND_OFONO, "imsd", "/imsd", FALSE),
++  };
++
++  g_assert_cmpint (calls_pick_tel_default_origin (c, G_N_ELEMENTS (c), TRUE), ==, 0);
++}
++
++static void
++test_imsd_not_in_list_uses_mm (void)
++{
++  CallsOriginCandidate c[] = {
++    cand (CALLS_ORIGIN_KIND_MM, "0", "0", TRUE),
++  };
++
++  g_assert_cmpint (calls_pick_tel_default_origin (c, G_N_ELEMENTS (c), TRUE), ==, 0);
++  g_assert_cmpint (calls_pick_tel_default_origin (NULL, 0, TRUE), ==, -1);
++}
++
++static void
++test_explicit_origin_unchanged (void)
++{
++  CallsOriginCandidate c[] = {
++    cand (CALLS_ORIGIN_KIND_OFONO, "imsd", "/imsd", TRUE),
++    cand (CALLS_ORIGIN_KIND_MM, "0", "0", TRUE),
++  };
++
++  g_assert_cmpint (calls_dial_origin_index (FALSE, 1, c, G_N_ELEMENTS (c)), ==, 1);
++  g_assert_cmpint (calls_dial_origin_index (FALSE, 0, c, G_N_ELEMENTS (c)), ==, 0);
++  g_assert_cmpint (calls_dial_origin_index (FALSE, 1, NULL, 0), ==, 1);
++}
++
++static void
++test_offline_sip_skipped (void)
++{
++  CallsOriginCandidate c[] = {
++    cand (CALLS_ORIGIN_KIND_SIP, "sip", "sip", FALSE),
++    cand (CALLS_ORIGIN_KIND_MM, "0", "0", TRUE),
++  };
++
++  g_assert_cmpint (calls_pick_tel_default_origin (c, G_N_ELEMENTS (c), TRUE), ==, 1);
++}
++
++static void
++test_sip_only_unchanged (void)
++{
++  CallsOriginCandidate c[] = {
++    cand (CALLS_ORIGIN_KIND_SIP, "home", "home", TRUE),
++    cand (CALLS_ORIGIN_KIND_SIP, "work", "work", FALSE),
++  };
++
++  g_assert_cmpint (calls_pick_tel_default_origin (c, G_N_ELEMENTS (c), TRUE), ==, 0);
++}
++
++static void
++test_name_is_not_enough_for_mm (void)
++{
++  /* A non-oFono origin that happens to be labelled imsd is not preferred. */
++  CallsOriginCandidate c[] = {
++    cand (CALLS_ORIGIN_KIND_MM, "imsd", "imsd", TRUE),
++    cand (CALLS_ORIGIN_KIND_MM, "0", "0", TRUE),
++  };
++
++  g_assert_cmpint (calls_pick_tel_default_origin (c, G_N_ELEMENTS (c), TRUE), ==, 0);
++}
++
++static void
++test_ussd_does_not_prefer_imsd (void)
++{
++  CallsOriginCandidate c[] = {
++    cand (CALLS_ORIGIN_KIND_MM, "0", "0", TRUE),
++    cand (CALLS_ORIGIN_KIND_OFONO, "imsd", "/imsd", TRUE),
++  };
++
++  g_assert_cmpint (calls_pick_tel_default_origin (c, G_N_ELEMENTS (c), FALSE), ==, 0);
++}
++
++static void
++test_common_emergency_does_not_prefer_imsd (void)
++{
++  g_assert_true (calls_number_is_common_emergency ("112"));
++  g_assert_true (calls_number_is_common_emergency ("911"));
++  g_assert_true (calls_number_is_common_emergency ("999"));
++  g_assert_true (calls_number_is_common_emergency ("000"));
++  g_assert_false (calls_number_is_common_emergency ("1120"));
++  g_assert_false (calls_number_is_common_emergency ("*#100#"));
++  g_assert_false (calls_number_is_common_emergency (NULL));
++
++  /* Nobody advertised 112: stay on the first usable origin (MM). */
++  {
++    CallsOriginCandidate c[] = {
++      cand (CALLS_ORIGIN_KIND_MM, "0", "0", TRUE),
++      cand (CALLS_ORIGIN_KIND_OFONO, "imsd", "/imsd", TRUE),
++    };
++
++    g_assert_cmpint (calls_pick_tel_default_origin (c, G_N_ELEMENTS (c),
++                                                    !calls_number_is_common_emergency ("112")),
++                     ==, 0);
++  }
++}
++
++static void
++test_emergency_stays_on_first_listing (void)
++{
++  const char *mm[] = { "112", "911", NULL };
++  const char *imsd[] = { "112", NULL };
++  const char * const *lists[] = { mm, imsd };
++
++  g_assert_cmpint (calls_pick_first_listed ("112", lists, G_N_ELEMENTS (lists)), ==, 0);
++  g_assert_cmpint (calls_pick_first_listed ("113", lists, G_N_ELEMENTS (lists)), ==, -1);
++  g_assert_cmpint (calls_pick_first_listed ("112", NULL, 0), ==, -1);
++
++  /* Only imsd lists it: that origin is used. */
++  {
++    const char *none[] = { "911", NULL };
++    const char * const *only_imsd[] = { none, imsd };
++    g_assert_cmpint (calls_pick_first_listed ("112", only_imsd, 2), ==, 1);
++  }
++}
++
++static void
++test_late_ofono_readd_appears_in_list (void)
++{
++  g_autoptr (GHashTable) modems = NULL;
++  g_autoptr (GListStore) origins = NULL;
++  g_autoptr (GObject) marker = NULL;
++
++  modems = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_object_unref);
++  origins = g_list_store_new (G_TYPE_OBJECT);
++  marker = g_object_new (G_TYPE_OBJECT, NULL);
++
++  g_assert_true (calls_ofono_modem_should_add (FALSE, FALSE));
++  g_hash_table_insert (modems, g_strdup ("/imsd"), g_object_ref (marker));
++  g_list_store_append (origins, marker);
++  g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (origins)), ==, 1);
++  g_assert_false (calls_ofono_modem_should_add (TRUE, TRUE));
++
++  /* Vanish must drop the proxy and the origin together. */
++  calls_ofono_clear_on_vanish (modems, origins);
++  g_assert_cmpuint (g_hash_table_size (modems), ==, 0);
++  g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (origins)), ==, 0);
++  g_assert_true (calls_ofono_modem_should_add (FALSE, FALSE));
++
++  g_hash_table_insert (modems, g_strdup ("/imsd"), g_object_ref (marker));
++  g_list_store_append (origins, marker);
++  g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (origins)), ==, 1);
++  {
++    g_autoptr (GObject) got = g_list_model_get_item (G_LIST_MODEL (origins), 0);
++    g_assert_true (got == marker);
++  }
++
++  /* Hash left behind, origin already gone: still add. */
++  g_list_store_remove_all (origins);
++  g_assert_true (calls_ofono_modem_should_add (TRUE, FALSE));
++  g_list_store_append (origins, marker);
++  g_assert_cmpuint (g_list_model_get_n_items (G_LIST_MODEL (origins)), ==, 1);
++}
++
++int
++main (int argc, char **argv)
++{
++  g_test_init (&argc, &argv, NULL);
++
++  g_test_add_func ("/default-origin/imsd-online-beats-mm", test_imsd_online_beats_mm);
++  g_test_add_func ("/default-origin/imsd-path-id", test_imsd_path_id);
++  g_test_add_func ("/default-origin/imsd-absent-uses-mm", test_imsd_absent_uses_mm);
++  g_test_add_func ("/default-origin/imsd-offline-uses-mm", test_imsd_offline_uses_mm);
++  g_test_add_func ("/default-origin/imsd-not-in-list-uses-mm", test_imsd_not_in_list_uses_mm);
++  g_test_add_func ("/default-origin/explicit-unchanged", test_explicit_origin_unchanged);
++  g_test_add_func ("/default-origin/offline-sip-skipped", test_offline_sip_skipped);
++  g_test_add_func ("/default-origin/sip-only-unchanged", test_sip_only_unchanged);
++  g_test_add_func ("/default-origin/mm-named-imsd-not-preferred", test_name_is_not_enough_for_mm);
++  g_test_add_func ("/default-origin/ussd-does-not-prefer-imsd", test_ussd_does_not_prefer_imsd);
++  g_test_add_func ("/default-origin/common-emergency-stays-on-mm", test_common_emergency_does_not_prefer_imsd);
++  g_test_add_func ("/default-origin/emergency-stays-on-first-listing", test_emergency_stays_on_first_listing);
++  g_test_add_func ("/default-origin/late-ofono-readd", test_late_ofono_readd_appears_in_list);
++
++  return g_test_run ();
++}
