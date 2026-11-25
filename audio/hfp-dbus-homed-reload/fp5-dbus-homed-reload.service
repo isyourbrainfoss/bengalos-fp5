@@ -1,0 +1,30 @@
+# FP5: reload system D-Bus policy after systemd-homed has published uid 60434.
+#
+# /etc/dbus-1/system.d/io.github.isyourbrainfoss.Fp5HfpModem.conf uses
+# user="60434" (the lab fp5 systemd-homed UID) so dbus-daemon does not need
+# the name "fp5" at boot. That is not enough: dbus 1.16.4 still looks the
+# uid up via NSS when it loads system.d, before systemd-homed is ready, and
+# logs: Unknown username "60434". The allow-own policy is then ignored, and
+# fp5-hfp-modem-bridge cannot own io.github.isyourbrainfoss.Fp5HfpModem
+# (seen after the 2026-11-25 14:39 reboot; incoming Tesla call 16:30 had no
+# car UI, no A2DP pause, earpiece audio).
+#
+# This oneshot is pulled in by user@60434.service and ordered Before it, so
+# ReloadConfig runs once the user is resolvable and before the session's
+# fp5-hfp-modem-bridge starts. It does not restart dbus.
+# Rollback: disable and remove this unit and helper (backup rollback.sh).
+
+[Unit]
+Description=FP5: reload D-Bus policy once uid 60434 is resolvable (HFP modem bridge)
+Documentation=https://github.com/isyourbrainfoss/bengalos-fp5
+After=systemd-homed.service dbus.service
+Before=user@60434.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=150
+ExecStart=/var/lib/fp5-oot/bin/fp5-dbus-homed-reload
+
+[Install]
+WantedBy=user@60434.service

@@ -1,0 +1,15 @@
+#!/bin/sh
+# Wait until NSS can resolve the lab fp5 systemd-homed user (uid 60434),
+# then reload system D-Bus policy. Does not restart dbus.
+# Used by fp5-dbus-homed-reload.service; also callable from install.sh.
+set -eu
+i=0
+while [ "$i" -lt 120 ]; do
+    if getent passwd 60434 >/dev/null 2>&1; then
+        exec /bin/busctl call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+echo "fp5-dbus-homed-reload: timed out waiting for uid 60434" >&2
+exit 1
