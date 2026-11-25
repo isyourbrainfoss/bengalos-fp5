@@ -324,3 +324,9 @@ Anropsnumre lagres bare som sha256 med lokal salt under `~/.local/state/fp5-repe
 **Backup:** `~/.local/state/fp5-repeat-caller/backup-20261124T225915/` (ingen eksisterende filer ble overskrevet).
 **Tilbake:** `systemctl --user disable --now fp5-repeat-caller.service` og fjern binær og enhetsfil, eller `sh ~/.local/state/fp5-repeat-caller/rollback.sh`. Rører ikke gjeldende profil; sletter også salt og hashed historikk.
 **Gren:** `feat/repeat-caller` 2210cf8 i isyourbrainfoss/bengalos-fp5, pushet, ikke merget.
+
+## 2026-11-25 08:38 – Ekstra midlertidig logging av bilens pause/demp (Kristians ja, t999u)
+- Hva: tre nye systemd-run --user-enheter på lab-FP5, kun lesing/logging, forsvinner ved omstart: fp5-avrcp-log-keys (dbus-monitor av gsd MediaKeys og MPRIS-egenskaper), fp5-avrcp-log-pw (pw-mon filtrert: nodetilstand, mute/volum, media.role), fp5-avrcp-log-journal (journal for mpris-proxy, fp5-car-mpris-guard, gsd-media-keys, phosh, wireplumber). Logger i ~/.local/state/fp5-avrcp-log/.
+- Hvorfor: bilen sendte AVRCP Pause og satte A2DP-volum til 0 kl. 08:24:27 og 08:36:33 uten at Kristian trykket noe; vi må se om det er tastetrykk, kildebytte eller fokus.
+- Ikke med: btmon (rå AVRCP-PDU-er) krever root og venter på «nå».
+- Tilbakestilling: systemctl --user stop fp5-avrcp-log-keys fp5-avrcp-log-pw fp5-avrcp-log-journal (eller omstart).
