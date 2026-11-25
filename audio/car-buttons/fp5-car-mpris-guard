@@ -23,7 +23,12 @@
 #    transport reappeared, mpris-proxy logged a device disconnect, or an
 #    MPRIS player (org.mpris.MediaPlayer2.*, not mpris-proxy's own) came or
 #    went. Never during a call (deferred to its end), >= 20 s apart, at most
-#    4 per 10 min. (MediaControl1.Player is NOT used: the Tesla never has
+#    4 per 10 min.
+#    v2.2 (25.11): a "device disconnected" line from mpris-proxy only counts
+#    when that BlueZ device is an audio device (A2DP sink / AVRCP UUIDs), i.e.
+#    the car's classic link. An LE link timing out (e.g. the phone-key link)
+#    restarted mpris-proxy needlessly (08:31, 08:49): the car got
+#    AvailablePlayersChanged twice and a jumping play position. (MediaControl1.Player is NOT used: the Tesla never has
 #    one, even when everything works.)
 # Off: touch ~/.config/fp5-car-guard.off (both parts, takes effect at once),
 #      FP5_CAR_AUDIO_GUARD=off / FP5_CAR_PLAYER_GUARD=off in the unit, or
@@ -73,6 +78,23 @@ def car_a2dp_sinks(sinks):
             continue
         out.append(s)
     return out
+
+
+AUDIO_UUID_PREFIXES = ("0000110b", "0000110c", "0000110e")  # A2DP sink, AVRCP target/controller
+
+
+def disconnected_device(line):
+    """mpris-proxy log line -> BlueZ device path, or None if not a disconnect line."""
+    line = line.strip()
+    if not (line.startswith("Bluetooth Device ") and line.endswith(" disconnected")):
+        return None
+    path = line[len("Bluetooth Device "):-len(" disconnected")].strip()
+    return path if path.startswith("/org/bluez/") else None
+
+
+def is_audio_device(uuids):
+    """True if a BlueZ Device1 UUID list says A2DP sink or AVRCP (the car's classic link)."""
+    return any(str(u).lower().startswith(AUDIO_UUID_PREFIXES) for u in (uuids or ()))
 
 
 def key(name):
@@ -340,7 +362,7 @@ def main():
               state_path=os.path.join(home, ".local", "state", "fp5-car-guard", "volumes.json"),
               default_vol=int(os.environ.get("FP5_CAR_DEFAULT_VOL", "35")), off=off, schedule=schedule,
               car_connected=lambda: any(c.get("name", "").startswith("bluez_card.") for c in pactl_json("cards")))
-    log("fp5-car-mpris-guard v2.1 running (audio %s, buttons %s)"
+    log("fp5-car-mpris-guard v2.2 running (audio %s, buttons %s)"
         % ("on" if not off()[0] else "off", "on" if not off()[1] else "off"))
 
     # BlueZ: AVRCP connected, A2DP transport (re)appears
@@ -419,9 +441,25 @@ def main():
             g.event()
     follow(["pactl", "subscribe"], pa_line, "pactl subscribe")
 
+    def device_uuids(path):
+        try:
+            return dcall(sysbus, "org.bluez", path, "org.freedesktop.DBus.Properties", "Get",
+                         GLib.Variant("(ss)", ("org.bluez.Device1", "UUIDs")), "(v)")[0]
+        except GLib.Error:
+            return None
+
     def mp_line(line):
-        if line.startswith("Bluetooth Device ") and line.rstrip().endswith(" disconnected"):
+        path = disconnected_device(line)
+        if path is None:
+            return
+        uuids = device_uuids(path)
+        if uuids is None:
+            # device object gone: cannot tell; the car's reconnect (AVRCP / A2DP transport) triggers anyway
+            log("mpris-proxy saw a disconnect of an unknown device: ignored")
+        elif is_audio_device(uuids):
             g.want_proxy("mpris-proxy saw a device disconnect")
+        else:
+            log("mpris-proxy saw a non-audio device disconnect (e.g. LE phone key): ignored")
     follow(["journalctl", "--user", "-u", "mpris-proxy.service", "-f", "-n", "0", "-o", "cat"], mp_line,
            "mpris-proxy log follower")
 

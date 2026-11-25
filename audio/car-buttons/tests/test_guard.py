@@ -242,5 +242,23 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(G.vol_pct({"volume": {"mono": {"value_percent": "12%"}}}), 12)
 
 
+class DisconnectFilter(unittest.TestCase):
+    def test_parse_disconnect_line(self):
+        self.assertEqual(G.disconnected_device("Bluetooth Device /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF disconnected\n"),
+                         "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF")
+        self.assertIsNone(G.disconnected_device("Bluetooth Transport /org/bluez/hci0/dev_AA/sep1/fd0 removed"))
+        self.assertIsNone(G.disconnected_device("player org.mpris.MediaPlayer2.x at :1.5 found"))
+
+    def test_car_counts_le_key_does_not(self):
+        car = ["0000110b-0000-1000-8000-00805f9b34fb", "0000110e-0000-1000-8000-00805f9b34fb",
+               "0000111e-0000-1000-8000-00805f9b34fb"]
+        le_key = ["00001800-0000-1000-8000-00805f9b34fb", "0000180a-0000-1000-8000-00805f9b34fb",
+                  "0000180f-0000-1000-8000-00805f9b34fb"]
+        self.assertTrue(G.is_audio_device(car))
+        self.assertFalse(G.is_audio_device(le_key))
+        self.assertFalse(G.is_audio_device([]))
+        self.assertFalse(G.is_audio_device(None))
+
+
 if __name__ == "__main__":
     unittest.main()
