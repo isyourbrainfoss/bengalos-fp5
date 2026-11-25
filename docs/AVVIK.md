@@ -340,3 +340,12 @@ Anropsnumre lagres bare som sha256 med lokal salt under `~/.local/state/fp5-repe
 ## 2026-11-25 09:13 – All midlertidig bil-logging stoppet (Kristian, t1006u)
 - Stoppet: fp5-btmon-log (run0), fp5-avrcp-log-keys/-pw/-journal/-session/-system. Loggfilene ligger igjen (/var/log/fp5-btmon-20261125T084838.snoop, ~/.local/state/fp5-avrcp-log/).
 - Funn: kl. 08:55:25 sendte bilen AVRCP volum 0 + PASS THROUGH PAUSE; telefonen sendte ingen pause. Ingen konfig endret.
+
+## 2026-11-25 09:43 – fp5-car-mpris-guard v2.2: bare bilens lydlenke utløser mpris-proxy-omstart (Kristians ja, t1008u «rett opp»)
+- Hva: `~/.local/bin/fp5-car-mpris-guard` på lab-FP5 oppdatert v2.1 → v2.2. En «Bluetooth Device … disconnected»-linje fra mpris-proxy teller nå bare når BlueZ-enheten har A2DP-sink- eller AVRCP-UUID (bilens klassiske lenke). LE-enheter (f.eks. telefonnøkkel-lenken) og ukjente/fjernede enheter ignoreres og logges uten adresse. Bare guard-enheten ble restartet (`systemctl --user restart fp5-car-mpris-guard`); mpris-proxy, bluetooth, PipeWire og WirePlumber er ikke rørt.
+- Hvorfor: btmon/journal 25.11 viste at en LE-lenke med tidsavbrudd (08:31:09, 08:49:03) fikk guarden til å restarte mpris-proxy. Bilen fikk da AvailablePlayersChanged to ganger og en avspillingsposisjon som hoppet (734 s → 3267 s). Dette er ikke årsaken til pausene, men det er unødvendig støy mot bilen.
+- Test: py_compile OK; 22 enhetstester grønne (2 nye: tolking av disconnect-linja, bil vs LE-nøkkel); tørrsjekk mot ekte BlueZ-enheter på telefonen: 2 lydenheter teller, 3 LE/andre ignoreres. Tjenesten er aktiv og logger «v2.2 running».
+- Backup: `~/.local/state/fp5-car-mpris-guard/backup-20261125T094331/` (skript + enhetsfil).
+- Tilbake: `sh ~/.local/state/fp5-car-mpris-guard/backup-20261125T094331/rollback.sh`
+- Gren: `fix/car-guard-disconnect` 597f0ee i isyourbrainfoss/bengalos-fp5, pushet, ikke merget.
+- Merk (pausene): 08:45/08:55-episoden var strømmet (ingen lokal fil). Podcasts sendte stillhet fra 08:45:14.8 og 08:55:21.7, før bilen sendte volum 0 + pause. ModemManager logget ingen nettbrudd da, først fra 08:58:10. Kristian mener episodene var lastet ned tidligere ganger, så strømming er neppe eneste årsak.
