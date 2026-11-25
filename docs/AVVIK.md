@@ -415,3 +415,27 @@ Lest tilbake: printk `8 4 1 8`, console_suspend N, pm_debug_messages 1, pm_print
 **Hvorfor:** Telefonen døde i dvale uten lader 25.11 ca. 19:34 og ca. 20:08. Det siste skjedde med console_suspend=N alene (printk 4), så console_suspend=Y er ikke eneste årsak. Tung logging er den eneste oppsettet der det aldri har vært dødsfall uten lader. Det tyder på et timing-kappløp som den trege loggingen skjuler. Brukes nå som omvei, og et nytt dødsfall vil vise siste «PM: calling …» i ramoops.
 **Backup:** `/var/lib/fp5-backup/20261125T201937-suspend-logging-heavy/` (før-verdier og rollback.sh).
 **Tilbake:** `run0 sh /var/lib/fp5-backup/20261125T201937-suspend-logging-heavy/rollback.sh` (setter `4 4 1 8`, pm_debug 0, console_suspend Y, pm_print_times 1), eller ta en omstart.
+
+## 2026-11-25 23:46 — BengalOS 0.26.1124.3 i inaktivt spor (Kristians «nå» t1049u og t1054u)
+
+**Hva:** Lab-FP5 (kjørte 0.26.1120.1) fikk 0.26.1124.3 skrevet inn i det inaktive sporet som tidligere var 0.26.1118.1 (kun nestet userdata-GPT: loop0p7 usr, loop0p6 verity, loop0p5 sig). UKI lagt på ESP som `BengalOS_0.26.1124.3_arm64+3.efi` (boot counting, 3 forsøk). 1120.1-UKI ble stående som tilbakefall. 1118.1-UKI flyttet til backup (usr der er overskrevet). Ti `*_0.26.1124.3`-sysexts kopiert til `/var/lib/extensions` (ingen `fp5-volte-modules` for ny kjerne). 1120.1-sysextene ble ikke slettet. Offisielle sysupdate-overføringer 10/11/12 + waydroid + dev maskert i `/etc`. `qcom-modem-setup` maskert i `/etc` så den ikke kjører ved første boot. Ingen `systemd-sysext refresh` mens 1120.1 kjørte, ingen fastboot/qbootctl, ingen ytre GPT/abl/xbl/firmware/super/persist/modem, pstore urørt, SIM-PIN ble ikke skrevet inn, boot ble ikke velsignet av oss.
+
+Etter lesende kontroll og hash-tilbakelesing startet telefonen 0.26.1124.3 kl. 23:48 Europe/Oslo (kjerne `7.2.8-sc7280-fp5+`, VARIANT_ID=sc7280, `/usr` på loop0p7, `cma=128M`).
+
+**run0:** To tidligere forsøk 23:43 (t1049u, polkit allerede godkjent) stoppet i preflight uten skriving: (1) `findmnt /usr` ga både `loop0p4` og en sysext-linje, (2) `sfdisk` ikke i root-PATH. Etter fiks, tørrkjøring som bruker (DRY_RUN_OK, ingenting skrevet) og nytt «nå» (t1054u): én install-run0 kl. 23:46, les-tilbake-hash OK, INSTALL_OK. En egen reboot-run0 ble ikke bekreftet (maskinen ble borte i forbindelse med omstarten).
+
+**Hvorfor:** Bygg nærmere oppstrøms `device-sc7280` med minimal FP5-delta, etter Kristians ja til å installere og starte på nytt.
+
+**Etter boot (lesing):** Alle ti 1124.3-sysexts er flettet. 1120.1-sporet er urørt (loop0p4/3/2). ModemManager aktiv, tilkoblet, registrert hjemme på LTE/5G; `unlock-required` er sim-pin2 (hoved-PIN allerede låst opp — ikke av oss). `qcom-modem-setup` fortsatt maskert, ikke kjørt. q6voice-moduler lastet. Fingeravtrykk: `fp5-qtee.socket` aktiv, økt kjører. Kamera: imx800, imx858 og s5kjn1 synlige. Bluetooth, HFP-bro, PipeWire/WirePlumber og callaudiod kjører. `q6voiced` og `81voltd` er fortsatt maskert i `/etc` fra 14.11 (planen endret dem ikke). `fp5-volte-runtime` hoppet over (ser etter gammel volte-modulmappe; forventet).
+
+**Merk / ødelagt eller ubekreftet:**
+- `fp5-ims` startet ikke: `guard.py` avviser kjernenavnet `7.2.8-sc7280-fp5+` (den forventer den gamle volte-unamen). Ingen ofonod/imsd-prosess. Ringing er derfor sannsynligvis ødelagt til vakten er oppdatert og IMS startes med nytt ja.
+- `systemd-bless-boot` kjørte av seg selv ved boot-complete («Marked boot as good», teller 1). Vi kjørte den ikke og velsignet ikke selv. `fp5-uki-case-fix` trengte ikke kjøre (ingen `bengalos_*.efi`).
+- systemd-sysext logget seks «Required key not available» for verity ved oppstart, men flettet likevel de ti sysextene (offisiell waydroid-DDI er signert).
+- Eneste failed unit: `systemd-timedated` (NAMESPACE / cgroup). Tung dvalelogging fra 20:19 var bare runtime og forsvant ved omstarten (eget ja kreves for å slå den på igjen).
+
+**Backup:** `/var/lib/fp5-backup/20261125T234604-install-1124.3/` (ESP-UKI-er, loader.conf, `/etc/sysupdate.d`, rollback.sh). 1118.1 usr/verity/sig ble ikke tatt kopi av.
+
+**Tilbake:** `run0 sh /var/lib/fp5-backup/20261125T234604-install-1124.3/rollback.sh` og så omstart. Det fjerner 1124.3-UKI fra ESP, gjenoppretter `/etc/sysupdate.d` og `qcom-modem-setup`-tilstanden, og fjerner 1124.3-sysext-filene; 1120.1-UKI + usr + sysexts blir stående. Ikke slett 1120.1-sporet. 1118.1-usr kan ikke gjenopprettes.
+
+**Test (Kristian):** anrop (sannsynligvis etter IMS-vakt), fingeravtrykk, kamera. Ikke velsign boot manuelt.
