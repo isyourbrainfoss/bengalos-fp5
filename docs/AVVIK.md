@@ -1,7 +1,7 @@
 # FP5 BengalOS – avviksdokument (ikke-standard oppsett)
 
 Telefon: lab-FP5, maskin «phosh» (bruker fp5), BengalOS fra intern UFS (A/B via systemd-sysupdate fra isyourbrainfoss/bengalos-fp5 fp5-feed).
-Sist oppdatert: 25. nov 2026 kl. 17:07 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
+Sist oppdatert: 25. nov 2026 kl. 17:12 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
 Prinsipp: alt som avviker fra offisiell BengalOS står her med plassering, hvorfor og hvordan det fjernes.
 
 ## 1. Bil / Tesla (Bluetooth)
@@ -57,6 +57,7 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 
 | Avvik | Hvor | Av / tilbake |
 |---|---|---|
+| Medlemskort på låseskjermen (ticket-box): Coop Mega (QR) og Rema 1000 (EAN-13), 25.11 17:12 | `~/phosh-ticket-box/Coop Mega.pdf`, `~/phosh-ticket-box/Rema 1000.pdf`. Pluginet var allerede på (`mobi.phosh.shell.plugins lock-screen` inkluderer `ticket-box`; mappe `phosh-ticket-box`). | `sh ~/.local/state/fp5-ticket-box/backup-20261125T171158/rollback.sh` |
 | Fingeravtrykk via QTEE (fp5-qtee), delt økt, vibrasjon ved treff | `/var/lib/fp5-qtee-share/`, drop-ins for fp5-qtee@ og fp5-fprintd | `/var/lib/fp5-backup/20261116-fprintd-share/rollback.sh --apply`, `/var/lib/fp5-backup/20261117-fp-haptic-direct/rollback.sh` |
 | screen-on-race v2 | fp5-qtee fix/screen-on-race 89079ff | `run0 sh /var/lib/fp5-backup/20261118-install/screen-on-race-v2/rollback.sh` |
 | Phosh startes låst på nytt etter krasj | `~/.config/systemd/user/mobi.phosh.Shell.service.d/70-fp5-respawn.conf`, `~/.local/bin/fp5-phosh-respawn` | `~/.local/state/fp5-phosh-respawn/rollback.sh` |
@@ -385,3 +386,12 @@ Anropsnumre lagres bare som sha256 med lokal salt under `~/.local/state/fp5-repe
 - Hvorfor: Etter omstarten 14:39 lastet dbus 1.16.4 ikke `user="60434"`-policyen (`Unknown username "60434"`). Broen fikk ikke bussnavnet, så innkommende IMS 16:30 viste ingen ringing i Teslaen, A2DP ble ikke satt på pause, og samtalelyden ble i røret.
 - Resultat: `ReloadConfig` fullført i samme run0. `fp5-hfp-modem-bridge` eide `io.github.isyourbrainfoss.Fp5HfpModem` og logget `ready on` 17:05:40 (siste `could not own` 17:05:34; modem `fp5imsd0` eksportert, State=8). WirePlumber hadde siste ModemManager-forsøk 14:40:12 (`NameHasNoOwner`) og ble derfor startet på nytt som brukertjeneste 17:06:25 (godkjent som del av fiksen). Etter omstarten: `patched libspa-bluez5 enabled`, ingen ny `NameHasNoOwner`; kjent varsel «ofono running, but not configured as HFP/HSP backend» uendret. wireplumber, pipewire, pipewire-pulse og broen er aktive. Oneshoten er enabled men inactive i denne økten (ReloadConfig ble kjørt av install.sh; enheten kjører ved neste `user@60434`). Teslas A2DP-kort forsvant etter WirePlumber-omstarten (standard-sluk ble telefonhøyttaleren); ingen Teslakommando eller ny tilkobling ble gjort. RING/+CIEV er ikke testet (krever ekte eller godkjent samtale). Reboot-overlevelse er ikke verifisert.
 - Tilbake: `run0 sh /var/lib/fp5-backup/20261125T170536-hfp-dbus-homed-reload/rollback.sh`.
+
+## 2026-11-25 17:12 – Medlemskort på låseskjermen (ticket-box): Coop Mega og Rema 1000
+
+- Hva: To PDF-er med bare koden lagt i `~/phosh-ticket-box/` (pluginets standardmappe under hjemmekatalogen, `g_get_home_dir` + `folder`): `Coop Mega.pdf` (QR, fra `~/Documents/1000020901.jpg`) og `Rema 1000.pdf` (EAN-13, fra `~/Documents/1000020890.jpg`). A6-format, liten tittel, uten siffer under strekkoden og uten resten av skjermbildet. Opprinnelige JPG-er er urørt. Ingen run0, ingen systemendring, ingen sysext, Phosh ble ikke startet på nytt. gsettings ble ikke endret: `mobi.phosh.shell.plugins lock-screen` sto allerede på `['ticket-box', 'upcoming-events']`, og `mobi.phosh.plugins.ticket-box folder` sto allerede på `'phosh-ticket-box'`. Phosh 0.59.0+nb20261120.12181931; pluginet `ticket-box` er installert (`/usr/lib/aarch64-linux-gnu/phosh/plugins/libphosh-plugin-ticket-box.so`).
+- Hvorfor: Kristian (t1035u/t1036u) vil vise medlemskortene på låseskjermen før opplåsing, bare selve koden, som PDF-er i Phosh sin billettboks.
+- Verifisering: Dekodet på boks (zxing-cpp og zbar). Nytegnet i samme symbologi med stille sone. Rundtur OK på både PNG og ferdig PDF (pdftoppm 300 dpi, zxing og zbar, samme innholdshash som originalen). Kodeverdiene er ikke skrevet i logger, chat eller git. PDF-sha256: Coop Mega `23609899064c5a40f2df1ea3ebbbfe4ea138673a4cac4621362f75b84f8778fb`, Rema 1000 `3ca6303e185b0ee33709d7eaab19ecc48f9c3a7649d777f095e00a1779337a3c`.
+- Vise: Lås telefonen og sveip til billettboksen (Ticket Box) på låseskjermen. Pluginet lister PDF-er når det vises (`g_file_enumerate_children_async`); det ble ikke funnet noen filmonitor, så en ny låsing kan være nødvendig hvis listen er tom. Phosh-omstart er ikke gjort og trengs sannsynligvis ikke.
+- Backup: `~/.local/state/fp5-ticket-box/backup-20261125T171158/` (gsettings-snapshot, SHA256SUMS og rollback.sh).
+- Tilbake: `sh ~/.local/state/fp5-ticket-box/rollback.sh` (fjerner bare de to PDF-ene, gjenoppretter gsettings, sletter mappen bare hvis den er tom, restarter ikke Phosh).
