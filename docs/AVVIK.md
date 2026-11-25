@@ -336,3 +336,7 @@ Anropsnumre lagres bare som sha256 med lokal salt under `~/.local/state/fp5-repe
 - Hvorfor: avgjøre om bilen eller telefonen stopper A2DP-strømmen / sender AVRCP pause (uforklarte pauser 08:24, 08:36:33, 08:45:19).
 - Merk: snoop-fila kan inneholde BT-adresser; deles aldri ufiltrert.
 - Tilbakestilling: run0 systemctl stop fp5-btmon-log (eller omstart); slett fila etter analyse.
+
+## 2026-11-25 09:13 – All midlertidig bil-logging stoppet (Kristian, t1006u)
+- Stoppet: fp5-btmon-log (run0), fp5-avrcp-log-keys/-pw/-journal/-session/-system. Loggfilene ligger igjen (/var/log/fp5-btmon-20261125T084838.snoop, ~/.local/state/fp5-avrcp-log/).
+- Funn: kl. 08:55:25 sendte bilen AVRCP volum 0 + PASS THROUGH PAUSE; telefonen sendte ingen pause. Ingen konfig endret.
