@@ -454,3 +454,17 @@ Etter lesende kontroll og hash-tilbakelesing startet telefonen 0.26.1124.3 kl. 2
 **Backup:** `/var/lib/fp5-backup/20261126T073847-ims-guard-1124.3/` (opprinnelig `ownership.py` 95023836a14541da…, uendret `guard.py` 852c8e956b7164e69…, `rollback.sh`). `fp5-ims` var inactive og enabled før start.
 
 **Tilbake:** `run0 sh /var/lib/fp5-backup/20261126T073847-ims-guard-1124.3/rollback.sh` — legger tilbake den gamle `ownership.py` (kun volte-unamen), `daemon-reload`, og stopper `fp5-ims` fordi nåværende kjerne da ikke er tillatt. Krever eget ja og én run0.
+
+## 2026-11-26 13:37 — imsd 1.2.4 + mic + media-v2 installert (Kristians «nå» t1078u)
+
+**Hva:** På lab-FP5 ble `/opt/fp5-imsd/bin/{imsd,imsd-ofonod,imsd-pcscf,imsd-dialerd,imsd-media}` byttet til den Debian/glibc-bunten fra desk `/home/kb/fp5-imsd-1.2.4-20261126/artifacts/` (gren `fp5-mic-on-1.2.4` commit `54f1238`, oppå 1.2.4 `d48c101` og mikrofonfiks `b479706`). `lib/` ble ikke rørt (mtime 8.11). `fp5-ims-grant-wake`, `LD_PRELOAD=libfp5-boottime-steady.so` og `transaction.py` (`MIC_BACKEND` standard `pw`) ble stående. `SMS_OVER_IMS` er ikke satt. Bare `fp5-ims.service` ble startet på nytt (imsd og imsd-ofonod, ny IMS-registrering). Ingen sysext-refresh, ingen andre tjenester, ingen anropstest.
+
+**run0:** Én run0 kl. 13:37:53 Europe/Oslo med `/home/fp5/fp5-xfer-imsd-124/install.sh` → `root-install.sh`. `APPLY_OK` ble skrevet 13:37:57 (ingen sleep etter restart).
+
+**Etter (lesing):** Live-hasher: imsd `e858ed86…`, imsd-ofonod `d4448237…`, imsd-pcscf `30cf604e…`, imsd-dialerd `1a31b0f5…`, imsd-media `a1eb00dc…` (uendret, samme som media-v2 fra 16.11). `fp5-ims` aktiv siden 13:37:56 Europe/Oslo. Første poll `ok=1 why=ready imsd_registered=yes` kom samtidig med at en ny transaksjon startet (kan være gammel status). 13:38:16 så `fp5-ims-grant-wake` et nytt grant (utløp ca. 7190 s / typisk ~2 t) og armte vekking. oFono `/imsd` er Powered/Online med `VoiceCallManager`. ModemManager fortsatt aktiv. Anrop er ikke testet.
+
+**Merk:** `q6voiced` og `81voltd` er fortsatt maskert i `/etc` fra 14.11. Ikke endret.
+
+**Backup:** `/var/lib/fp5-backup/20261126T133752-imsd-124/` (gamle binærer, SHA256SUMS, `rollback.sh`).
+
+**Tilbake:** `run0 sh /var/lib/fp5-backup/20261126T133752-imsd-124/rollback.sh` mens telefonen er ledig. Skriptet legger tilbake binærene og skriver `systemctl restart fp5-ims.service` uten å kjøre den. Restart `fp5-ims` etterpå, når telefonen er ledig.
