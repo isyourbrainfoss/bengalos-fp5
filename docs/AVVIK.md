@@ -484,3 +484,15 @@ Etter lesende kontroll og hash-tilbakelesing startet telefonen 0.26.1124.3 kl. 2
 **Tilbake:** `run0 sh /var/lib/fp5-backup/<ts>-mm-keep-ims/rollback.sh` og omstart.
 
 **Rutine skjerpet:** Hver ombygging av fp5-sysexts må sjekke at alle lokale patcher i AVVIK fortsatt er med (her: strengen «sparing IMS bearer» i daemonen).
+
+## 2026-11-26 20:09 — Installert: fp5-modemmanager 1124.3 med IMS-spar-patchen (Kristians «passer nå» t1097u)
+
+**Hva:** `/var/lib/extensions/fp5-modemmanager_0.26.1124.3.raw` byttet fra sha 5db97766… (upatchet) til `6ad373385b2d2485509cbdc6659596c14b2436b6bd2dbfc11cb384406b0d7eeb` (ModemManager fc7239de…, Debian 1.25.95-1 + 9317cbc4 + `mm-fp5-keep-ims-bearer.patch`). Kjørt som fp5: `sh /home/fp5/fp5-xfer-mm-keepims/install.sh` → én run0 20:09:46 Europe/Oslo, APPLY_OK 20:09:47, så omstart (ingen live `systemd-sysext refresh`). Ingen andre filer endret.
+
+**Hvorfor:** 1124.3-ombyggingen mistet IMS-spar-patchen fra 21.11, så NetworkManager-dvale (`Simple.Disconnect("/")`) koblet ned IMS-bæreren ved hver dvale, og innkommende anrop i dvale gikk over CS (26.11 15:19). Se oppføringen 26.11 16:10.
+
+**Etter boot (lesing):** 0.26.1124.3, alle ti sysexts flettet, `/usr/sbin/ModemManager` sha fc7239de… og inneholder «sparing IMS bearer». Ingen feilede system- eller brukerenheter. ModemManager og fp5-ims aktive. SIM-PIN tastet av Kristian. Modem tilkoblet LTE/5G. fp5-ims klar 20:12:32, imsd-ofonod oppe 20:12:40, grant-wake armet 20:12:47 (grant ca. 7190 s). `check-carried-fixes --online` (gren `feat/carried-fixes-guard` fcb22b9, kopiert til `/home/fp5/fp5-xfer-mm-keepims/cfg/`): 40 OK, 0 mangler, 1 hoppet over (fp5-volte-modules, ikke brukt på denne kjernen). «sparing IMS bearer» i journalen og innkommende anrop i dvale er ikke testet ennå (ingen testsamtale uten Kristians ja).
+
+**Backup:** `/var/lib/fp5-backup/20261126T200946-mm-keep-ims/` (gammel raw 5db97766…, SHA256SUMS, rollback.sh). Logg: `/var/lib/fp5-backup/mm-keep-ims-last.log`.
+
+**Tilbake:** `run0 sh /var/lib/fp5-backup/20261126T200946-mm-keep-ims/rollback.sh`, så omstart.
