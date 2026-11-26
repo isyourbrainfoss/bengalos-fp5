@@ -60,6 +60,17 @@ Review checkout: `FP5_FEED_O=<live official-20261114> FP5_FEED_LOGD=<scratch> ba
 This uses this checkout's script, lib, build-sysexts.sh and carry, and the live uki/, sysext/src+out, baseline and waydroid.
 The lab identifiers for the secret audit live in the untracked `auto/lab-patterns.local` (name<TAB>regex).
 
+Carried-fixes guard: after waydroid-fix is built, and before assets are staged, every run
+including `--dry-run` executes `scripts/check-carried-fixes-sysexts` on `$T/sysext/out/$V`
+with `--profile feed`, `--version`, and `--kernel-uname` (the UKI uname). Profile `feed`
+fail-closes on the sysexts this pipeline builds: the ModemManager spare string
+(`sparing IMS bearer`), MM#1110, frunk, waydroid-fix, qtee, ims-app, device, and
+volte-modules when the kernel is `7.2.8-sc7280-volte20261107+`. Profile `daily` is the
+default and also requires `fp5-phoc`, `fp5-phosh`, and `fp5-gnome-calls`. The 1124.3
+install path uses that default. A missing marker is `CHECK_FAILED`: nothing is uploaded
+and `DRYRUN_OK` is not claimed. The lines are in `work/<v>/report/carried-fixes.log`.
+The inventory is `docs/CARRIED-FIXES.md`.
+
 Post-upload index compare: 6 tries with backoff (5..160 s, about 5 min), cache-busted, instead of a single `sleep 5`.
 This failed with ERROR on 15, 17, 18 and 19 Nov.
 

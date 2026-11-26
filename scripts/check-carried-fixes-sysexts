@@ -1,0 +1,14 @@
+#!/bin/sh
+# Required step for an install or publish script.
+#   scripts/check-carried-fixes-sysexts DIR [--version V] [--kernel-uname UNAME] ...
+# Exit 1 when a required sysext or image marker is missing. On-device items are
+# not required here. Pass extra checker flags after DIR.
+set -eu
+if [ $# -lt 1 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+  echo "usage: check-carried-fixes-sysexts DIR [check-carried-fixes options]" >&2
+  exit 2
+fi
+DIR=$1
+shift
+D=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+exec "$D/check-carried-fixes" --sysext-dir "$DIR" "$@"

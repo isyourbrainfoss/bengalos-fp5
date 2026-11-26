@@ -213,6 +213,22 @@ grep -q '^effective overlay: .*mobi.phosh.phoc present' "$W/report/waydroid-fix.
 [ -s "$T/sysext/out/$V/fp5-waydroid-fix_$V.raw.xz" ] || fail "waydroid fix: fp5-waydroid-fix_$V.raw.xz not built"
 say "waydroid fix OK: $(grep '^== waydroid fix' "$W/report/waydroid-fix.log")"
 
+# ---- carried-fixes guard (fail closed, including --dry-run)
+# Runs on the built set in $T/sysext/out/$V, before staging and before DRYRUN_OK
+# or publish. Profile feed is the sysexts this pipeline builds (the spare-IMS
+# string, MM#1110, frunk, waydroid-fix, qtee, ims-app, device, and volte-modules
+# when $UNAME is the volte kernel). Profile daily, the default, also requires
+# phoc, phosh, and gnome-calls. See docs/CARRIED-FIXES.md.
+CF_CHECK=$(cd "$SX/../.." && pwd)/scripts/check-carried-fixes-sysexts
+[ -x "$CF_CHECK" ] || fail "carried-fixes: $CF_CHECK missing"
+say "carried-fixes guard"
+if ! "$CF_CHECK" "$T/sysext/out/$V" --profile feed --version "$V" --kernel-uname "$UNAME" \
+    | tee "$W/report/carried-fixes.log"; then
+  reason=$(grep -E '^(MISSING|UNREADABLE):' "$W/report/carried-fixes.log" | paste -sd';' - || true)
+  fail "carried-fixes: ${reason:-a required marker is missing under $T/sysext/out/$V}"
+fi
+say "carried-fixes guard OK"
+
 # ---- stage feed assets
 S=$W/feed; mkdir -p "$S"
 xz -T0 -9 -c "$W/out/BengalOS_$V.efi" > "$S/BengalOS_$V.efi.xz"
