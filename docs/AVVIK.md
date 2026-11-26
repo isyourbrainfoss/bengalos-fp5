@@ -1,7 +1,7 @@
 # FP5 BengalOS – avviksdokument (ikke-standard oppsett)
 
 Telefon: lab-FP5, maskin «phosh» (bruker fp5), BengalOS fra intern UFS (A/B via systemd-sysupdate fra isyourbrainfoss/bengalos-fp5 fp5-feed).
-Sist oppdatert: 25. nov 2026 kl. 17:12 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
+Sist oppdatert: 26. nov 2026 kl. 07:41 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
 Prinsipp: alt som avviker fra offisiell BengalOS står her med plassering, hvorfor og hvordan det fjernes.
 
 ## 1. Bil / Tesla (Bluetooth)
@@ -34,6 +34,7 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 
 | Avvik | Hvor | Av / tilbake |
 |---|---|---|
+| **fp5-ims kjernevakt for `7.2.8-sc7280-fp5+`** (installert 26.11 07:38, Kristians «nå» t1057u; én run0) – `ownership.py` godtar i tillegg den snevre regexen `^7\.2\.[0-9]+-sc7280-fp5\+$` (den gamle volte-unamen er fortsatt tillatt). `fp5-ims` er aktiv; IMS-grant sett. Se oppføringen 26.11 07:38. | `/opt/fp5-imsd/service/ownership.py` 211c80036b7956bb… (på skrivbar btrfs-rot, ikke i sysext). `guard.py` uendret. | Backup `/var/lib/fp5-backup/20261126T073847-ims-guard-1124.3/`. Tilbake: `run0 sh /var/lib/fp5-backup/20261126T073847-ims-guard-1124.3/rollback.sh` (eget ja). |
 | **fp5-call-mic v4 + early ADC1, IMS-journal, callaudiod-watch** (installert 21.11 20:25; IMS tilbake 20:36 etter DeleteBearer av nede Bearer/4, Kristians ja «nå» 20:35) – ADC1 på ved ringing, feilsikker IMS-logging også mens telefonen er våken, og idle-watchdog for hengende callaudiod. UCM uendret. Ingen aarch64-callaudiod-binær (bare watchdog). Se oppføringen 21.11 20:25 under. Grener `fix/call-mic-ring-adc1` 2a8a158, `fix/ims-resume-journal` 95f5be5, `fix/callaudiod-hang` fbfb8ce (pushet, ikke merget). | `/var/lib/fp5-oot/bin/fp5-call-mic` 4699f645…c0c8, `fp5-call-mic-early` e268bcdb…cc9d, `fp5-callaudiod-watch` bbff3826…9ecf; `/opt/fp5-imsd/service/manager.py` 9cd3bdcb…e4b3; `/etc/systemd/system/fp5-ims.service.d/10-syslog.conf` 542bfecb…ff36. Stage `/home/fp5/fp5-xfer-call-fixes`. | Backup `/var/lib/fp5-backup/20261121-202535-call-fixes/`. Tilbake: `sh /home/fp5/fp5-xfer-call-fixes/rollback.sh` (eller `sh /var/lib/fp5-backup/20261121-202535-call-fixes/rollback.sh`). |
 | **fp5-call-mic v3 + fp5-mic-level** (installert 20.11 16:04:05, bare del B, ingen UCM-endring) – for stille telefonmikrofon i første samtale etter oppstart (09:04, 12:21) | `/var/lib/fp5-oot/bin/fp5-call-mic` (defd321e…), `/var/lib/fp5-oot/bin/fp5-mic-level` (20005206…, ny), `/var/lib/fp5-oot/bin/fp5-call-audio-snap` (ec5977cf…), `~/.config/systemd/user/fp5-call-mic.service` (deee1bb8…), gren `fix/first-call-mic` 730f310. Skrur på ADC1 med en gang, sjekker nivået (~1,5 s, bare nivå, ingen lyd lagres) og åpner mikrofonveien på nytt hvis den er flat; hopper over bilsamtaler. Kjørte ikke ved bilsamtalen 16:04 – som forventet (bilsamtaler bruker ikke telefonens mikrofon). Ikke testet på første samtale etter oppstart ennå. | Backup `/var/lib/fp5-backup/20261120-160401-first-call-mic`. Tilbake: `sh ~/.local/share/fp5-mic-staging-v3/rollback-mic-v3.sh` (ett passord, ingen omstart) |
 | fp5-call-mic v2 (erstattet av v3 20.11 16:04) + fp5-call-audio-snap | `~/.config/systemd/user/fp5-call-mic.service`, gren fix/call-mic-race | `/var/lib/fp5-backup/20261119-call-mic/rollback.sh` |
@@ -429,7 +430,7 @@ Etter lesende kontroll og hash-tilbakelesing startet telefonen 0.26.1124.3 kl. 2
 **Etter boot (lesing):** Alle ti 1124.3-sysexts er flettet. 1120.1-sporet er urørt (loop0p4/3/2). ModemManager aktiv, tilkoblet, registrert hjemme på LTE/5G; `unlock-required` er sim-pin2 (hoved-PIN allerede låst opp — ikke av oss). `qcom-modem-setup` fortsatt maskert, ikke kjørt. q6voice-moduler lastet. Fingeravtrykk: `fp5-qtee.socket` aktiv, økt kjører. Kamera: imx800, imx858 og s5kjn1 synlige. Bluetooth, HFP-bro, PipeWire/WirePlumber og callaudiod kjører. `q6voiced` og `81voltd` er fortsatt maskert i `/etc` fra 14.11 (planen endret dem ikke). `fp5-volte-runtime` hoppet over (ser etter gammel volte-modulmappe; forventet).
 
 **Merk / ødelagt eller ubekreftet:**
-- `fp5-ims` startet ikke: `guard.py` avviser kjernenavnet `7.2.8-sc7280-fp5+` (den forventer den gamle volte-unamen). Ingen ofonod/imsd-prosess. Ringing er derfor sannsynligvis ødelagt til vakten er oppdatert og IMS startes med nytt ja.
+- `fp5-ims` startet ikke ved første boot: vakten avviste kjernenavnet `7.2.8-sc7280-fp5+` (den forventet den gamle volte-unamen). Fikset 26.11 07:38 (se oppføringen under).
 - `systemd-bless-boot` kjørte av seg selv ved boot-complete («Marked boot as good», teller 1). Vi kjørte den ikke og velsignet ikke selv. `fp5-uki-case-fix` trengte ikke kjøre (ingen `bengalos_*.efi`).
 - systemd-sysext logget seks «Required key not available» for verity ved oppstart, men flettet likevel de ti sysextene (offisiell waydroid-DDI er signert).
 - Eneste failed unit: `systemd-timedated` (NAMESPACE / cgroup). Tung dvalelogging fra 20:19 var bare runtime og forsvant ved omstarten (eget ja kreves for å slå den på igjen).
@@ -438,4 +439,18 @@ Etter lesende kontroll og hash-tilbakelesing startet telefonen 0.26.1124.3 kl. 2
 
 **Tilbake:** `run0 sh /var/lib/fp5-backup/20261125T234604-install-1124.3/rollback.sh` og så omstart. Det fjerner 1124.3-UKI fra ESP, gjenoppretter `/etc/sysupdate.d` og `qcom-modem-setup`-tilstanden, og fjerner 1124.3-sysext-filene; 1120.1-UKI + usr + sysexts blir stående. Ikke slett 1120.1-sporet. 1118.1-usr kan ikke gjenopprettes.
 
-**Test (Kristian):** anrop (sannsynligvis etter IMS-vakt), fingeravtrykk, kamera. Ikke velsign boot manuelt.
+**Test (Kristian):** anrop (IMS er oppe; `q6voiced`/`81voltd` er fortsatt maskert), fingeravtrykk, kamera. Ikke velsign boot manuelt.
+
+## 2026-11-26 07:38 — fp5-ims kjernevakt åpnet for 7.2.8-sc7280-fp5+ (Kristians «nå» t1057u)
+
+**Hva:** På lab-FP5 som kjører 0.26.1124.3 (kjerne `7.2.8-sc7280-fp5+`) ble `/opt/fp5-imsd/service/ownership.py` patchet slik at `supported_kernel` også godtar `^7\.2\.[0-9]+-sc7280-fp5\+$`, i tillegg til den gamle eksakte unamen `7.2.8-sc7280-volte20261107+`. `guard.py` er uendret (den kaller `supported_kernel`). Filen ligger på den skrivbare btrfs-roten (`/dev/loop0p8`), ikke i en sysext (`/opt` har ingen sysext-overlegg). Ingen `systemd-sysext refresh`. Deretter `systemctl daemon-reload` og `systemctl start fp5-ims.service` (imsd/ofonod kommer med den enheten). Live-hash `211c80036b7956bb0fc55f344d1fea9a6bbf42aea663c0ea69d610c95b70e373`. Rørte ikke `q6voiced`, `81voltd`, ModemManager, SIM-PIN, NV/profil eller andre beskyttede tjenester.
+
+**run0:** Tørrkjøring som vanlig bruker først (syntaks og 37 enhetstester OK). Én run0 kl. 07:38:46 Europe/Oslo med `/home/fp5/ims-guard-1124.3/apply.sh` (prompt synlig, t1060u). `apply.log` stopper ved «starting fp5-ims.service» uten `APPLY_OK`, fordi run0-sesjonen ble lukket 07:38:51 midt i skriptets `sleep 2` etter start. Selve arbeidet gikk gjennom: backup, patch, predikat OK, tjenesten startet. Ingen ny run0.
+
+**Etter (lesing):** `fp5-ims` aktiv (running) siden 07:38:49 Europe/Oslo; `guard.py` ExecCondition status 0. Første poll: `ok=1 why=ready ims-bearer=absent imsd_registered=yes rat=lte,nr`, deretter ny transaksjon. 07:38:56 kom oFono `/imsd` opp (Powered/Online, `VoiceCallManager`); gnome-calls tok inn opprinnelsen. 07:39:00 så `fp5-ims-grant-wake` et IMS-grant (utløp ca. 7190 s / typisk ~2 t registreringsgrant) og armte vekking. ModemManager fortsatt aktiv og registrert hjemme på LTE/5G. Uprivilegert `ip xfrm` viste 0 state og 0 policy, så kjerne-IPsec er ikke bekreftet uten ny root; ingen ny run0. Anrop er ikke testet.
+
+**Merk:** `q6voiced` og `81voltd` er fortsatt maskert i `/etc` fra 14.11. Det kan påvirke samtalelyd på 1124.3. Ikke endret; venter på ja.
+
+**Backup:** `/var/lib/fp5-backup/20261126T073847-ims-guard-1124.3/` (opprinnelig `ownership.py` 95023836a14541da…, uendret `guard.py` 852c8e956b7164e69…, `rollback.sh`). `fp5-ims` var inactive og enabled før start.
+
+**Tilbake:** `run0 sh /var/lib/fp5-backup/20261126T073847-ims-guard-1124.3/rollback.sh` — legger tilbake den gamle `ownership.py` (kun volte-unamen), `daemon-reload`, og stopper `fp5-ims` fordi nåværende kjerne da ikke er tillatt. Krever eget ja og én run0.
