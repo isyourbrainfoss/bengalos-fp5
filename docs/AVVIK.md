@@ -496,3 +496,27 @@ Etter lesende kontroll og hash-tilbakelesing startet telefonen 0.26.1124.3 kl. 2
 **Backup:** `/var/lib/fp5-backup/20261126T200946-mm-keep-ims/` (gammel raw 5db97766…, SHA256SUMS, rollback.sh). Logg: `/var/lib/fp5-backup/mm-keep-ims-last.log`.
 
 **Tilbake:** `run0 sh /var/lib/fp5-backup/20261126T200946-mm-keep-ims/rollback.sh`, så omstart.
+
+## 2026-11-26 20:44 — Grok Bot-appen på lab-FP5 oppdatert fra 0.78.1 til 1.3.0 (Kristians ja kl. 20:41 Europe/Oslo)
+
+**Hva:** Brukerromsinstallasjonen av Grok Bot-skrivebordsappen på lab-FP5 ble byttet fra 0.78.1 til offisiell 1.3.0 (commit `bfb372966cec`). Ingen run0, ingen apt, ikke `.deb`. Den kjørende 0.78.1-prosessen ble ikke avsluttet, og 1.3.0 ble ikke startet.
+
+Nedlastet `Grok_Bot_1.3.0.AppImage` til `/home/fp5/Applications/` (154 629 441 byte, sha256 `20dc3d62be6aaef92f85e0431bee784b44ef139267d20ba7cd6b0b1e7ceeff80`; ingen offisiell sjekksum publisert). Utpakking med `--appimage-extract` krevde et midlertidig brukersymbol `libz.so` → `libz.so.1` via `LD_LIBRARY_PATH` (runtimen etterspør `libz.so`, systemet har bare `libz.so.1`). Deretter `mv grok-bot grok-bot-0.78.1` og `mv grok-bot-1.3.0 grok-bot`. `.desktop` ble først kopiert til `~/.local/share/applications/grok-bot.desktop.0.78.1.bak`; bare `X-AppImage-Version` ble satt til `1.3.0`. `Exec` og `TryExec` er uendret (`/home/fp5/Applications/grok-bot/AppRun --no-sandbox --ozone-platform=wayland --enable-wayland-ime -- %U`). `AppRun` finnes og er kjørbar; `grok-bot` er ELF aarch64.
+
+**Hvorfor:** Kristian godkjente oppdatering til siste offisielle versjon. Oppdatering inne i appen er ikke tilgjengelig på denne plattformen.
+
+**Etter (lesing):** Ny tre 398 M i `/home/fp5/Applications/grok-bot` (binær 217 058 616 byte). Gammel tre 372 M i `/home/fp5/Applications/grok-bot-0.78.1` (binær 212 995 360 byte). Begge AppImage-filene ligger igjen i `~/Applications/`. Den kjørende 0.78.1-prosessen (pid 3586 og barn) var i live etter byttet og peker på inoden i `grok-bot-0.78.1`.
+
+**Merk:** 1.3.0 brukes først når Kristian lukker den gamle appen og starter den på nytt.
+
+**Backup:** `/home/fp5/Applications/grok-bot-0.78.1/` og `/home/fp5/.local/share/applications/grok-bot.desktop.0.78.1.bak`. Opprinnelig AppImage: `/home/fp5/Applications/Grok_Bot_0.78.1-arm64.AppImage` (145 405 830 byte).
+
+**Tilbake:** Som vanlig bruker, uten run0:
+
+```
+mv /home/fp5/Applications/grok-bot /home/fp5/Applications/grok-bot-1.3.0
+mv /home/fp5/Applications/grok-bot-0.78.1 /home/fp5/Applications/grok-bot
+cp /home/fp5/.local/share/applications/grok-bot.desktop.0.78.1.bak /home/fp5/.local/share/applications/grok-bot.desktop
+```
+
+Deretter lukk appen og start den på nytt (hvis 1.3.0 allerede kjører).
