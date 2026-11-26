@@ -468,3 +468,19 @@ Etter lesende kontroll og hash-tilbakelesing startet telefonen 0.26.1124.3 kl. 2
 **Backup:** `/var/lib/fp5-backup/20261126T133752-imsd-124/` (gamle binærer, SHA256SUMS, `rollback.sh`).
 
 **Tilbake:** `run0 sh /var/lib/fp5-backup/20261126T133752-imsd-124/rollback.sh` mens telefonen er ledig. Skriptet legger tilbake binærene og skriver `systemctl restart fp5-ims.service` uten å kjøre den. Restart `fp5-ims` etterpå, når telefonen er ledig.
+
+## 2026-11-26 16:10 — fp5-modemmanager 1124.3 med IMS-spar-patchen: bygget og lagt klar, IKKE installert (Kristians ja t1088u «ja fiks»)
+
+**Hvorfor:** Innkommende VoLTE i dvale virket ikke etter 1124.3 (25.11 23:48). 1124.3-sysexten `fp5-modemmanager` (sha 5db97766…) var den upatchede 1120.1-daemonen omtagget, og `mm-fp5-keep-ims-bearer.patch` fra 21.11 falt bort. Ved hver dvale koblet NetworkManager (`Simple.Disconnect("/")`) da ned IMS-bæreren. Journal: 0 «sparing IMS bearer» i 1124.3-boot mot 80+ per 1120.1-boot. Anropet 26.11 15:19 kom derfor over CS og døde.
+
+**Hva (desk, Grok Build):** Ny `fp5-modemmanager_0.26.1124.3.raw` sha `6ad373385b2d2485509cbdc6659596c14b2436b6bd2dbfc11cb384406b0d7eeb` (xz `7933a555…7da67`) i `internal-install/upstream-sc7280/artifacts/sysext/0.26.1124.3-keepims/`. 1124.3-treet med kun `usr/sbin/ModemManager` byttet til keep-IMS-daemonen fra 21.11 (Debian 1.25.95-1 + 9317cbc4 + keep-IMS, sha fc7239de…, build-id a22f7e12…). extension-release byte-lik (VERSION_ID=0.26.1124.3). Vanlig EROFS som de andre fp5-sysextene (ikke verity-signert). Sjekker: symcheck mot 1124.3-usr 0 uløste/0 manglende bibliotek, GLIBC ≤2.42, DT_NEEDED lik, ldd ren, «sparing IMS bearer» finnes, ingen hemmeligheter. Rapport: `sysext-work/mm-keepims-1124.3/REPORT.md`; `SYSEXT-1124.3.md` oppdatert (backup `.bak-20261126-mmkeepims`).
+
+**Git:** `fix/mm-keep-ims-bearer` (d99036b) flettet inn i `feat/upstream-sc7280-sysexts-1124.3` (merge 5ffc4bb, vanlig merge) + 5b25db8 (README for daily-1124.3 krever keep-IMS og sjekk av strengen før hver ombygging). Pushet, ingen force-push.
+
+**Lagt klar på telefonen (bare /home):** `/home/fp5/fp5-xfer-mm-keepims/` (raw, `install.sh`, `root-install.sh`, `SHA256SUMS`, `VERIFY-AFTER-BOOT.md`). Ingenting kopiert til `/var/lib/extensions`, ingen run0, ingen omstart.
+
+**Installering (venter på «nå»):** `sh /home/fp5/fp5-xfer-mm-keepims/install.sh` som fp5 → én run0: backup til `/var/lib/fp5-backup/<ts>-mm-keep-ims/` med `rollback.sh`, bytter raw (sjekker gammel sha 5db97766… og ny sha), deretter omstart (ingen live sysext refresh). `--no-reboot` bytter bare fila. Etter boot: SIM-PIN, så sjekkene i VERIFY-AFTER-BOOT.md.
+
+**Tilbake:** `run0 sh /var/lib/fp5-backup/<ts>-mm-keep-ims/rollback.sh` og omstart.
+
+**Rutine skjerpet:** Hver ombygging av fp5-sysexts må sjekke at alle lokale patcher i AVVIK fortsatt er med (her: strengen «sparing IMS bearer» i daemonen).
