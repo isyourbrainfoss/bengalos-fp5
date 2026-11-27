@@ -1,7 +1,7 @@
 # FP5 BengalOS – avviksdokument (ikke-standard oppsett)
 
 Telefon: lab-FP5, maskin «phosh» (bruker fp5), BengalOS fra intern UFS (A/B via systemd-sysupdate fra isyourbrainfoss/bengalos-fp5 fp5-feed).
-Sist oppdatert: 27. nov 2026 kl. 11:11 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
+Sist oppdatert: 27. nov 2026 kl. 16:23 (norsk tid, Europe/Oslo). Nye avvik legges øverst i sin seksjon.
 Prinsipp: alt som avviker fra offisiell BengalOS står her med plassering, hvorfor og hvordan det fjernes.
 
 ## 1. Bil / Tesla (Bluetooth)
@@ -60,6 +60,7 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 
 | Avvik | Hvor | Av / tilbake |
 |---|---|---|
+| **Kjerne med krasjlogging (pstore/ramoops + PM-dvaledebug) bygget 27.11 16:12, IKKE installert** (Kristians ja 15:18 Europe/Oslo til å bygge på desk) | Desk `/home/kb/repos/grok_build/fp5/kernel-pstore-20261127/artifacts/fp5-pstore-20261127/`. UKI `fp5-pstore-20261127.efi` sha `cd235696726860e7f475ae2d747a59d40f95de937f857ca5b7eac4485d51b770`. Kjernenavn fortsatt `7.2.8-sc7280-fp5+`, merket `#fp5pstore.20261127`. | Ikke installert. Standard oppstartsvalg er fortsatt 0.26.1124.3. Se oppføringen 27.11 16:12. |
 | Medlemskort på låseskjermen (ticket-box): Coop Mega (QR) og Rema 1000 (EAN-13), 25.11 17:12 | `~/phosh-ticket-box/Coop Mega.pdf`, `~/phosh-ticket-box/Rema 1000.pdf`. Pluginet var allerede på (`mobi.phosh.shell.plugins lock-screen` inkluderer `ticket-box`; mappe `phosh-ticket-box`). | `sh ~/.local/state/fp5-ticket-box/backup-20261125T171158/rollback.sh` |
 | Fingeravtrykk via QTEE (fp5-qtee), delt økt, vibrasjon ved treff | `/var/lib/fp5-qtee-share/`, drop-ins for fp5-qtee@ og fp5-fprintd | `/var/lib/fp5-backup/20261116-fprintd-share/rollback.sh --apply`, `/var/lib/fp5-backup/20261117-fp-haptic-direct/rollback.sh` |
 | screen-on-race v2 | fp5-qtee fix/screen-on-race 89079ff | `run0 sh /var/lib/fp5-backup/20261118-install/screen-on-race-v2/rollback.sh` |
@@ -522,3 +523,29 @@ cp /home/fp5/.local/share/applications/grok-bot.desktop.0.78.1.bak /home/fp5/.lo
 ```
 
 Deretter lukk appen og start den på nytt (hvis 1.3.0 allerede kjører).
+
+## 2026-11-27 16:12 — Kjerne med krasjlogging bygget på desk, IKKE installert (Kristians ja 15:18 til å bygge)
+
+**Hvorfor:** Telefonen skrudde seg av igjen 27.11 i dvale (samme type dvaledød som før, sist også 26.11 kveld på 1124.3). En endring bare på oppstartslinjen gir ikke krasjlogger på den kjørende 1124.3-kjernen `7.2.8-sc7280-fp5+`. 1124.3 ble kuttet fra oppstrøms BengalOS `linux-sc7280` (`0a23f4382b6c`) pluss FP5-funksjonsfragmentet (`fp5-no-nfc.config`: QTEE, q6voice, XFRM, IMX800, FocalTech) og patchene 0001–0003 og 0005–0007. Offisiell `config-7.2.8-sc7280+` har `CONFIG_PSTORE=y`, men `PSTORE_RAM`, `PSTORE_CONSOLE`, `PSTORE_PMSG` og `PM_DEBUG` er av, og ramoops-noden i enhetstreet ble ikke tatt med. Tidligere fungerende ramoops (2 MiB på `0xa9000000`) fantes bare i de egne s2idle/wdt2/panel3-kjernene (`7.2.8-sc7280+`), og ble ikke tatt med da dagsbildet gikk over på oppstrøms-sc7280-profilen. `pstore.backend=ramoops` på kjørelinjen kan ikke lage bakenden uten `PSTORE_RAM` og et reservert område.
+
+**Hva (desk, Grok Build, jobb `20261127-153956-1917385`):** Ny kjerne identisk med den kjørende 1124.3-kjernen, pluss bare pstore/ramoops og PM-dvaledebug. Bygget i `fp5-aarch64-kbuild:14.2` (gcc 14.2.0-19). `uname -r` er fortsatt `7.2.8-sc7280-fp5+`; `uname -v` er `#fp5pstore.20261127 SMP PREEMPT Fri Nov 27 15:55:35 CET 2026`. Pakke: `/home/kb/repos/grok_build/fp5/kernel-pstore-20261127/artifacts/fp5-pstore-20261127/`. Telefonen ble ikke kontaktet. Install- og revert-skriptene er bare syntakssjekket (`sh -n`), ikke kjørt.
+
+Hovedfiler (sha256):
+
+- UKI `fp5-pstore-20261127.efi` (227175424 byte) `cd235696726860e7f475ae2d747a59d40f95de937f857ca5b7eac4485d51b770` — ny, ikke-standard systemd-boot-oppføring, ikke en erstatning for `BengalOS_0.26.1124.3.efi`
+- `vmlinuz.efi` `d97b9f654b4420a7380ab6d8d903fc4055d3d7b2f48dc97097e1da7d6218dfff`
+- FP5-DTB med `ramoops@a9000000` (2 MiB, uten `no-map`) `5e8060a54a71b3b3b831f020475907a4a5bccdc5f103024a9b2b69b18cc7f3df`
+- Otter-DTB uendret, samme sha som 1124.3: `fdc49ae4836bce077b1b865b928442754cd9edfa8779e41248b09b90c193a4ad`
+
+Konfigurasjonsdiff mot den kjørende 1124.3-`.config` (bare dette): `PSTORE_RAM/CONSOLE/PMSG` n→y, `PM_DEBUG` n→y, `PM_SLEEP_DEBUG` y, `REED_SOLOMON` m→y (og `REED_SOLOMON_ENC8` y), `EFI_VARS_PSTORE_DEFAULT_DISABLE` n→y. `PM_ADVANCED_DEBUG` og `DETECT_HUNG_TASK` er av. Vermagic `7.2.8-sc7280-fp5+ SMP preempt mod_unload aarch64` matcher `/usr`-modulene; eneste modulnavn som mangler er `reed_solomon.ko` (nå innebygd). Ingen modul-sysext. Initrd-overlegg + rotfil `fp5-builtin.conf` hindrer at `/usr`-modulen lastes på denne kjernen, men laster den som vanlig på 1124.3.
+
+UKI-hovedprofilen har 1124.3-kjørelinjen pluss `pstore.backend=ramoops panic=10 oops=panic mem_sleep_default=s2idle`. Ikke `qrtr.wake_services` (den koden er ikke i 1124.3). Ikke `no_console_suspend` eller `pm_debug_messages` på hovedprofilen (de har vært knyttet til at Phosh dør ved oppvåkning). Valgfri andre profil er bare 1124.3-verbose (`debug plymouth.enable=0` …). UKI-en er usignert (ingen `.pcrsig`); lab bruker `Verify=no`. Rapport: `artifacts/REPORT.md` og `INSTALL-PLAN.md`.
+
+**Installering (venter på nytt ja og «nå»):** Kopier pakken til telefonen, deretter `run0 env FP5_PSTORE_INSTALL_OK=yes sh ./install-fp5-pstore.sh`. Det legger bare inn `/boot/EFI/Linux/fp5-pstore-20261127.efi` og `/etc/modprobe.d/fp5-builtin.conf`, tar backup av `loader.conf` (uten å endre den) og av eventuell gammel modprobe-fil. `BengalOS_0.26.1124.3.efi` overskrives ikke. Standardvalget blir stående. Velg testoppføringen én gang i systemd-boot-menyen på U-Boot USB ACM (`/dev/ttyACM0` på desk, 5 s). `bootctl set-oneshot` virker ikke her. Etter boot (bare lesing, ikke tøm pstore): `uname -v` inneholder `fp5pstore.20261127`; `/sys/module/ramoops` eller `/sys/fs/pstore` finnes; dmesg viser `0xa9000000`; `/sys/power/pm_debug_messages` og `pm_print_times` finnes.
+
+**RAM-boot:** Ingen RAM-boot-avbildning. `fastboot boot` på ABL vil ha et Android-boot-image, ikke denne UKI-en. Å pakke et nytt `boot.img` ville vært gjetning. Trygg test er ny ESP-fil + menyvalg. Ingen `fastboot flash`/`erase`/`oem`, ingen qbootctl, ingen skriving til interne partisjoner.
+
+**Tilbake:** Standardvalget er allerede 1124.3. Etter en ev. installasjon: `run0 env FP5_PSTORE_INSTALL_OK=yes sh ./revert-fp5-pstore.sh` (fjerner test-UKI og legger tilbake modprobe-filen; skriver aldri `loader.conf`).
+
+**Vaktliste:** Tapt pstore i 1124.3 er ført som `fp5-pstore-ramoops` på grenen `feat/carried-fixes-guard` (pushet, ikke merget), med config-fragment og DT-patch, så nye kjerner skal ta det med.
+
