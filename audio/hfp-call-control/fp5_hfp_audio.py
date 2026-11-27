@@ -50,6 +50,21 @@
 #              100%. imsd-media's pw-record stream: unmute / 100% if it is
 #              muted or below the floor. Not put back at call end (0% is a
 #              dead mic; WirePlumber then saves 100% for the route).
+# Speaker floor (Tesla call 2026-11-27 16:26: incoming VoLTE, mSBC, audio
+# both ways but very low even at max car volume). Same class of bug as the
+# mic: v3 only unmutes the SCO sink and never looks at its volume, and does
+# not log it. A2DP (handsfree-output) and HFP (handsfree-hf-output) share the
+# sink node; Tesla often sets AVRCP volume to 0 around calls, and that can
+# attenuate the PCM sent over SCO. Now:
+#   speaker floor  when the car is made the default sink, and while the call
+#              lasts (same 2 s guard as the mic, at most SPEAKER_FIX_MAX
+#              writes): SCO sink below SPEAKER_FLOOR_PCT -> 100% (this is
+#              the active handsfree-hf-output route while the profile is
+#              HFP). imsd-media's pw-play stream: unmute / 100% if muted or
+#              below the floor. The A2DP route is not set to 100%. If a
+#              write was made, the pre-call A2DP volume is put back on
+#              restore so a shared node volume cannot leak 100% into media
+#              (mpris-guard still handles a post-call 0%).
 # Idle: if WirePlumber restarts (or the bridge starts) while the car is the
 # default sink, put it back as default once its A2DP sink reappears.
 # Never touches the ALSA card, mixers or the modem. Never logs node names
@@ -72,6 +87,9 @@ MIC_TARGET = "100%"
 MIC_GUARD_MS = 2000           # read-only check while a call lasts
 MIC_GUARD_LIMIT_MS = 6 * 3600 * 1000
 MIC_FIX_MAX = 6               # writes per call, then only log
+SPEAKER_FLOOR_PCT = 50        # HFP speaker below this is too quiet at the car
+SPEAKER_TARGET = "100%"       # full-scale PCM; the car knob remains the level
+SPEAKER_FIX_MAX = 6           # writes per call, then only log
 # the call media helpers imsd-media spawns (MIC_BACKEND=pw)
 CALL_CAPTURE_APPS = ("pw-record", "pw-cat")
 CALL_PLAYBACK_APPS = ("pw-play", "pw-cat")
@@ -123,6 +141,17 @@ def _props(item):
 
 def _true(v):
     return str(v).lower() in ("true", "1", "yes")
+
+
+def _transport_volume(props):
+    """Best-effort HFP/A2DP transport volume (AT+VGS or AVRCP) from pactl
+    properties, or None. Never include device paths (they carry BT addresses)."""
+    if not isinstance(props, dict):
+        return None
+    for k in ("api.bluez5.volume", "bluetooth.volume", "bluez5.volume", "device.volume"):
+        if k in props and props[k] not in (None, ""):
+            return str(props[k])
+    return None
 
 
 def vol_pct(item):
@@ -241,6 +270,7 @@ class AudioRouter:
         self.after_engage = None
         self.restoring = None     # state whose defaults are still to be put back
         self.mic_fixes = 0        # car mic volume corrections this call
+        self.speaker_fixes = 0    # HFP speaker volume corrections this call
         self.mic_guarding = False
 
     # ---- state file ----
@@ -388,7 +418,7 @@ class AudioRouter:
         self.ready = self.engaging = self.profile_asked = False
         self.after_engage = None
         self.seen = set()
-        self.mic_fixes, self.mic_guarding = 0, False
+        self.mic_fixes, self.speaker_fixes, self.mic_guarding = 0, 0, False
         self.restore()
 
     # ---- engage: profile + defaults, once ----
@@ -419,6 +449,15 @@ class AudioRouter:
             card, prev, hfp = cards[0]
             st = {"card": card, "profile": prev, "hfp": hfp,
                   "sink": self.p.get("sink"), "source": self.p.get("source")}
+            # remember A2DP volume before the HFP switch, in case a 100%
+            # write on the shared sink node would otherwise leak into media
+            cidx0 = card_index(cards_all, card)
+            for s in self.p.json("sinks"):
+                if _is_car(s, card, cidx0) and not is_sco(s):
+                    av = vol_pct(s)
+                    if av is not None:
+                        st["a2dp_vol"] = int(round(av))
+                    break
             if self.restoring and self.restoring.get("card") == card:
                 # back-to-back call: the last call's defaults are not back yet,
                 # so keep its baseline (else we would save the car nodes)
@@ -450,12 +489,20 @@ class AudioRouter:
         if src.get("mute"):
             self.p.set("set-source-mute", src["name"], "0")
         self._mic_floor(src, "start")
+        self._speaker_floor(sink, "start")
         self.ready = True
         v = vol_pct(src)
-        self.log("call: car is default sink+source (codec %s, %s source, mic was %s) after %d ms"
+        sv = vol_pct(sink)
+        extra = ""
+        tv = _transport_volume(_props(sink))
+        if tv is not None:
+            extra = ", transport volume %s" % tv
+        self.log("call: car is default sink+source (codec %s, %s source, mic was %s, speaker was %s%s) after %d ms"
                  % (_props(sink).get("api.bluez5.codec", "?"),
                     "loopback" if _true(_props(src).get("bluez5.loopback")) else "plain",
                     "?" if v is None else "%d%%" % round(v),
+                    "?" if sv is None else "%d%%" % round(sv),
+                    extra,
                     (time.monotonic() - self.t_engage) * 1000))
         return True
 
@@ -476,6 +523,28 @@ class AudioRouter:
         self.log("call: car mic volume %d%% -> %s (%s)%s" % (round(v), MIC_TARGET, why, "" if ok else " FAILED"))
         return ok
 
+    def _speaker_floor(self, sink, why):
+        """sink: pactl json of the car SCO sink (handsfree-hf-output while
+        the profile is HFP). Raise it to SPEAKER_TARGET when it is below
+        SPEAKER_FLOOR_PCT. Returns True if it wrote."""
+        v = vol_pct(sink)
+        if v is None or v >= SPEAKER_FLOOR_PCT:
+            return False
+        if self.speaker_fixes >= SPEAKER_FIX_MAX:
+            if self.speaker_fixes == SPEAKER_FIX_MAX:
+                self.speaker_fixes += 1
+                self.log("call: car speaker volume keeps dropping (%d%%); giving up for this call" % round(v))
+            return False
+        self.speaker_fixes += 1
+        ok = self.p.set("set-sink-volume", sink["name"], SPEAKER_TARGET)
+        self.log("call: car speaker volume %d%% -> %s (%s)%s" % (round(v), SPEAKER_TARGET, why, "" if ok else " FAILED"))
+        if ok:
+            st = self._load()
+            if st is not None:
+                st["speaker_raised"] = True
+                self._save(st)
+        return ok
+
     def _start_mic_guard(self):
         if self.mic_guarding:
             return
@@ -483,16 +552,20 @@ class AudioRouter:
         self._poll(MIC_GUARD_MS, MIC_GUARD_LIMIT_MS, self._mic_guard_step)
 
     def _mic_guard_step(self):
-        """Read-only unless the car mic dropped below the floor mid-call."""
+        """Read-only unless the car mic or HFP speaker dropped below the floor mid-call."""
         if not self.live:
             return True
         st = self._load()
         if not st:
             return True
         card = st["card"]
-        src = car_source(card, card_index(self.p.json("cards"), card), self.p.json("sources"))
+        cidx = card_index(self.p.json("cards"), card)
+        src = car_source(card, cidx, self.p.json("sources"))
         if src is not None:
             self._mic_floor(src, "during call")
+        sink = car_sco_sink(card, cidx, self.p.json("sinks"))
+        if sink is not None:
+            self._speaker_floor(sink, "during call")
         return not self.timers  # tests: one step; phone: until the call ends
 
     # ---- watch: where did imsd-media's streams land? one move at most ----
@@ -545,6 +618,14 @@ class AudioRouter:
                 if v is not None and v < MIC_FLOOR_PCT:
                     self.p.set("set-source-output-volume", str(s.get("index")), MIC_TARGET)
                     self.log("call: %s #%s volume %d%% -> %s" % (kind, s.get("index"), round(v), MIC_TARGET))
+            elif kind == "sink-input":
+                if s.get("mute"):
+                    self.p.set("set-sink-input-mute", str(s.get("index")), "0")
+                    self.log("call: %s #%s was muted -> unmuted" % (kind, s.get("index")))
+                v = vol_pct(s)
+                if v is not None and v < SPEAKER_FLOOR_PCT:
+                    self.p.set("set-sink-input-volume", str(s.get("index")), SPEAKER_TARGET)
+                    self.log("call: %s #%s volume %d%% -> %s" % (kind, s.get("index"), round(v), SPEAKER_TARGET))
 
     # ---- restore ----
     def restore(self):
@@ -582,6 +663,15 @@ class AudioRouter:
             self.p.set("set-default-sink", car_sinks[0])
         for s in car_sinks:
             self.p.set("set-sink-mute", s, "0")
+        # If we raised the HFP speaker, put the pre-call A2DP volume back so
+        # a shared sink-node volume cannot stay at 100% (media would blast).
+        # Routes that are stored separately are unchanged by this write of
+        # the same value. We never set the A2DP route to 100%.
+        if st.get("speaker_raised") and st.get("a2dp_vol") is not None and car_sinks:
+            tgt = "%d%%" % int(st["a2dp_vol"])
+            name = st.get("sink") if st.get("sink") in car_sinks else car_sinks[0]
+            if self.p.set("set-sink-volume", name, tgt):
+                self.log("call: A2DP sink volume put back to %s (HFP speaker was raised)" % tgt)
         if st.get("source") in sources:
             self.p.set("set-default-source", st["source"])
     # ---- idle: car stays the default sink across WirePlumber restarts ----

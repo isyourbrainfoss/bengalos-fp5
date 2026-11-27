@@ -27,9 +27,13 @@ class FakePactl:
       on the phone mic all along.
     Indices: sinks speaker=1 car=2; sources mic=10 car loopback=11."""
     def __init__(self, profile="a2dp-sink", sink=SINK, source="alsa_input.mic", node_delay=0,
-                 sco_ever=True, muted=True, mic_vol=65536):
+                 sco_ever=True, muted=True, mic_vol=65536, a2dp_vol=65536, hfp_spk_vol=65536):
         self.profile, self.default_sink, self.default_source = profile, sink, source
         self.mic_vol = mic_vol       # loopback (= car HFP input route) volume, pactl units
+        # A2DP (handsfree-output) and HFP (handsfree-hf-output) volumes are
+        # stored separately, as WirePlumber routes on the shared sink node.
+        self.a2dp_vol = a2dp_vol
+        self.hfp_spk_vol = hfp_spk_vol
         self.calls, self.muted = [], {SINK: muted}
         self.card_gone = False
         self.node_delay, self.sco_ever = node_delay, sco_ever
@@ -76,6 +80,10 @@ class FakePactl:
             car = {"index": 2, "name": SINK, "mute": self.muted.get(SINK, False),
                    "properties": {"device.name": CAR, "device.id": str(CAR_IDX),
                                   "api.bluez5.profile": "a2dp-sink", "api.bluez5.codec": "sbc"}}
+        vol = self.hfp_spk_vol if (self.profile.startswith("headset") and self.sco_up) else self.a2dp_vol
+        pct = int(round(vol * 100 / 65536))
+        car["volume"] = {"front-left": {"value": vol, "value_percent": "%d%%" % pct},
+                         "front-right": {"value": vol, "value_percent": "%d%%" % pct}}
         return [spk, car]
 
     def json(self, what):
@@ -124,8 +132,21 @@ class FakePactl:
             self.muted[a[1]] = a[2] == "1"
         elif a[0] == "set-source-volume" and a[1] == LOOP:
             self.mic_vol = round(int(a[2].rstrip("%")) * 65536 / 100)
+        elif a[0] == "set-sink-volume" and a[1] == SINK:
+            v = round(int(a[2].rstrip("%")) * 65536 / 100)
+            if self.profile.startswith("headset") and self.sco_up:
+                self.hfp_spk_vol = v
+            else:
+                self.a2dp_vol = v
         elif a[0] in ("set-source-output-volume", "set-source-output-mute"):
             for s in self.outputs:
+                if str(s["index"]) == a[1]:
+                    if a[0].endswith("mute"):
+                        s["mute"] = a[2] == "1"
+                    else:
+                        s["volume"] = {"mono": {"value": round(int(a[2].rstrip("%")) * 65536 / 100)}}
+        elif a[0] in ("set-sink-input-volume", "set-sink-input-mute"):
+            for s in self.inputs:
                 if str(s["index"]) == a[1]:
                     if a[0].endswith("mute"):
                         s["mute"] = a[2] == "1"
@@ -332,6 +353,105 @@ class AudioRouterTest(unittest.TestCase):
         self.p.mic_vol = 0
         self.r._mic_guard_step()
         self.assertFalse([l for l in self.logs if "bluez_" in l or "XX" in l], self.logs)
+
+    # ---- speaker floor (Tesla call 2026-11-27 16:26: very low call audio) ----
+    def test_zero_car_speaker_raised_before_dial(self):
+        self.p.hfp_spk_vol = 0
+        self.p.a2dp_vol = 32768  # 50%: must not be written to 100%
+        order = []
+        self.r.prepare(lambda: order.append((self.p.hfp_spk_vol, self.p.a2dp_vol)))
+        self.assertEqual(order, [(65536, 32768)], "HFP speaker 100% before dial; A2DP unchanged")
+        self.assertIn(("set-sink-volume", SINK, "100%"), self.p.calls)
+        self.assertTrue(any("car speaker volume 0% -> 100% (start)" in l for l in self.logs), self.logs)
+        self.assertTrue(any("speaker was 0%" in l for l in self.logs), self.logs)
+
+    def test_good_car_speaker_not_touched(self):
+        self.p.hfp_spk_vol = 40000  # ~61%, above the 50% floor
+        self.r.prepare(lambda: None)
+        self.r._mic_guard_step()
+        self.assertEqual(self.p.acts("set-sink-volume", "set-sink-input"), [])
+
+    def test_car_speaker_dropping_mid_call_raised_capped(self):
+        self.r.prepare(lambda: None)
+        self.r.calls_changed(1)
+        for _ in range(A.SPEAKER_FIX_MAX + 3):
+            self.p.hfp_spk_vol = 0
+            self.r._mic_guard_step()
+        self.assertEqual(len(self.p.acts("set-sink-volume")), A.SPEAKER_FIX_MAX)
+        self.assertTrue(any("giving up for this call" in l and "speaker" in l for l in self.logs), self.logs)
+
+    def test_a2dp_volume_not_set_to_100_at_end(self):
+        self.p.a2dp_vol = 32768
+        self.p.hfp_spk_vol = 0
+        self.r.prepare(lambda: None)
+        self.r.calls_changed(1)
+        self.r.calls_changed(0)
+        self.assertEqual(self.p.hfp_spk_vol, 65536)
+        self.assertEqual(self.p.a2dp_vol, 32768, "A2DP route stays at the pre-call volume")
+        # restore may write the saved A2DP volume back (same 50%), never 100%
+        a2dp_writes = [c for c in self.p.acts("set-sink-volume")
+                       if c == ("set-sink-volume", SINK, "100%")]
+        # the 100% write is only while HFP is up; after restore, profile is a2dp
+        # and a2dp_vol is 50%
+        self.assertTrue(a2dp_writes)
+        self.assertNotEqual(self.p.a2dp_vol, 65536)
+
+    def test_shared_node_volume_put_back_on_restore(self):
+        """If set-sink-volume could not be route-specific, still don't leave A2DP at 100%."""
+        # Force a shared volume model: both fields are the same object via a side channel
+        self.p.a2dp_vol = 32768
+        self.p.hfp_spk_vol = 0
+        self.r.prepare(lambda: None)
+        self.assertEqual(self.p.hfp_spk_vol, 65536)
+        # simulate a shared node: HFP 100% leaked onto A2DP before restore
+        self.p.a2dp_vol = self.p.hfp_spk_vol
+        self.r.calls_changed(1)
+        self.r.calls_changed(0)
+        self.assertEqual(self.p.a2dp_vol, 32768)
+        self.assertTrue(any("A2DP sink volume put back to 50%" in l for l in self.logs), self.logs)
+
+    def test_muted_or_quiet_pw_play_stream_fixed(self):
+        self.r.prepare(lambda: None)
+        self.r.calls_changed(1)
+        self.p.spawn()
+        play = self.p.stream(self.p.inputs, "pw-play")
+        play["mute"], play["volume"] = True, {"mono": {"value": 0}}
+        self.r._watch_step()
+        self.assertIn(("set-sink-input-mute", "60", "0"), self.p.calls)
+        self.assertIn(("set-sink-input-volume", "60", "100%"), self.p.calls)
+
+    def test_speaker_logs_no_node_names(self):
+        self.p.hfp_spk_vol = 0
+        self.r.prepare(lambda: None)
+        self.p.hfp_spk_vol = 0
+        self.r.calls_changed(1)
+        self.r._mic_guard_step()
+        blob = "\n".join(self.logs)
+        self.assertNotIn(CAR, blob)
+        self.assertNotIn(SINK, blob)
+        self.assertNotIn("bluez_", blob)
+
+    def test_transport_volume_logged_when_present(self):
+        self.p.hfp_spk_vol = 0
+        # inject after SCO is up, via a hook: set on next _sinks by wrapping prepare
+        orig = self.p._sinks
+        def with_vgs():
+            sinks = orig()
+            if self.p.sco_up:
+                sinks[-1]["properties"]["api.bluez5.volume"] = "15"
+            return sinks
+        self.p._sinks = with_vgs
+        self.r.prepare(lambda: None)
+        self.assertTrue(any("transport volume 15" in l for l in self.logs), self.logs)
+
+    def test_speaker_fix_counter_resets_per_call(self):
+        for _ in range(2):
+            self.p.hfp_spk_vol = 0
+            self.r.prepare(lambda: None)
+            self.r.calls_changed(1)
+            self.r.calls_changed(0)
+        # one raise at the start of each call (restore may also write the saved A2DP volume)
+        self.assertEqual(len([l for l in self.logs if "car speaker volume 0% -> 100% (start)" in l]), 2)
 
     def test_unmute_only_when_muted(self):
         self.p.muted[SINK] = False
