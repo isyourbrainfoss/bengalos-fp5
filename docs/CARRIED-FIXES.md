@@ -924,6 +924,18 @@ are absent.
 - **Phone 2026-11-26:** present
 - **Check:** No presence test. Listed so the inventory is complete.
 
+### `fp5-pstore-ramoops`
+
+- **Name:** Pstore ramoops and PM sleep debug in the FP5 kernel
+- **Why:** 1124.3 lost crash logs. Official sc7280 config has PSTORE=y but PSTORE_RAM, PSTORE_CONSOLE, PSTORE_PMSG and PM_DEBUG off, and the ramoops reserved-memory node was not carried (patches 0001–0003, 0005–0007 have no ramoops). A cmdline `pstore.backend=ramoops` cannot create the backend without PSTORE_RAM and a reserved region. Earlier working kernels (s2idle/wdt2/panel3) had 2 MiB at 0xa9000000. Any new FP5 kernel cut from upstream linux-sc7280 plus the functional fragment must also carry this fragment and DT patch.
+- **Branch / commit:** `feat/carried-fixes-guard` (this branch)
+- **Where:** `kernel/config/fp5-pstore-ramoops.config` and `kernel/patches/0008-arm64-dts-qcom-qcm6490-fairphone-fp5-add-ramoops-reg.patch`. Desk UKI `fp5-pstore-20261127` was built 27 Nov 2026 and is not installed.
+- **Upstreamable:** later. Propose the DT node and the pstore/PM debug options with the FP5 / sc7280 kernel. Do not drop them while waiting.
+- **Scope:** on-device (checked by --online, and by --all-scopes). The file checks look at this repo (`--tree` of the checkout). They do not pass on the live 1124.3 phone.
+- **Required:** no, until the pstore UKI (or a later kernel with the same carry) is installed. It is still a must-carry for every new kernel build.
+- **Phone 2026-11-26:** missing (and still missing on 27 Nov 2026)
+- **Check:** The config fragment contains PSTORE_RAM/CONSOLE/PMSG and PM_SLEEP_DEBUG; the DT patch contains ramoops@a9000000 / 2 MiB.
+
 ### `pstore-plain`
 
 - **Name:** pstore plain note

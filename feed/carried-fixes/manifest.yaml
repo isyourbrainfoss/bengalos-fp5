@@ -1153,6 +1153,35 @@ items:
     required: false
     status_on_phone_20261126: present
 
+  - id: fp5-pstore-ramoops
+    name: "Pstore ramoops and PM sleep debug in the FP5 kernel"
+    why: "1124.3 lost crash logs. Official sc7280 config has PSTORE=y but PSTORE_RAM, PSTORE_CONSOLE, PSTORE_PMSG and PM_DEBUG off, and the ramoops DT node was not carried. A cmdline-only pstore.backend=ramoops cannot create the backend. Any new FP5 kernel cut from linux-sc7280 plus the functional fragment must also carry this."
+    branch: "feat/carried-fixes-guard"
+    commit: ""
+    where: "kernel/config/fp5-pstore-ramoops.config and kernel/patches/0008-arm64-dts-qcom-qcm6490-fairphone-fp5-add-ramoops-reg.patch; desk UKI artifacts/fp5-pstore-20261127/ built 27 Nov 2026, not installed"
+    upstreamable: later
+    upstreamable_reason: "The ramoops reserved-memory node (0xa9000000, 2 MiB, no no-map) and the pstore/PM debug fragment can be proposed with the FP5 / sc7280 kernel. Do not drop them while waiting."
+    scope: on-device
+    profiles:
+      - daily
+    required: false
+    status_on_phone_20261126: missing
+    note: "Desk kernel fp5-pstore-20261127 built 27 Nov 2026, not installed. Promote to required once that UKI (or a later one with the same carry) is the daily kernel. Until then the source fragment and DT patch in this repo are the carry. 1124.3 still lacks them."
+    checks:
+      - kind: text
+        path: kernel/config/fp5-pstore-ramoops.config
+        contains:
+          - "CONFIG_PSTORE_RAM=y"
+          - "CONFIG_PSTORE_CONSOLE=y"
+          - "CONFIG_PSTORE_PMSG=y"
+          - "CONFIG_PM_SLEEP_DEBUG=y"
+      - kind: text
+        path: kernel/patches/0008-arm64-dts-qcom-qcm6490-fairphone-fp5-add-ramoops-reg.patch
+        contains:
+          - "ramoops@a9000000"
+          - "0xa9000000"
+          - "0x200000"
+
   - id: pstore-plain
     name: "pstore plain note"
     why: "Listed in AVVIK section 4 as a pointer, not a file this check can see."

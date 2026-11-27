@@ -1,0 +1,51 @@
+From ac44f46d0fc08e7d8b219b71027afa95a62d616c Mon Sep 17 00:00:00 2001
+From: "FP5 bring-up (draft)" <fp5@localhost>
+Date: Mon, 2 Nov 2026 17:16:46 +0100
+Subject: [PATCH 1/4] arm64: dts: qcom: qcm6490-fairphone-fp5: add ramoops
+ region
+
+Reserve 2 MiB at 0xa9000000 for pstore/ramoops so that panics, oopses
+and the tail of the console survive a warm reset. The address and size
+match the Fairphone 5 Android kernel (yupik.dtsi) and sm7325-xiaomi-lisa.
+
+DRAFT for the BengalOS FP5 kernel, not for upstream submission as-is.
+---
+ .../boot/dts/qcom/qcm6490-fairphone-fp5.dts   | 22 +++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/qcm6490-fairphone-fp5.dts b/arch/arm64/boot/dts/qcom/qcm6490-fairphone-fp5.dts
+index c921dbc89..19616b56d 100644
+--- a/arch/arm64/boot/dts/qcom/qcm6490-fairphone-fp5.dts
++++ b/arch/arm64/boot/dts/qcom/qcm6490-fairphone-fp5.dts
+@@ -286,6 +286,28 @@ cdsp_mem: cdsp@88f00000 {
+ 			no-map;
+ 		};
+ 
++		/*
++		 * Same carve-out as the Fairphone 5 Android kernel (downstream
++		 * yupik.dtsi: ramoops@a9000000, 2 MiB, mem-type 2) and other
++		 * sc7280-family phones upstream (sm7325-xiaomi-lisa). Lies in
++		 * DDR bank 0 (0x80000000..0xb96fffff), between wpss_mem (ends
++		 * 0x9c6fffff) and removed_mem (0xc0000000). Not no-map, so the
++		 * cached mapping (mem-type 2) matches the linear map.
++		 *
++		 * 2 MiB = 5 x 256 KiB dump records + 512 KiB console
++		 *       + 256 KiB pmsg (no ftrace zone).
++		 */
++		ramoops@a9000000 {
++			compatible = "ramoops";
++			reg = <0x0 0xa9000000 0x0 0x200000>;
++			record-size = <0x40000>;
++			console-size = <0x80000>;
++			pmsg-size = <0x40000>;
++			ecc-size = <16>;
++			mem-type = <2>;
++			max-reason = <2>; /* KMSG_DUMP_OOPS: panics and oopses */
++		};
++
+ 		removed_mem: removed@c0000000 {
+ 			reg = <0x0 0xc0000000 0x0 0x5100000>;
+ 			no-map;
+-- 
+2.47.3
+
