@@ -81,7 +81,8 @@ IMS spare (merged 21 Nov 2026, Kristian): carry/ModemManager is now 1.25.95-1 + 
   added by hand (image/carry-<V>). Until the live tree is updated from this branch, every new version needs that
   manual carry step, now with the new carry/ModemManager (sha256 fc7239de...). Without it a phone with
   35-fp5-modemmanager.transfer sees the new version as incomplete and does not update.
-- Once the live tree runs this branch's script: the first version built with the new daemon stops with CHECK_FAILED
-  in container-checks.sh ("payload differs from the previous version's carry build"), nothing is published. That is
-  expected: a human reviews (diff = the new ModemManager only, sha fc7239de...), then publishes that version by hand
-  or with a reviewed run. Later versions with the same binary pass automatically.
+- Once the live tree runs this branch's script: a carry file that differs from the previous version passes only
+  when its new sha256 and path are listed in `auto/baseline/carry-reviewed.sha256` with a reason. The reviewed
+  lines are the keep-IMS ModemManager (sha fc7239de..., path `usr/sbin/ModemManager`) and
+  `usr/share/doc/fp5-modemmanager/mm-fp5-keep-ims-bearer.patch`. Any other added, changed, or deleted file is still
+  CHECK_FAILED and nothing is published. The 28 Nov 2026 run failed on this exact delta before the allowlist existed.

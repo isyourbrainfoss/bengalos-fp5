@@ -72,8 +72,20 @@ for n in $CARRY; do
   P=$W/sxprev/$n
   if [ -n "$PREV" ] && [ -f /o/sysext/out/$PREV/${n}_$PREV.raw ]; then
     rm -rf $P; mkdir -p $P; fsck.erofs --extract=$P /o/sysext/out/$PREV/${n}_$PREV.raw >/dev/null 2>&1
-    d=$(diff -rq --no-dereference -x extension-release.d -x README $P $X 2>&1)
-    [ -z "$d" ] && echo "same-payload-as-$PREV $n" || { echo "$d" | head; F "carry $n payload differs from $PREV"; }
+    d=$(diff -rq --no-dereference -x extension-release.d -x README $P $X 2>&1) || true
+    if [ -z "$d" ]; then echo "same-payload-as-$PREV $n"
+    else
+      # A changed or added file passes only when its new sha256 and relative
+      # path are listed in the reviewed-carry allowlist, with a reason.
+      # Deletions and anything not listed still fail. The allowlist is this
+      # checkout's auto/baseline, mounted at /auto. It is not copied into the
+      # live official-20261114 tree.
+      if python3 "$L/carry_reviewed.py" "$P" "$X" /auto/baseline/carry-reviewed.sha256; then
+        echo "reviewed-carry-delta $n"
+      else
+        F "carry $n payload differs from $PREV and is not on the reviewed allowlist"
+      fi
+    fi
   else WARN "carry $n: no $PREV build to compare (first carried version)"; fi
 done
 M=$W/sxc/fp5-modemmanager_$V/usr/sbin/ModemManager

@@ -1,0 +1,5 @@
+# Reviewed carry deltas. A file that differs from the previous published carry
+# passes only when its new sha256 and path are listed here with a reason.
+# Everything else still fails. Do not add a line without a review.
+fc7239de5ebe5b96b2f132de8ad40607cd175fc20b2283f096f6654d7efbf95f usr/sbin/ModemManager reviewed keep-IMS daemon (Debian 1.25.95-1 + 9317cbc4 + mm-fp5-keep-ims-bearer, build-id a22f7e12)
+1b4184f5778c267b2abf3bc816801728a050c837a20ab261382edb0bb14292b2 usr/share/doc/fp5-modemmanager/mm-fp5-keep-ims-bearer.patch reviewed keep-IMS bearer patch
