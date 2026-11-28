@@ -5,6 +5,7 @@
 #   run0 sh install.sh
 #       copies files, writes drop-ins, daemon-reload. Does NOT restart.
 #   run0 sh install.sh --restart-bluetooth
+# On factory-symlink /etc/systemd/user images, use install-home-obex.sh instead.
 #       also restarts bluetooth.service and the user obex service.
 #       Drops the Bluetooth link. Car parked. Not during a call.
 #       Kristian has to ask for this explicitly.

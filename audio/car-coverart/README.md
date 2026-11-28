@@ -21,13 +21,21 @@ drop-ins, `install.sh` and `rollback.sh` to
 Copy that staging directory to the phone. Do not overwrite
 `/usr/libexec/bluetooth/bluetoothd`.
 
+On this image `/etc/systemd/user` is a read-only factory symlink, so
+use `install-home-obex.sh`. It writes the obex drop-in under
+`~/.config/systemd/user/`, which includes `[Install] WantedBy=default.target`,
+and enables the user unit so obexd starts at login.
+
 ```
-run0 sh install.sh
-run0 sh install.sh --restart-bluetooth
+run0 sh install-home-obex.sh
+run0 sh install-home-obex.sh --restart-bluetooth
 ```
 
-The first command only copies files. The second restarts
-`bluetooth.service` and the user `obex` service. The link drops.
+The first command only copies files and enables the user unit. The second
+also restarts `bluetooth.service` and starts `obex.service`. The link drops.
+
+`install.sh` still writes under `/etc/systemd/user` and will fail on this
+image.
 
 ```
 run0 sh /var/lib/fp5-backup/20261120-coverart/rollback.sh --apply
