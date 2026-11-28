@@ -1,0 +1,24 @@
+#!/bin/sh
+# Fake nmcli for 50-fp5-wifi-preferred tests. Scenario file: $FP5_FAKE_SCENARIO
+#   wifi=<mode>   one connected Wi-Fi device whose connection mode is <mode>
+#   wifi2=<mode>  a second connected Wi-Fi device
+#   gsm=connected a connected gsm device qrtr0
+#   modefail=1    mode lookup returns nothing (error)
+S=${FP5_FAKE_SCENARIO:?}
+has(){ grep -q "^$1" "$S"; }
+val(){ sed -n "s/^$1=//p" "$S" | head -1; }
+case "$*" in
+  "-t -f TYPE,STATE,CON-UUID device")
+    has wifi= && echo "wifi:connected:uuid-a"
+    has wifi2= && echo "wifi:connected:uuid-b"
+    has gsm= && echo "gsm:connected:uuid-g" ;;
+  "-t -f DEVICE,TYPE,STATE device")
+    has gsm= && echo "qrtr0:gsm:connected"
+    has wifi= && echo "wlan0:wifi:connected" ;;
+  "-g 802-11-wireless.mode connection show uuid uuid-a")
+    has modefail=1 || val wifi ;;
+  "-g 802-11-wireless.mode connection show uuid uuid-b")
+    has modefail=1 || val wifi2 ;;
+  "-g connection.type connection show uuid uuid-g") echo gsm ;;
+  *) echo "fake-nmcli: unexpected: $*" >&2; exit 1 ;;
+esac

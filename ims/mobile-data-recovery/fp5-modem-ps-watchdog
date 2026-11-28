@@ -1,0 +1,425 @@
+#!/usr/bin/python3
+"""fp5-modem-ps-watchdog: recover a modem that is registered but has no packet service.
+
+Seen 28 Nov 2026 in the car: after a cell change the modem registered "home" but
+the packet service stayed detached (QMI protocol error 'Internal' on every attach,
+rate 1 per 10 s). Only a reboot brought data back. This service power-cycles the
+modem (ModemManager disable, power-state low, power-state on, enable) in exactly
+that situation and in no other.
+
+ACTS only when ALL of these hold:
+  * the modem is registered on the home or a roaming network (3GPP registration
+    state home/roaming) and the modem state is registered/connected/connecting;
+  * mobile data is enabled (NetworkManager WWAN radio on and a gsm profile with
+    autoconnect=yes);
+  * the signal is not poor (quality >= MIN_SIGNAL, if ModemManager reports one);
+  * no call is active or being set up (oFono /imsd and ModemManager voice, and
+    the answer is known);
+  * the system has not just resumed from suspend;
+  * AND either packet service has been "detached" for DETACH_S seconds in a row,
+    or ERR_COUNT attach failures "QMI protocol error (3): 'Internal'" were logged
+    by ModemManager within ERR_WINDOW_S seconds;
+  * rate limit: at least MIN_GAP_S since the last cycle and at most MAX_PER_HOUR
+    cycles in the last 3600 s (the limit survives restarts, state file in
+    /var/lib/fp5-modem-watchdog/).
+It NEVER acts on: no coverage / searching / denied / unknown registration, a
+registered modem whose packet service is attached (including plain 2G or 3G),
+a SIM that needs a PIN, a disabled modem, mobile data switched off by the user,
+airplane mode, or poor signal. Poor coverage therefore does nothing.
+
+Second duty (user-chosen WWAN off): when NetworkManager's WWAN radio is off for
+more than IMS_RELEASE_S seconds and the modem still lists a connected IMS bearer
+(profile-id 2, or apn "ims"), the bearer is disconnected explicitly
+(Bearer.Disconnect, which the keep-IMS ModemManager patch does not spare). With
+the WWAN radio off the modem cannot take calls anyway. Once per WWAN-off episode.
+
+Logs (journal, identifier fp5-modem-ps-watchdog) carry state words only. No
+identifiers, operator codes, cell IDs, numbers or addresses are read or printed.
+No PIN is ever touched. Stdlib only, no D-Bus bindings.
+Test: python3 -m unittest discover -s tests
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CFG = {
+    "POLL_S": 15.0,
+    "DETACH_S": 90.0,
+    "ERR_COUNT": 3,
+    "ERR_WINDOW_S": 120.0,
+    "MIN_SIGNAL": 15,
+    "MIN_GAP_S": 600.0,
+    "MAX_PER_HOUR": 3,
+    "RESUME_GRACE_S": 60.0,
+    "IMS_RELEASE_S": 20.0,
+    "VERIFY_S": 90.0,
+    "DRY_RUN": False,
+    "STATE_DIR": "/var/lib/fp5-modem-watchdog",
+    "MMCLI": "mmcli",
+    "NMCLI": "nmcli",
+    "BUSCTL": "busctl",
+    "JOURNALCTL": "journalctl",
+}
+for _k, _v in list(CFG.items()):
+    _e = os.environ.get("FP5_WD_" + _k)
+    if _e is not None:
+        CFG[_k] = (_e == "1") if isinstance(_v, bool) else type(_v)(_e)
+
+ACT_STATES = ("registered", "connected", "connecting")
+REG_OK = ("home", "roaming")
+INTERNAL_RE = re.compile(r"packet service attach .*failed.*QMI protocol error \(3\): 'Internal'")
+IMS_PROFILE_ID = "2"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def run(args, timeout=20.0):
+    """Run a command. Returns (rc, stdout). rc -1 = timeout or not runnable."""
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return -1, ""
+
+
+# ---------------------------------------------------------------- readers
+
+def parse_k(text):
+    d = {}
+    for line in text.splitlines():
+        k, sep, v = line.partition(":")
+        if sep:
+            d[k.strip()] = v.strip()
+    return d
+
+
+def modem_snapshot():
+    """Dict of state words from `mmcli -K`, or None when there is no modem."""
+    rc, out = run([CFG["MMCLI"], "-m", "any", "-K"])
+    if rc != 0 or not out:
+        return None
+    d = parse_k(out)
+    sig = d.get("modem.generic.signal-quality.value", "--")
+    bearers = []
+    for k, v in d.items():
+        if k.startswith("modem.generic.bearers.value["):
+            bearers.append(v)
+    return {
+        "state": d.get("modem.generic.state", "unknown"),
+        "power": d.get("modem.generic.power-state", "unknown"),
+        "reg": d.get("modem.3gpp.registration-state", "unknown"),
+        "ps": d.get("modem.3gpp.packet-service-state", "unknown"),
+        "signal": int(sig) if sig.isdigit() else None,
+        "bearers": bearers,
+    }
+
+
+def wwan_enabled():
+    rc, out = run([CFG["NMCLI"], "radio", "wwan"], 10)
+    if rc != 0:
+        return None
+    return out.strip() == "enabled"
+
+
+def gsm_autoconnect():
+    rc, out = run([CFG["NMCLI"], "-t", "-f", "TYPE,AUTOCONNECT", "connection", "show"], 10)
+    if rc != 0:
+        return None
+    return any(line.strip() == "gsm:yes" for line in out.splitlines())
+
+
+def data_enabled():
+    """True/False, or None when unknown. Mobile data = WWAN radio on + a gsm profile that autoconnects."""
+    w, a = wwan_enabled(), gsm_autoconnect()
+    if w is None or a is None:
+        return None
+    return bool(w and a)
+
+
+def call_active():
+    """True (a call exists), False (known: none), None (unknown: do not act)."""
+    rc, out = run([CFG["BUSCTL"], "--system", "call", "org.ofono", "/imsd",
+                   "org.ofono.VoiceCallManager", "GetCalls"], 10)
+    if rc == 0:
+        m = re.match(r"a\(oa\{sv\}\)\s+(\d+)", out.strip())
+        if not m:
+            return None
+        if int(m.group(1)) > 0:
+            return True
+    else:
+        # Service or object missing = imsd is not up = no IMS call. Anything else is unknown.
+        if not _ofono_absent():
+            return None
+    rc, out = run([CFG["MMCLI"], "-m", "any", "--voice-list-calls"], 10)
+    if rc != 0 and "No calls were found" not in out:
+        # mmcli prints "No calls were found" on stderr with rc 0 on most builds; rc!=0 = unknown
+        return None
+    return "/Call/" in out
+
+
+def _ofono_absent():
+    rc, out = run([CFG["BUSCTL"], "--system", "status", "org.ofono"], 10)
+    if rc == 0:
+        return False
+    rc2, out2 = run([CFG["BUSCTL"], "--system", "list", "--no-legend"], 10)
+    if rc2 != 0:
+        return False
+    return not any(line.split(None, 1)[:1] == ["org.ofono"] for line in out2.splitlines())
+
+
+def internal_errors(now_wall, window_s):
+    """Number of attach 'Internal' failures ModemManager logged in the last window_s seconds."""
+    rc, out = run([CFG["JOURNALCTL"], "-u", "ModemManager.service", "--no-pager", "-o", "cat",
+                   "--since", "-%d" % int(window_s)], 15)
+    if rc != 0:
+        return 0
+    return sum(1 for line in out.splitlines() if INTERNAL_RE.search(line))
+
+
+def boot_offset():
+    """CLOCK_BOOTTIME - CLOCK_MONOTONIC: grows by the time spent suspended."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
+# ---------------------------------------------------------------- rate limit
+
+class RateLimit:
+    def __init__(self, path, min_gap, per_hour):
+        self.path, self.min_gap, self.per_hour = path, min_gap, per_hour
+        self.times = []
+        try:
+            with open(path) as f:
+                self.times = [float(t) for t in json.load(f).get("cycles", [])]
+        except (OSError, ValueError, AttributeError):
+            self.times = []
+
+    def check(self, now):
+        self.times = [t for t in self.times if now - t < 3600 and t <= now]
+        if self.times and now - self.times[-1] < self.min_gap:
+            return False, "rate-limit: last cycle %ds ago (min %ds)" % (now - self.times[-1], self.min_gap)
+        if len(self.times) >= self.per_hour:
+            return False, "rate-limit: %d cycles in the last hour (max %d)" % (len(self.times), self.per_hour)
+        return True, ""
+
+    def record(self, now):
+        self.times.append(now)
+        try:
+            os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"cycles": self.times[-20:]}, f)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            log("warn: cannot save rate-limit state: %s" % type(e).__name__)
+
+
+# ---------------------------------------------------------------- decision
+
+class Watch:
+    """Pure decision logic. All time is passed in, no I/O."""
+
+    def __init__(self):
+        self.detached_since = None
+        self.wwan_off_since = None
+        self.ims_released = False
+        self.last_skip = None
+        self.resume_until = 0.0
+
+    def resumed(self, mono, grace):
+        self.detached_since = None
+        self.resume_until = mono + grace
+
+    def observe(self, snap, mono, data_on, signal_min):
+        """Update the detached timer. Returns (candidate, why).
+        candidate True = registered (home/roaming) but packet service detached/unknown right now."""
+        if snap is None:
+            self.detached_since = None
+            return False, "no modem"
+        if snap["state"] not in ACT_STATES:
+            self.detached_since = None
+            return False, "modem state %s" % snap["state"]
+        if snap["reg"] not in REG_OK:
+            self.detached_since = None
+            return False, "registration %s (no coverage or not registered: nothing to fix)" % snap["reg"]
+        if snap["ps"] not in ("detached", "unknown"):
+            self.detached_since = None
+            return False, "packet service %s (fine, any technology)" % snap["ps"]
+        if data_on is not True:
+            self.detached_since = None
+            return False, "mobile data %s" % ("off" if data_on is False else "unknown")
+        sig = snap["signal"]
+        if sig is not None and sig < signal_min:
+            self.detached_since = None
+            return False, "poor signal %d%% (< %d%%): not a modem fault" % (sig, signal_min)
+        if mono < self.resume_until:
+            return False, "just resumed from suspend"
+        if snap["ps"] == "detached":
+            if self.detached_since is None:
+                self.detached_since = mono
+        else:
+            self.detached_since = None
+        return True, "registered, packet service %s" % snap["ps"]
+
+    def detached_for(self, mono):
+        return 0.0 if self.detached_since is None else mono - self.detached_since
+
+    def wwan_check(self, snap, wwan, mono, release_s):
+        """True when an IMS bearer should be released now (WWAN off, bearer still up)."""
+        if wwan is not False:
+            self.wwan_off_since = None
+            self.ims_released = False
+            return False
+        if self.wwan_off_since is None:
+            self.wwan_off_since = mono
+        if self.ims_released or snap is None:
+            return False
+        return mono - self.wwan_off_since >= release_s
+
+
+# ---------------------------------------------------------------- actions
+
+def bearer_info(path):
+    rc, out = run([CFG["MMCLI"], "-b", path, "-K"], 15)
+    if rc != 0:
+        return None
+    d = parse_k(out)
+    return {
+        "connected": d.get("bearer.status.connected") == "yes",
+        "ims": d.get("bearer.properties.profile-id") == IMS_PROFILE_ID
+        or d.get("bearer.properties.apn", "").lower() == "ims",
+    }
+
+
+def release_ims(snap):
+    """Disconnect connected IMS bearers explicitly. Returns how many were released."""
+    n = 0
+    for b in snap["bearers"]:
+        info = bearer_info(b)
+        if not info or not (info["ims"] and info["connected"]):
+            continue
+        if CFG["DRY_RUN"]:
+            log("DRY-RUN: would release IMS bearer %s" % b.rsplit("/", 1)[-1])
+            n += 1
+            continue
+        rc, _ = run([CFG["BUSCTL"], "--system", "--timeout=20", "call", "org.freedesktop.ModemManager1", b,
+                     "org.freedesktop.ModemManager1.Bearer", "Disconnect"], 25)
+        log("IMS bearer %s released (rc=%d)" % (b.rsplit("/", 1)[-1], rc))
+        n += 1
+    return n
+
+
+def wait_for(pred, timeout, step=2.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        s = modem_snapshot()
+        if pred(s):
+            return s
+        time.sleep(step)
+    return modem_snapshot()
+
+
+def power_cycle():
+    """ModemManager's own power cycle. SetPowerState only works on a disabled modem."""
+    m = CFG["MMCLI"]
+    rc, _ = run([m, "-m", "any", "--disable"], 60)
+    log("step disable rc=%d" % rc)
+    s = wait_for(lambda s: s is not None and s["state"] == "disabled", 40)
+    if s is not None and s["state"] == "disabled":
+        rc, _ = run([m, "-m", "any", "--set-power-state-low"], 40)
+        log("step power-state-low rc=%d" % rc)
+        time.sleep(3)
+        rc, _ = run([m, "-m", "any", "--set-power-state-on"], 40)
+        log("step power-state-on rc=%d" % rc)
+    else:
+        log("step power-state skipped: modem not disabled (NetworkManager may have re-enabled it)")
+    rc, _ = run([m, "-m", "any", "--enable"], 60)
+    log("step enable rc=%d" % rc)
+    s = wait_for(lambda s: s is not None and s["ps"] == "attached" and s["reg"] in REG_OK, CFG["VERIFY_S"], 3.0)
+    if s is not None and s["ps"] == "attached":
+        log("RECOVERED: packet service attached again after the power cycle")
+        return True
+    log("NOT-RECOVERED: packet service still not attached after %ds. Another cycle only follows within the "
+        "rate limit. A reboot is the known fix." % int(CFG["VERIFY_S"]))
+    return False
+
+
+# ---------------------------------------------------------------- loop
+
+def decide_and_act(w, rl, snap, data_on, now_mono, now_wall):
+    """One poll after observe(). Returns an action word for tests: none, cycle, dry-cycle."""
+    cand, why = w.observe(snap, now_mono, data_on, CFG["MIN_SIGNAL"])
+    if not cand:
+        if why != w.last_skip:
+            log("idle: %s" % why)
+            w.last_skip = why
+        return "none"
+    detached = w.detached_for(now_mono)
+    errs = internal_errors(now_wall, CFG["ERR_WINDOW_S"])
+    trig = None
+    if detached >= CFG["DETACH_S"]:
+        trig = "packet service detached for %ds while registered (%s)" % (detached, snap["reg"])
+    elif errs >= CFG["ERR_COUNT"]:
+        trig = "%d attach failures 'Internal' in %ds while registered (%s)" % (errs, CFG["ERR_WINDOW_S"], snap["reg"])
+    if not trig:
+        return "none"
+    ok, why = rl.check(now_wall)
+    if not ok:
+        key = "rate-limit: " + ("gap" if "last cycle" in why else "hour")
+        if key != w.last_skip:
+            log("SKIP cycle: %s. Trigger was: %s" % (why, trig))
+            w.last_skip = key
+        return "none"
+    c = call_active()
+    if c is not False:
+        if "call" != w.last_skip:
+            log("SKIP cycle: %s. Trigger was: %s" % ("a call is active" if c else "call state unknown", trig))
+            w.last_skip = "call"
+        return "none"
+    log("TRIGGER: %s. Power-cycling the modem (signal %s%%, mobile data on)."
+        % (trig, snap["signal"] if snap["signal"] is not None else "?"))
+    rl.record(now_wall)
+    w.detached_since = None
+    w.last_skip = None
+    if CFG["DRY_RUN"]:
+        log("DRY-RUN: would run mmcli disable, set-power-state-low, set-power-state-on, enable")
+        return "dry-cycle"
+    power_cycle()
+    return "cycle"
+
+
+def main():
+    w = Watch()
+    rl = RateLimit(os.path.join(CFG["STATE_DIR"], "cycles.json"), CFG["MIN_GAP_S"], CFG["MAX_PER_HOUR"])
+    log("started: detach %ds, errors %d/%ds, min signal %d%%, min gap %ds, max %d/h, dry-run=%s"
+        % (CFG["DETACH_S"], CFG["ERR_COUNT"], CFG["ERR_WINDOW_S"], CFG["MIN_SIGNAL"], CFG["MIN_GAP_S"],
+           CFG["MAX_PER_HOUR"], CFG["DRY_RUN"]))
+    off = boot_offset()
+    while True:
+        time.sleep(CFG["POLL_S"])
+        try:
+            now_off = boot_offset()
+            mono = time.monotonic()
+            if now_off - off > 5.0:
+                w.resumed(mono, CFG["RESUME_GRACE_S"])
+                log("resume from suspend detected: timers reset, %ds grace" % CFG["RESUME_GRACE_S"])
+            off = now_off
+            snap = modem_snapshot()
+            wwan = wwan_enabled()
+            if w.wwan_check(snap, wwan, mono, CFG["IMS_RELEASE_S"]):
+                w.ims_released = True
+                if snap is not None and snap["state"] != "disabled":
+                    n = release_ims(snap)
+                    log("WWAN off for %ds: %d IMS bearer(s) released" % (CFG["IMS_RELEASE_S"], n))
+            data_on = data_enabled() if (snap and snap["ps"] != "attached") else None
+            decide_and_act(w, rl, snap, data_on, mono, time.time())
+        except Exception as e:  # never die on a bad poll
+            log("poll error: %s" % type(e).__name__)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,25 @@
+[Unit]
+Description=FP5 modem watchdog: registered but no packet service for 90 s -> modem power cycle (rate limited)
+Documentation=https://github.com/isyourbrainfoss/bengalos-fp5 (ims/mobile-data-recovery, docs/AVVIK.md)
+After=ModemManager.service NetworkManager.service
+ConditionPathExists=/var/lib/fp5-oot/modem-watchdog/fp5-modem-ps-watchdog
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /var/lib/fp5-oot/modem-watchdog/fp5-modem-ps-watchdog
+SyslogIdentifier=fp5-modem-ps-watchdog
+StateDirectory=fp5-modem-watchdog
+StateDirectoryMode=0700
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=30
+Nice=10
+MemoryMax=64M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

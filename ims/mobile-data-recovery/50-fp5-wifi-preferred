@@ -1,0 +1,65 @@
+#!/bin/sh
+# FP5 BengalOS deviation (Kristian, 2026-11-15): Android-like "Wi-Fi preferred".
+# Mobile data stays connected (the toggle never switches itself off), but it is
+# not used for traffic while Wi-Fi is connected:
+#  - static part (gsm profiles + /etc/NetworkManager/conf.d/50-fp5-wifi-preferred.conf):
+#    gsm ipv4/ipv6.route-metric=2000 (Wi-Fi default 600) and
+#    ipv4/ipv6.dns-priority=200 (Wi-Fi default 100), so Wi-Fi wins routes and DNS.
+#  - this script: an IPv4-only Wi-Fi has no IPv6 default route, so IPv6 would
+#    still leave over cellular. While any Wi-Fi *client* connection is up, the
+#    active gsm device gets ipv6.never-default=yes at runtime (nmcli device
+#    modify, never touches the saved profile); it is set back to "no" when
+#    Wi-Fi goes away. A fresh gsm activation starts from the profile value (no).
+# 2026-11-28 change: a Wi-Fi device that runs an access point / hotspot
+#    (802-11-wireless.mode=ap, e.g. the car hotspot) is NOT a Wi-Fi uplink. It
+#    used to count as "Wi-Fi connected", which switched the mobile IPv6 default
+#    route off while the hotspot was the only thing up. Lookup errors keep the
+#    old behaviour (count it as Wi-Fi).
+# IMS/VoLTE (imsd's own mux and P-CSCF host route) is not touched.
+# Undo: delete this file and the conf.d snippet, reset the gsm profile values.
+# Docs: docs/FP5-CUSTOMIZATIONS.md and docs/AVVIK.md in bengalos-fp5.
+# Test: FP5_DRY_RUN=1 FP5_NMCLI=/path/fake-nmcli FP5_STATE=/tmp/x <script> wlan0 up
+ACTION="$2"
+NMCLI="${FP5_NMCLI:-nmcli}"
+STATE="${FP5_STATE:-/run/fp5-wifi-preferred}"
+DRY="${FP5_DRY_RUN:-0}"
+TAG=fp5-wifi-mobile
+log(){ if [ "$DRY" = 1 ]; then echo "LOG: $*"; else logger -t "$TAG" "$*"; fi; }
+run(){ if [ "$DRY" = 1 ]; then echo "RUN: $*"; else "$@" >/dev/null 2>&1; fi; }
+
+case "$ACTION" in up|down|connectivity-change) ;; *) exit 0 ;; esac
+mkdir -p "$STATE"
+
+# A gsm (re)activation or deactivation resets runtime settings: forget our state.
+if [ -n "$CONNECTION_UUID" ] && [ -n "$DEVICE_IFACE" ] && \
+   [ "$("$NMCLI" -g connection.type connection show uuid "$CONNECTION_UUID" 2>/dev/null)" = gsm ]; then
+  rm -f "$STATE/$DEVICE_IFACE"
+fi
+
+# Is a Wi-Fi *client* connection up? Access-point mode (hotspot) does not count.
+wifi_client_up() {
+  "$NMCLI" -t -f TYPE,STATE,CON-UUID device 2>/dev/null | \
+    awk -F: '$1=="wifi" && $2=="connected"{print $3}' | while IFS= read -r u; do
+    mode=$("$NMCLI" -g 802-11-wireless.mode connection show uuid "$u" 2>/dev/null)
+    case "$mode" in ap) continue ;; esac
+    echo yes
+    break
+  done | grep -q yes
+}
+
+want=no
+wifi_client_up && want=yes
+
+"$NMCLI" -t -f DEVICE,TYPE,STATE device 2>/dev/null | \
+  awk -F: '$2=="gsm" && $3=="connected"{print $1}' | while IFS= read -r dev; do
+  [ -n "$dev" ] || continue
+  cur=$(cat "$STATE/$dev" 2>/dev/null || echo no)
+  [ "$cur" = "$want" ] && continue
+  if run "$NMCLI" --wait 15 device modify "$dev" ipv6.never-default "$want"; then
+    printf '%s\n' "$want" > "$STATE/$dev"
+    log "Wi-Fi connected=$want: mobile IPv6 default route $( [ "$want" = yes ] && echo off || echo on )"
+  else
+    log "device modify failed (want ipv6.never-default=$want)"
+  fi
+done
+exit 0
