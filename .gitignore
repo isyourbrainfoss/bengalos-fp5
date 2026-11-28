@@ -1,2 +1,5 @@
 feed/auto/lab-patterns.local
 feed/auto/work/
+
+__pycache__/
+*.pyc
