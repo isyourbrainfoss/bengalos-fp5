@@ -507,31 +507,22 @@ items:
     why: "The Tesla only shows album/audiobook art over AVRCP BIP. Debian bluez 5.88 has no cover-art server, so the car got no cover."
     branch: "feat/car-coverart"
     commit: "a0d929b"
-    where: "/var/lib/fp5-oot/coverart/{bluetoothd,obexd (selector),obexd-<VERSION_ID>,fp5-coverart-prepare}; /etc/systemd/system/bluetooth.service.d/fp5-coverart.conf; ${HOME}/.config/systemd/user/obex.service.d/fp5-coverart.conf"
+    where: "/var/lib/fp5-oot/coverart/{bluetoothd,obexd,fp5-coverart-prepare}; /etc/systemd/system/bluetooth.service.d/fp5-coverart.conf; ${HOME}/.config/systemd/user/obex.service.d/fp5-coverart.conf"
     upstreamable: later
     upstreamable_reason: "BlueZ cover-art patches 0001/0002 on bluez 5.88-1. Upstream BIP server work is not merged."
     scope: on-device
     required: true
     status_on_phone_20261126: present
-    note: "Lives in /var, /etc and the home, so a usr/A-B update keeps it. The OOT daemons link against the image's glib/dbus/udev: symbol-check them against every new usr. obexd links libebook/libedataserver, whose sonames moved in 0.26.1127.1 (.so.4/.27 -> .so.5/.28), so obexd is now per image: /var/lib/fp5-oot/coverart/obexd is a selector script that execs obexd-$VERSION_ID and falls back to stock obexd (no art) if that build is missing. Known builds: obexd-0.26.1124.3 = 9c407eef3275ae93c3014ebc0c6f14b1b80c5fbca9f50756cfbfc25302c5de44. 28 Nov: user obex.service has no WantedBy (D-Bus activation only), so after a boot nothing starts obexd, the cover-art PSM is not registered, and the car gets no art. The active-or-wanted check catches that."
+    note: "Lives in /var, /etc and the home, so a usr/A-B update keeps it. The OOT daemons link against the image's glib/dbus/udev: symbol-check them against every new usr. 28 Nov 10:51 (Kristian t1123u): user drop-in gained [Install] WantedBy=default.target (sha f73b0b5e…); systemctl --user enable --now obex.service. After a login, obexd should start and register Imaging Responder. The active-or-wanted check fails if that is missing. 0.26.1127.1 moves libebook/libedataserver sonames (.so.4/.27 -> .so.5/.28), so this 20 Nov obexd (9c407eef…) will not start there; a per-image rebuild (or selector + obexd-$VERSION_ID) is required before that image is installed, and is not on the phone yet."
     checks:
       - kind: exists
         path: /var/lib/fp5-oot/coverart/bluetoothd
         executable: true
         sha256: "7d87d63745eab16af8a5302896782b58f6ed9f610be3ec7798e09149d6da495c"
-      - kind: text
+      - kind: exists
         path: /var/lib/fp5-oot/coverart/obexd
         executable: true
-        contains:
-          - "obexd-$V"
-          - "/usr/libexec/bluetooth/obexd"
-      - kind: exists
-        path: /var/lib/fp5-oot/coverart/obexd-${VERSION_ID}
-        executable: true
-      - kind: bytes
-        path: /var/lib/fp5-oot/coverart/obexd-${VERSION_ID}
-        contains:
-          - "AVRCP Cover Art server"
+        sha256: "9c407eef3275ae93c3014ebc0c6f14b1b80c5fbca9f50756cfbfc25302c5de44"
       - kind: exists
         path: /var/lib/fp5-oot/coverart/fp5-coverart-prepare
         executable: true
@@ -546,7 +537,8 @@ items:
         contains:
           - "ExecStart=/var/lib/fp5-oot/coverart/obexd"
           - "FP5_COVERART_PREPARE=/var/lib/fp5-oot/coverart/fp5-coverart-prepare"
-        sha256: "3754bac64cbf5849c633f167550de7ff7e9b1a942ff4d0ea3a853924795daafb"
+          - "WantedBy=default.target"
+        sha256: "f73b0b5e54b79274c2fcdf73ea9b3fbfa1bfc627c17614f8189d9029fe113856"
       - kind: unit
         name: obex.service
         user: true
