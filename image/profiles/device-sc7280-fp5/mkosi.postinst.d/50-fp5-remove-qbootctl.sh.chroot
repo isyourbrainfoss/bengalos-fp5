@@ -56,4 +56,26 @@ if ! grep -q 'isyourbrainfoss/bengalos-fp5' /usr/lib/sysupdate.d/20-uki.transfer
     echo "FP5 sysupdate feed was not installed" >&2
     exit 1
 fi
+# The usr image must be able to fetch the next FP5 release without /etc overrides.
+for f in 10-usr-verity-sig.transfer 11-usr-verity.transfer 12-usr.transfer \
+         35-fp5-modemmanager.transfer 36-fp5-frunk-qs.transfer \
+         37-fp5-phoc.transfer 38-fp5-phosh.transfer 39-fp5-gnome-calls.transfer \
+         waydroid.transfer; do
+    if ! grep -q 'isyourbrainfoss/bengalos-fp5' "/usr/lib/sysupdate.d/$f"; then
+        echo "FP5 sysupdate file $f was not installed" >&2
+        exit 1
+    fi
+    if ! grep -q '^Verify=no' "/usr/lib/sysupdate.d/$f"; then
+        echo "FP5 sysupdate file $f is missing Verify=no" >&2
+        exit 1
+    fi
+done
+if ! grep -q '^Features=waydroid' /usr/lib/sysupdate.d/waydroid.transfer; then
+    echo "waydroid.transfer lost Features=waydroid" >&2
+    exit 1
+fi
+if [ -e /usr/lib/sysupdate.d/30-fp5-volte-modules.transfer ]; then
+    echo "30-fp5-volte-modules.transfer must not be in this image" >&2
+    exit 1
+fi
 dpkg --audit

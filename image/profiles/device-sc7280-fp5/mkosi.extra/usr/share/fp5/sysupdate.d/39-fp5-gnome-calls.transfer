@@ -1,0 +1,17 @@
+# FP5 add-on: fp5-gnome-calls (GNOME Calls with the prefer-IMS origin carry). Not feature-gated.
+# The phone needs this sysext for every usr version, so sysupdate only offers versions the FP5 feed has.
+[Transfer]
+ProtectVersion=%A
+Verify=no
+
+[Source]
+Type=url-file
+Path=https://github.com/isyourbrainfoss/bengalos-fp5/releases/download/fp5-feed/
+MatchPattern=fp5-gnome-calls_@v.raw.xz
+
+[Target]
+Type=regular-file
+Path=/var/lib/extensions
+MatchPattern=fp5-gnome-calls_@v.raw
+Mode=0444
+InstancesMax=2

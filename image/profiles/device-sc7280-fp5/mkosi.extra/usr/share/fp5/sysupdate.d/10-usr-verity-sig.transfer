@@ -1,0 +1,18 @@
+# FP5 override of the official usr-verity-sig transfer. Same Target as upstream.
+# Source is the FP5 feed. Verify=no matches the other FP5 transfers (HTTPS only).
+[Transfer]
+ProtectVersion=%A
+Verify=no
+
+[Source]
+Type=url-file
+Path=https://github.com/isyourbrainfoss/bengalos-fp5/releases/download/fp5-feed/
+MatchPattern=%M_@v.usr-verity-sig.raw.xz
+
+[Target]
+Type=partition
+Path=auto
+MatchPattern=%M-@v-vs
+MatchPartitionType=usr-verity-sig
+PartitionFlags=0
+ReadOnly=1

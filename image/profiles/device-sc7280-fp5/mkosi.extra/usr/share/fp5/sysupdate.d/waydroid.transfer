@@ -1,0 +1,19 @@
+# FP5 override of the official waydroid sysext transfer.
+# Features=waydroid stays, so /etc/sysupdate.d/waydroid.feature.d/50-enable.conf still gates it.
+# The asset is this image's BengalOS-waydroid-sysext, published on the FP5 feed.
+[Transfer]
+Features=waydroid
+ProtectVersion=%A
+Verify=no
+
+[Source]
+Type=url-file
+Path=https://github.com/isyourbrainfoss/bengalos-fp5/releases/download/fp5-feed/
+MatchPattern=%M-waydroid-sysext_@v.raw.xz
+
+[Target]
+Type=regular-file
+Path=/var/lib/extensions
+MatchPattern=%M-waydroid-sysext_@v.raw
+Mode=0444
+InstancesMax=2
