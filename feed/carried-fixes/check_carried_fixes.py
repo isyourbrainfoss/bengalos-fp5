@@ -514,7 +514,27 @@ class Ctx:
         self.raw_note = raw_note  # error string, or None if base is usable
 
 
+def running_version(ctx):
+    """VERSION_ID for ${VERSION_ID} paths: --version, else os-release under the root."""
+    if ctx.version:
+        return ctx.version
+    for rel in ("usr/lib/os-release", "etc/os-release"):
+        p = under_root(ctx.system_root, "/" + rel)
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                if line.startswith("VERSION_ID="):
+                    return line.split("=", 1)[1].strip().strip('"')
+        except OSError:
+            continue
+    return None
+
+
 def locate(ctx, path):
+    if "${VERSION_ID}" in path:
+        v = running_version(ctx)
+        if not v:
+            return None
+        path = path.replace("${VERSION_ID}", v)
     path = expand_path(path, ctx.home)
     if path.startswith("/"):
         return under_root(ctx.system_root, path)

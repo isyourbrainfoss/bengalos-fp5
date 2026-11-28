@@ -321,4 +321,39 @@ set -e
 echo "$out" | grep -q 'expected' || fail "sha mismatch not reported: $out"
 say "exact sha256 fails on a changed binary; obex must be active or wanted"
 
+# --- ${VERSION_ID} paths follow os-release under the root ---
+V="$TMP/ver"; mkdir -p "$V/usr/lib" "$V/var/lib/y"
+printf 'ID=bengalos\nVERSION_ID=0.26.1127.1\n' > "$V/usr/lib/os-release"
+cat > "$TMP/ver.yaml" << 'EOF'
+schema: 1
+items:
+  - id: ver-test
+    name: "ver"
+    why: "test"
+    where: "test"
+    upstreamable: no
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: bytes
+        path: /var/lib/y/obexd-${VERSION_ID}
+        contains:
+          - "AVRCP Cover Art server"
+EOF
+set +e
+out=$("$CHECK" --manifest "$TMP/ver.yaml" --tree "$V" --all-scopes --root "$V")
+rc=$?
+set -e
+[ "$rc" = 1 ] || fail "missing per-version obexd passed: $out"
+printf 'x AVRCP Cover Art server x\n' > "$V/var/lib/y/obexd-0.26.1124.3"
+set +e
+"$CHECK" --manifest "$TMP/ver.yaml" --tree "$V" --all-scopes --root "$V" >/dev/null
+rc=$?
+set -e
+[ "$rc" = 1 ] || fail "an obexd for another version satisfied the running version"
+cp "$V/var/lib/y/obexd-0.26.1124.3" "$V/var/lib/y/obexd-0.26.1127.1"
+out=$("$CHECK" --manifest "$TMP/ver.yaml" --tree "$V" --all-scopes --root "$V") || fail "per-version obexd failed: $out"
+say "\${VERSION_ID} paths follow the running image"
+
 echo "ALL TESTS PASSED"
