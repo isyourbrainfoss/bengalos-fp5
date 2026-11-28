@@ -10,3 +10,8 @@ f73b0b5e54b79274c2fcdf73ea9b3fbfa1bfc627c17614f8189d9029fe113856  fp5-coverart-o
 612b4054e3bf5c8d1bbb3951065335ca9447ca2420a0b49567a18473ff3603e0  rollback.sh
 1f7bf07d9a75aae49529a77b0675492bf3b55f78092e424539bf4ee9e0ec8d15  install-home-obex.sh
 105b37ab34335863c6bcae6051991d10c9dcaaedaf5ae3fa7b023e672c69dc73  rollback-home-obex.sh
+# 28 Nov 2026, forky rebuild for BengalOS 0.26.1127.1 (libebook-contacts .so.5, libedataserver .so.28).
+# bluetoothd and fp5-coverart-prepare rebuilt byte-identical to the 20 Nov build.
+# Installed as /var/lib/fp5-oot/coverart/obexd-0.26.1127.1; /var/lib/fp5-oot/coverart/obexd is obexd-selector.
+090e06f5efc55b51d0eb7c1199116812e608f21ecc59736acc38a5b4f7fc446a  obexd-0.26.1127.1
+e674c4c370dd99b095a2a7c4dcb17a853cbd45b81b31ad36217e9c0ec54228b1  obexd-selector

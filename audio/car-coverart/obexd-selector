@@ -1,0 +1,12 @@
+#!/bin/sh
+# FP5 cover art: obexd selector (installed as /var/lib/fp5-oot/coverart/obexd).
+# obexd links libebook/libedataserver, whose sonames change between images,
+# so each image gets its own build: obexd-$VERSION_ID. Without one, run the
+# stock obexd (obex/PBAP keep working, no cover art). See docs/CARRIED-FIXES.md.
+D=/var/lib/fp5-oot/coverart
+V=$(sed -n 's/^VERSION_ID=//p' /usr/lib/os-release | tr -d '"')
+if [ -n "$V" ] && [ -x "$D/obexd-$V" ]; then
+	exec "$D/obexd-$V" "$@"
+fi
+echo "fp5-coverart: no obexd-$V, starting stock obexd without cover art" >&2
+exec /usr/libexec/bluetooth/obexd "$@"
