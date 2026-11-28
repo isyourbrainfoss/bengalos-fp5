@@ -1195,6 +1195,57 @@ items:
     required: false
     status_on_phone_20261126: present
 
+  - id: wifi-preferred
+    name: "Wi-Fi preferred over mobile data, hotspot (AP mode) is not an uplink"
+    why: "Android-like Wi-Fi preference without turning mobile data off (15 Nov). 28 Nov: the car hotspot counted as Wi-Fi and switched the mobile IPv6 default route off."
+    branch: "fix/mobile-data-recovery"
+    commit: "b199381"
+    where: "/etc/NetworkManager/dispatcher.d/50-fp5-wifi-preferred and /etc/NetworkManager/conf.d/50-fp5-wifi-preferred.conf (gsm route-metric 2000, dns-priority 200)"
+    upstreamable: no
+    upstreamable_reason: "Local policy."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    note: "Lives in /etc, so an A/B usr update keeps it. The new marker wifi_client_up is the AP-mode fix (installed only after Kristian's 'nå'; until then the 15 Nov script is live and this check fails by design)."
+    checks:
+      - kind: text
+        path: /etc/NetworkManager/dispatcher.d/50-fp5-wifi-preferred
+        contains:
+          - "wifi_client_up"
+          - "802-11-wireless.mode"
+        sha256: "7032edacd1252953d06336548e1dd69711575a50dd4d4ba83bcdcf72c39f7f11"
+      - kind: text
+        path: /etc/NetworkManager/conf.d/50-fp5-wifi-preferred.conf
+        contains:
+          - "ipv4.route-metric=2000"
+          - "ipv6.route-metric=2000"
+
+  - id: modem-ps-watchdog
+    name: "Modem packet-service watchdog (+ IMS release when WWAN is turned off)"
+    why: "28 Nov: modem registered home but packet service stayed detached (QMI Internal on attach), no data until reboot. Power-cycles the modem only in that state, never on poor coverage."
+    branch: "fix/mobile-data-recovery"
+    commit: "b199381"
+    where: "/var/lib/fp5-oot/modem-watchdog/fp5-modem-ps-watchdog and /etc/systemd/system/fp5-modem-ps-watchdog.service"
+    upstreamable: later
+    upstreamable_reason: "Workaround for a modem/firmware attach fault. Drop it if the root cause is fixed upstream or in firmware."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: missing
+    note: "Lives in /var and /etc, so an A/B usr update keeps it. Rate limit state is /var/lib/fp5-modem-watchdog/cycles.json."
+    checks:
+      - kind: exists
+        path: /var/lib/fp5-oot/modem-watchdog/fp5-modem-ps-watchdog
+        executable: true
+        sha256: "86d3f89ed7ac0661bd6d8f267b0e11d4d45a99797d00ce7e9b0f82c497838d1f"
+      - kind: text
+        path: /etc/systemd/system/fp5-modem-ps-watchdog.service
+        contains:
+          - "ExecStart=/usr/bin/python3 /var/lib/fp5-oot/modem-watchdog/fp5-modem-ps-watchdog"
+        sha256: "e3c13e0b98fc3013875bf6e9fb7782f8e531ab976f62aebd4c6afe465bd52257"
+      - kind: unit
+        name: fp5-modem-ps-watchdog.service
+        state: enabled
+
   - id: fp5-pstore-ramoops
     name: "Pstore ramoops and PM sleep debug in the FP5 kernel"
     why: "1124.3 lost crash logs. Official sc7280 config has PSTORE=y but PSTORE_RAM, PSTORE_CONSOLE, PSTORE_PMSG and PM_DEBUG off, and the ramoops DT node was not carried. A cmdline-only pstore.backend=ramoops cannot create the backend. Any new FP5 kernel cut from linux-sc7280 plus the functional fragment must also carry this."

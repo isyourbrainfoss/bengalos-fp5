@@ -72,14 +72,14 @@ phosh, and gnome-calls are printed as `SKIP` on that profile. Forgetting
 
 ## Counts
 
-68 items, 42 required.
+70 items, 44 required.
 
 | Scope | Items | Required |
 |---|---:|---:|
 | sysext | 10 | 9 |
 | image | 2 | 1 |
 | version-conditional | 1 | 1 |
-| on-device | 55 | 31 |
+| on-device | 57 | 33 |
 
 ## Phone on 26 Nov 2026
 
@@ -937,6 +937,32 @@ are absent.
 - **Required:** no
 - **Phone 2026-11-26:** present
 - **Check:** No presence test. Listed so the inventory is complete.
+
+### `wifi-preferred`
+
+- **Name:** Wi-Fi preferred over mobile data, hotspot (AP mode) is not an uplink
+- **Why:** Android-like Wi-Fi preference without turning mobile data off (15 Nov). 28 Nov: the car hotspot counted as Wi-Fi and switched the mobile IPv6 default route off.
+- **Branch / commit:** `fix/mobile-data-recovery` `b199381`
+- **Where:** `/etc/NetworkManager/dispatcher.d/50-fp5-wifi-preferred` and `/etc/NetworkManager/conf.d/50-fp5-wifi-preferred.conf`
+- **Upstreamable:** no. Local policy.
+- **Scope:** on-device (checked by --online, and by --all-scopes)
+- **Required:** yes
+- **Phone 2026-11-26:** present
+- **Check:** (1) The dispatcher contains `wifi_client_up` and `802-11-wireless.mode`, exact sha256 `7032edac…7f11`. (2) The conf.d snippet contains both `route-metric=2000` lines.
+- **Note:** Lives in `/etc`. The AP-mode fix is installed only after Kristian's «nå». Until then the 15 Nov script is live and check (1) fails by design.
+
+### `modem-ps-watchdog`
+
+- **Name:** Modem packet-service watchdog (+ IMS release when WWAN is turned off)
+- **Why:** 28 Nov: modem registered home but packet service stayed detached (QMI Internal on attach), no data until reboot. Power-cycles the modem only in that state, never on poor coverage.
+- **Branch / commit:** `fix/mobile-data-recovery` `b199381`
+- **Where:** `/var/lib/fp5-oot/modem-watchdog/fp5-modem-ps-watchdog` and `/etc/systemd/system/fp5-modem-ps-watchdog.service`
+- **Upstreamable:** later. Drop it if the root cause is fixed upstream or in firmware.
+- **Scope:** on-device (checked by --online, and by --all-scopes)
+- **Required:** yes
+- **Phone 2026-11-26:** missing (not installed until «nå»)
+- **Check:** (1) The script is executable with exact sha256 `86d3f89e…8d1f`. (2) The unit contains the `ExecStart` for that path, exact sha256 `e3c13e0b…2257`. (3) The system unit is enabled.
+- **Note:** Lives in `/var` and `/etc`, so an A/B usr update keeps it. Rate limit state: `/var/lib/fp5-modem-watchdog/cycles.json`.
 
 ### `fp5-pstore-ramoops`
 
