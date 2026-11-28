@@ -936,6 +936,18 @@ are absent.
 - **Phone 2026-11-26:** missing (and still missing on 27 Nov 2026)
 - **Check:** The config fragment contains PSTORE_RAM/CONSOLE/PMSG and PM_SLEEP_DEBUG; the DT patch contains ramoops@a9000000 / 2 MiB.
 
+### `fp5-pstore-ramoops-image`
+
+- **Name:** Built UKI carries ramoops, the pstore cmdline, and no oops=panic
+- **Why:** The source fragment is not enough. The image that will be installed must have PSTORE_RAM in the kernel, the FP5 DTB ramoops node at 0xa9000000 (2 MiB), and a default cmdline of `pstore.backend=ramoops panic=10 mem_sleep_default=s2idle`. `oops=panic` is forbidden. ramoops `max-reason` 2 is `KMSG_DUMP_OOPS`, so oopses are still recorded. The default profile must not carry `no_console_suspend`, `pm_debug_messages`, or `loglevel=8`.
+- **Branch / commit:** `feat/fp5-1127.1-pstore`
+- **Where:** UKI `.cmdline` (the first one, which is the default profile), `.dtbauto`, and `.linux` IKCFG or the modules config
+- **Upstreamable:** later. Same carry as `fp5-pstore-ramoops`, checked on the built UKI.
+- **Scope:** image (profiles: daily). Needs `--uki`. Without it the check is skipped out loud, so a sysext-only run stays green.
+- **Required:** yes
+- **Phone 2026-11-26:** missing
+- **Check:** Pass `--uki` (and `--tree` of the extracted usr when you have one). The default cmdline has the three tokens and not the forbidden ones. One `.dtbauto` contains `ramoops@a9000000` and the reg cells for 0xa9000000 size 0x200000. The kernel config has PSTORE_RAM/CONSOLE/PMSG, PM_DEBUG, PM_SLEEP_DEBUG, REED_SOLOMON, and EFI_VARS_PSTORE_DEFAULT_DISABLE built in.
+
 ### `pstore-plain`
 
 - **Name:** pstore plain note

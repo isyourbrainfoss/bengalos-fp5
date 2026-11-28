@@ -12,12 +12,14 @@ Exit 2 on usage or a broken manifest.
 
 import argparse
 import errno
+import gzip
 import hashlib
 import json
 import os
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -226,7 +228,7 @@ def load_manifest(path):
         # (a kernel patch that was never built, a unit inside another sysext)
         # may omit it; they are not fail-closed.
         if (item["required"] and item["scope"] in ("sysext", "image", "version-conditional")
-                and not item.get("sysext")):
+                and not item.get("sysext") and not item.get("needs_uki")):
             raise ManifestError(f"{iid}: needs sysext name")
     return data
 
@@ -504,7 +506,7 @@ def gsettings_get(schema, key, system_root):
 
 
 class Ctx:
-    def __init__(self, mode, base, system_root, version, kernel_uname, home, raw_note):
+    def __init__(self, mode, base, system_root, version, kernel_uname, home, raw_note, uki=None):
         self.mode = mode
         self.base = base
         self.system_root = system_root
@@ -512,6 +514,8 @@ class Ctx:
         self.kernel_uname = kernel_uname
         self.home = home
         self.raw_note = raw_note  # error string, or None if base is usable
+        self.uki = Path(uki) if uki else None
+        self._uki_sections = None
 
 
 def locate(ctx, path):
@@ -776,6 +780,172 @@ def check_gsettings(check, ctx):
     return "ok", "", None
 
 
+def pe_sections(data):
+    """Return (name, bytes) for each PE section. Name is the 8-byte header name."""
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        raise ValueError("not a PE")
+    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    if e_lfanew + 24 > len(data) or data[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+        raise ValueError("no PE signature")
+    coff = e_lfanew + 4
+    nsec = struct.unpack_from("<H", data, coff + 2)[0]
+    size_opt = struct.unpack_from("<H", data, coff + 16)[0]
+    sec_off = coff + 20 + size_opt
+    out = []
+    for i in range(nsec):
+        off = sec_off + i * 40
+        if off + 40 > len(data):
+            raise ValueError("section table truncated")
+        name = data[off:off + 8].split(b"\0", 1)[0].decode("ascii", "replace")
+        _vsize, _va, rawsize, rawptr = struct.unpack_from("<IIII", data, off + 8)
+        if rawptr + rawsize > len(data):
+            raise ValueError(f"section {name} exceeds the file")
+        out.append((name, data[rawptr:rawptr + rawsize]))
+    return out
+
+
+def zstd_decompress(payload):
+    try:
+        import zstandard
+    except ImportError:
+        zstandard = None
+    if zstandard is not None:
+        return zstandard.ZstdDecompressor().decompress(payload)
+    r = subprocess.run(["zstd", "-dc"], input=payload, capture_output=True)
+    if r.returncode != 0:
+        raise ValueError("zstd decompress failed")
+    return r.stdout
+
+
+def decompress_kernel(blob):
+    """EFI zboot (gzip or zstd) or a bare gzip Image. Otherwise the bytes as-is."""
+    if len(blob) >= 28 and blob[:4] == b"MZ\x00\x00" and blob[4:8] == b"zimg":
+        off, size = struct.unpack_from("<II", blob, 8)
+        comp = blob[24:blob.find(b"\0", 24)].decode("ascii", "replace")
+        payload = blob[off:off + size]
+        if comp == "gzip":
+            return gzip.decompress(payload)
+        if comp == "zstd":
+            return zstd_decompress(payload)
+        raise ValueError(f"zboot compression {comp}")
+    if blob[:2] == b"\x1f\x8b":
+        return gzip.decompress(blob)
+    return blob
+
+
+def ikconfig_text(blob):
+    raw = decompress_kernel(blob)
+    start = raw.find(b"IKCFG_ST")
+    if start < 0:
+        return None
+    end = raw.find(b"IKCFG_ED", start + 8)
+    if end < 0:
+        return None
+    return gzip.decompress(raw[start + 8:end]).decode("utf-8", "replace")
+
+
+def uki_sections(ctx):
+    if ctx._uki_sections is not None:
+        return ctx._uki_sections, None
+    if ctx.uki is None:
+        return None, "uki not given"
+    data, err = read_bytes(ctx.uki)
+    if err or data is None:
+        return None, err or f"cannot read {ctx.uki}"
+    try:
+        secs = pe_sections(data)
+    except ValueError as e:
+        return None, f"{ctx.uki} is not a PE UKI ({e})"
+    ctx._uki_sections = secs
+    return secs, None
+
+
+def check_uki_cmdline(check, ctx):
+    secs, err = uki_sections(ctx)
+    if err:
+        return "missing", err, None
+    blobs = [b for name, b in secs if name == ".cmdline"]
+    if not blobs:
+        return "missing", "UKI has no .cmdline section", None
+    # The first .cmdline is the default profile. A later debug profile must not count.
+    text = blobs[0].split(b"\0", 1)[0].decode("utf-8", "replace")
+    tokens = text.split()
+    for needle in [str(x) for x in (check.get("contains") or [])]:
+        if needle not in tokens:
+            return "missing", f"default cmdline lacks {needle!r}", None
+    for needle in [str(x) for x in (check.get("absent") or [])]:
+        if needle in text:
+            return "missing", f"default cmdline contains forbidden {needle!r}", None
+    return "ok", "", None
+
+
+def check_uki_dtb(check, ctx):
+    secs, err = uki_sections(ctx)
+    if err:
+        return "missing", err, None
+    blobs = [b for name, b in secs if name == ".dtbauto"]
+    if not blobs:
+        return "missing", "UKI has no .dtbauto section", None
+    needles = [str(x).encode("utf-8") for x in (check.get("contains") or [])]
+    reg = b""
+    if check.get("reg_hex"):
+        try:
+            reg = bytes.fromhex(str(check["reg_hex"]))
+        except ValueError:
+            return "missing", "reg_hex is not hex", None
+    for blob in blobs:
+        if all(n in blob for n in needles) and (not reg or reg in blob):
+            return "ok", "", None
+    return "missing", "no .dtbauto contains the ramoops node at 0xa9000000 (2 MiB)", None
+
+
+def check_uki_kconfig(check, ctx):
+    needles = [str(x) for x in (check.get("contains") or [])]
+    sources = []
+    uname = ctx.kernel_uname or ""
+    rels = []
+    if uname:
+        rels.extend([
+            f"usr/lib/modules/{uname}/config",
+            f"lib/modules/{uname}/config",
+            f"boot/config-{uname}",
+        ])
+    if ctx.base is not None:
+        for rel in rels:
+            path = locate(ctx, rel)
+            if path is None or classify_stat(path) != "ok":
+                continue
+            data, err = read_bytes(path)
+            if err or data is None:
+                return ("unreadable" if err == "unreadable" else "missing"), f"{rel}: {err}", None
+            sources.append((rel, data.decode("utf-8", "replace")))
+            break
+    secs, err = uki_sections(ctx)
+    if err and ctx.uki is not None:
+        return "missing", err, None
+    if secs is not None:
+        linux = next((b for name, b in secs if name == ".linux"), None)
+        if linux is None:
+            if not sources:
+                return "missing", "UKI has no .linux section and no modules config", None
+        else:
+            try:
+                text = ikconfig_text(linux)
+            except (OSError, ValueError, EOFError, gzip.BadGzipFile) as e:
+                return "missing", f"UKI kernel config: {e}", None
+            if text:
+                sources.append((".linux IKCFG", text))
+            elif not sources:
+                return "missing", "UKI kernel has no IKCFG and the tree has no modules config", None
+    if not sources:
+        return "missing", "no modules config and no IKCFG in the UKI kernel", None
+    for label, text in sources:
+        missing = [n for n in needles if n not in text]
+        if missing:
+            return "missing", f"{label} lacks {missing[0]!r}", None
+    return "ok", "", None
+
+
 def run_check(item, check, ctx):
     kind = check.get("kind")
     warn = None
@@ -797,6 +967,12 @@ def run_check(item, check, ctx):
         state, msg = check_dropin(check, ctx)
     elif kind == "gsettings":
         state, msg, warn = check_gsettings(check, ctx)
+    elif kind == "uki-cmdline":
+        state, msg, warn = check_uki_cmdline(check, ctx)
+    elif kind == "uki-dtb":
+        state, msg, warn = check_uki_dtb(check, ctx)
+    elif kind == "uki-kconfig":
+        state, msg, warn = check_uki_kconfig(check, ctx)
     else:
         state, msg = "missing", f"unknown check kind {kind}"
     return state, msg, warn
@@ -846,6 +1022,8 @@ def decide(item, args):
     if scope in ("sysext", "image"):
         if args.profile not in profiles:
             return "skip", f"profile {args.profile}"
+        if item.get("needs_uki") and not args.uki:
+            return "skip", "uki not given"
         return "run", None
     return "skip", f"scope {scope}"
 
@@ -916,6 +1094,7 @@ def main(argv):
     p.add_argument("--all-scopes", action="store_true",
                    help="also run on-device checks from --sysext-dir/--tree")
     p.add_argument("--root", help="prefix for absolute paths (tests). Still read-only.")
+    p.add_argument("--uki", help="UKI path for image-level checks (cmdline, DTB, kernel config)")
     args = p.parse_args(argv)
 
     only = []
@@ -964,7 +1143,9 @@ def main(argv):
             action, reason = decide(item, args)
             if action == "skip":
                 # Scope skips stay in the count only. Profile and version skips are printed.
-                loud = item["scope"] == "version-conditional" or (reason or "").startswith("profile")
+                loud = (item["scope"] == "version-conditional"
+                        or (reason or "").startswith("profile")
+                        or (reason or "").startswith("uki "))
                 results.append({"id": item["id"], "state": "skip", "message": reason, "loud": loud})
                 continue
             ctx = make_ctx(item, args, by_name, extractor, system_root, home)
@@ -1008,21 +1189,25 @@ def main(argv):
 
 def make_ctx(item, args, by_name, extractor, system_root, home):
     version = args.version
+    uki = args.uki
+    if item.get("needs_uki"):
+        base = Path(args.tree) if args.mode == "tree" else None
+        return Ctx(args.mode, base, system_root, version, args.kernel_uname, home, None, uki)
     if args.mode == "online":
-        return Ctx("online", system_root, system_root, version, args.kernel_uname, home, None)
+        return Ctx("online", system_root, system_root, version, args.kernel_uname, home, None, uki)
     if args.mode == "tree":
-        return Ctx("tree", Path(args.tree), system_root, version, args.kernel_uname, home, None)
+        return Ctx("tree", Path(args.tree), system_root, version, args.kernel_uname, home, None, uki)
     raw, picked = pick_raw(by_name, item.get("sysext"), version)
     if raw is None:
         ver = f" for {version}" if version else ""
         note = f"sysext {item.get('sysext')}_{{VERSION}}.raw{ver} not in the directory"
-        return Ctx("sysext", None, system_root, version, args.kernel_uname, home, note)
+        return Ctx("sysext", None, system_root, version, args.kernel_uname, home, note, uki)
     dest, err = extractor.get(raw)
     # Release must match the raw we opened, and --version when given (pick already filtered).
     use_version = version or picked
     if err:
-        return Ctx("sysext", None, system_root, use_version, args.kernel_uname, home, err)
-    return Ctx("sysext", dest, system_root, use_version, args.kernel_uname, home, None)
+        return Ctx("sysext", None, system_root, use_version, args.kernel_uname, home, err, uki)
+    return Ctx("sysext", dest, system_root, use_version, args.kernel_uname, home, None, uki)
 
 
 if __name__ == "__main__":

@@ -165,7 +165,8 @@ printf 'calls_pick_tel_default_origin\n' > "$D/usr/bin/gnome-calls"
 out=$("$CHECK" --tree "$D" --version 0.26.1124.3 --kernel-uname '7.2.8-sc7280-fp5+' --profile daily)
 echo "$out" | grep -q 'MISSING:' && fail "daily fixture failed: $out"
 echo "$out" | grep -q 'SKIP: fp5-volte-modules' || fail "daily fixture did not skip volte"
-echo "$out" | grep -q 'SUMMARY: required=41 passed=10 missing=0 skipped=31' || fail "daily summary: $out"
+echo "$out" | grep -q 'SKIP: fp5-pstore-ramoops-image' || fail "daily fixture did not skip the UKI check: $out"
+echo "$out" | grep -q 'SUMMARY: required=42 passed=10 missing=0 skipped=32' || fail "daily summary: $out"
 echo "$out" | grep -q 'WARN: fp5-gnome-calls-prefer-ims' || fail "expected warn for imsd origin name: $out"
 say "daily fixture passes with volte skipped"
 
@@ -218,7 +219,88 @@ bash -n "$ROOT/feed/auto/fp5-feed-auto.sh" || fail "fp5-feed-auto.sh syntax"
 grep -q 'check-carried-fixes-sysexts' "$ROOT/feed/auto/fp5-feed-auto.sh" || fail "hook missing"
 grep -q -- '--profile feed' "$ROOT/feed/auto/fp5-feed-auto.sh" || fail "hook missing --profile feed"
 grep -q 'carried-fixes:' "$ROOT/feed/auto/fp5-feed-auto.sh" || fail "hook does not fail closed"
+grep -q 'feed has switched to sc7280 lineage' "$ROOT/feed/auto/fp5-feed-auto.sh" || fail "old pipeline missing the sc7280 fail-closed check"
 say "fp5-feed-auto.sh hook parses"
+
+# --- UKI image check: skip without --uki, pass a synthetic UKI, fail oops=panic ---
+python3 - "$TMP" << 'PY' || fail "could not build synthetic UKIs"
+import gzip, struct, sys
+from pathlib import Path
+tmp = Path(sys.argv[1])
+
+def pe(sections):
+    # Minimal PE32+. The checker only reads the section table.
+    dos = bytearray(128)
+    dos[0:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 128)
+    nsec = len(sections)
+    opt = 240
+    coff = struct.pack("<HHIIIHH", 0xAA64, nsec, 0, 0, 0, opt, 0x022)
+    optional = bytearray(opt)
+    struct.pack_into("<H", optional, 0, 0x20B)
+    headers = bytes(dos) + b"PE\0\0" + coff + bytes(optional)
+    sec_off = len(headers)
+    raw = sec_off + nsec * 40
+    blobs = []
+    table = bytearray()
+    for name, data in sections:
+        if len(name.encode()) > 8:
+            raise SystemExit(name)
+        nb = name.encode().ljust(8, b"\0")
+        table += nb + struct.pack("<IIIIIIHHI", len(data), 0x2000, len(data), raw, 0, 0, 0, 0, 0x60000020)
+        blobs.append(data)
+        raw += len(data)
+    return headers + bytes(table) + b"".join(blobs)
+
+def zboot(config_text):
+    packed = gzip.compress(config_text.encode())
+    inner = b"IKCFG_ST" + packed + b"IKCFG_ED"
+    payload = gzip.compress(inner)
+    hdr = bytearray(64)
+    hdr[0:4] = b"MZ\x00\x00"
+    hdr[4:8] = b"zimg"
+    struct.pack_into("<I", hdr, 8, 64)
+    struct.pack_into("<I", hdr, 12, len(payload))
+    hdr[24:29] = b"gzip\0"
+    return bytes(hdr) + payload
+
+cfg = "\n".join([
+    "CONFIG_PSTORE_RAM=y",
+    "CONFIG_PSTORE_CONSOLE=y",
+    "CONFIG_PSTORE_PMSG=y",
+    "CONFIG_PM_DEBUG=y",
+    "CONFIG_PM_SLEEP_DEBUG=y",
+    "CONFIG_REED_SOLOMON=y",
+    "CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE=y",
+    "CONFIG_DM_VERITY=m",
+]) + "\n"
+dtb = b"ramoops@a9000000\0" + bytes.fromhex("00000000a90000000000000000200000")
+good_cmd = b"root=dissect cma=128M pstore.backend=ramoops panic=10 mem_sleep_default=s2idle\0"
+bad_cmd = good_cmd[:-1] + b" oops=panic\0"
+kernel = zboot(cfg)
+(tmp / "good.efi").write_bytes(pe([(".cmdline", good_cmd), (".dtbauto", dtb), (".linux", kernel)]))
+(tmp / "bad.efi").write_bytes(pe([(".cmdline", bad_cmd), (".dtbauto", dtb), (".linux", kernel)]))
+(tmp / "nodtb.efi").write_bytes(pe([(".cmdline", good_cmd), (".dtbauto", b"no-ramoops"), (".linux", kernel)]))
+PY
+out=$("$CHECK" --tree "$FIX/mm-present" --only fp5-pstore-ramoops-image)
+echo "$out" | grep -q 'SKIP: fp5-pstore-ramoops-image' || fail "uki check did not skip: $out"
+echo "$out" | grep -q 'SUMMARY: required=1 passed=0 missing=0 skipped=1' || fail "uki skip summary: $out"
+out=$("$CHECK" --tree "$FIX/mm-present" --uki "$TMP/good.efi" --only fp5-pstore-ramoops-image)
+echo "$out" | grep -q 'OK: fp5-pstore-ramoops-image' || fail "synthetic UKI did not pass: $out"
+echo "$out" | grep -q 'MISSING:' && fail "synthetic UKI had a miss: $out"
+set +e
+out=$("$CHECK" --tree "$FIX/mm-present" --uki "$TMP/bad.efi" --only fp5-pstore-ramoops-image)
+rc=$?
+set -e
+[ "$rc" = 1 ] || fail "oops=panic exit $rc"
+echo "$out" | grep -q 'oops=panic' || fail "oops=panic was not named: $out"
+set +e
+out=$("$CHECK" --tree "$FIX/mm-present" --uki "$TMP/nodtb.efi" --only fp5-pstore-ramoops-image)
+rc=$?
+set -e
+[ "$rc" = 1 ] || fail "missing ramoops exit $rc"
+echo "$out" | grep -q 'ramoops' || fail "missing ramoops was not named: $out"
+say "uki check skips without --uki, passes a good UKI, and rejects oops=panic"
 
 # --- real raws, read-only, when fsck.erofs works ---
 setup_fsck() {

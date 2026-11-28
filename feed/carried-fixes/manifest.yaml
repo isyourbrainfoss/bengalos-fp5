@@ -1182,6 +1182,46 @@ items:
           - "0xa9000000"
           - "0x200000"
 
+  - id: fp5-pstore-ramoops-image
+    name: "Built UKI carries ramoops, the pstore cmdline, and no oops=panic"
+    why: "The source fragment is not enough. The image that will be installed must have PSTORE_RAM in the kernel, the FP5 DTB ramoops node at 0xa9000000, and a default cmdline of pstore.backend=ramoops panic=10 mem_sleep_default=s2idle. oops=panic is forbidden: a non-fatal oops must not reboot the phone and drop a call. ramoops max-reason 2 still records oopses."
+    branch: "feat/fp5-1127.1-pstore"
+    commit: ""
+    where: "UKI .cmdline (first, the default profile), .dtbauto, and .linux IKCFG or the modules config"
+    upstreamable: later
+    upstreamable_reason: "Same carry as fp5-pstore-ramoops, checked on the built UKI."
+    scope: image
+    profiles:
+      - daily
+    required: true
+    needs_uki: true
+    status_on_phone_20261126: missing
+    note: "Skipped with a loud reason when --uki is not passed, so a sysext-only run stays green. Pass --uki and, when you have one, --tree of the extracted usr."
+    checks:
+      - kind: uki-cmdline
+        contains:
+          - "pstore.backend=ramoops"
+          - "panic=10"
+          - "mem_sleep_default=s2idle"
+        absent:
+          - "oops=panic"
+          - "no_console_suspend"
+          - "pm_debug_messages"
+          - "loglevel=8"
+      - kind: uki-dtb
+        contains:
+          - "ramoops@a9000000"
+        reg_hex: "00000000a90000000000000000200000"
+      - kind: uki-kconfig
+        contains:
+          - "CONFIG_PSTORE_RAM=y"
+          - "CONFIG_PSTORE_CONSOLE=y"
+          - "CONFIG_PSTORE_PMSG=y"
+          - "CONFIG_PM_DEBUG=y"
+          - "CONFIG_PM_SLEEP_DEBUG=y"
+          - "CONFIG_REED_SOLOMON=y"
+          - "CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE=y"
+
   - id: pstore-plain
     name: "pstore plain note"
     why: "Listed in AVVIK section 4 as a pointer, not a file this check can see."
