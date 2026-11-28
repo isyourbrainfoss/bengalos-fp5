@@ -142,7 +142,7 @@ echo "merged index: $(wc -l < "$OUT/SHA256SUMS") lines"
 
 echo "== secret audit (counts and rule names only)"
 export FP5_LAB_PATTERNS=${FP5_LAB_PATTERNS:-/home/kb/repos/grok_build/fp5/internal-install/feed-auto-live/feed/auto/lab-patterns.local}
-python3 "$HERE/secret-audit.py" "${ASSETS[@]/#/$OUT/}" || fail "secret audit found a hit (see COUNT lines; matches are not printed)"
+python3 "$HERE/secret-audit.py" --baseline "$HERE/secret-baseline.txt" "${ASSETS[@]/#/$OUT/}" || fail "secret audit found a hit (see COUNT lines; matches are not printed)"
 
 if [ "$MODE" = "dry-run" ]; then
   echo "DRYRUN_OK $VERSION staged in $OUT; nothing uploaded"
