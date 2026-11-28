@@ -72,14 +72,14 @@ phosh, and gnome-calls are printed as `SKIP` on that profile. Forgetting
 
 ## Counts
 
-66 items, 41 required.
+68 items, 42 required.
 
 | Scope | Items | Required |
 |---|---:|---:|
 | sysext | 10 | 9 |
 | image | 2 | 1 |
 | version-conditional | 1 | 1 |
-| on-device | 53 | 30 |
+| on-device | 55 | 31 |
 
 ## Phone on 26 Nov 2026
 
@@ -430,6 +430,20 @@ is absent from the raw set.
 - **Required:** yes
 - **Phone 2026-11-26:** present
 - **Check:** (1) `${HOME}/.local/bin/fp5-car-seek` is a regular file, executable; sha256 prefix `db10f6b0` is last_known and only warns. (2) user unit `fp5-car-seek.service` is enabled.
+
+### `fp5-coverart`
+
+- **Name:** AVRCP cover art to the car (OOT bluetoothd + obexd)
+- **Why:** The Tesla only shows album/audiobook art over AVRCP BIP. Debian bluez 5.88 has no cover-art server, so the car got no cover.
+- **Branch / commit:** `feat/car-coverart` `a0d929b`
+- **Where:** `/var/lib/fp5-oot/coverart/{bluetoothd,obexd,fp5-coverart-prepare}`; `/etc/systemd/system/bluetooth.service.d/fp5-coverart.conf`; `${HOME}/.config/systemd/user/obex.service.d/fp5-coverart.conf`
+- **Upstreamable:** later. BlueZ cover-art patches 0001/0002 on bluez 5.88-1. Upstream BIP server work is not merged.
+- **Scope:** on-device (checked by --online, and by --all-scopes)
+- **Required:** yes
+- **Phone 2026-11-26:** present
+- **Check:** (1) `bluetoothd` is executable with exact sha256 `7d87d637…a495c`. (2) `obexd` exact sha256 `9c407eef…de44`. (3) `fp5-coverart-prepare` exact sha256 `11268d10…c557`. A different hash fails. (4) The bluetooth drop-in contains `ExecStart=/var/lib/fp5-oot/coverart/bluetoothd`, exact sha256 `b7b71942…9569`. (5) The user obex drop-in contains the OOT `ExecStart`, `FP5_COVERART_PREPARE`, and `WantedBy=default.target`, exact sha256 `f73b0b5e…3856`. (6) User `obex.service` is active or has a `WantedBy` (read-only `systemctl --user is-active` / `show -p WantedBy`; never starts it).
+- **1127.1 note:** obexd links libebook/libedataserver. Their sonames moved in 0.26.1127.1 (`.so.4`/`.27` to `.so.5`/`.28`), so the 20 Nov obexd (`9c407eef…`) cannot start on that image. A per-image rebuild (or a selector plus `obexd-$VERSION_ID`) is required before 1127.1 is installed. That layout is not on the phone yet, and is not a current gate.
+- **Note:** Everything lives in `/var`, `/etc` and the home, so an A/B usr update keeps the files. On 28 Nov 10:51 (Kristian t1123u) the user drop-in gained `[Install] WantedBy=default.target` and `systemctl --user enable --now obex.service`. After a login, obexd should start and register Imaging Responder. Check (6) fails if it is neither active nor WantedBy.
 
 ### `car-mpris-guard`
 
