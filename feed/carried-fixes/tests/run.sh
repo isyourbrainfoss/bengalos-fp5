@@ -165,7 +165,7 @@ printf 'calls_pick_tel_default_origin\n' > "$D/usr/bin/gnome-calls"
 out=$("$CHECK" --tree "$D" --version 0.26.1124.3 --kernel-uname '7.2.8-sc7280-fp5+' --profile daily)
 echo "$out" | grep -q 'MISSING:' && fail "daily fixture failed: $out"
 echo "$out" | grep -q 'SKIP: fp5-volte-modules' || fail "daily fixture did not skip volte"
-echo "$out" | grep -q 'SUMMARY: required=42 passed=10 missing=0 skipped=32' || fail "daily summary: $out"
+echo "$out" | grep -q 'SUMMARY: required=44 passed=10 missing=0 skipped=34' || fail "daily summary: $out"
 echo "$out" | grep -q 'WARN: fp5-gnome-calls-prefer-ims' || fail "expected warn for imsd origin name: $out"
 say "daily fixture passes with volte skipped"
 
