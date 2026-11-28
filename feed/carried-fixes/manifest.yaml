@@ -513,16 +513,26 @@ items:
     scope: on-device
     required: true
     status_on_phone_20261126: present
-    note: "Lives in /var, /etc and the home, so a usr/A-B update keeps it. The OOT daemons link against the image's glib/dbus/udev: symbol-check them against every new usr. 28 Nov 10:51 (Kristian t1123u): user drop-in gained [Install] WantedBy=default.target (sha f73b0b5e…); systemctl --user enable --now obex.service. After a login, obexd should start and register Imaging Responder. The active-or-wanted check fails if that is missing. 0.26.1127.1 moves libebook/libedataserver sonames (.so.4/.27 -> .so.5/.28), so this 20 Nov obexd (9c407eef…) will not start there; a per-image rebuild (or selector + obexd-$VERSION_ID) is required before that image is installed, and is not on the phone yet."
+    note: "Lives in /var, /etc and the home, so a usr/A-B update keeps it. The OOT daemons link against the image's glib/dbus/udev: symbol-check them against every new usr. 28 Nov 10:51 (Kristian t1123u): user drop-in gained [Install] WantedBy=default.target (sha f73b0b5e…); systemctl --user enable --now obex.service. After a login, obexd should start and register Imaging Responder. The active-or-wanted check fails if that is missing. 0.26.1127.1 moves libebook/libedataserver sonames (.so.4/.27 -> .so.5/.28), so this 20 Nov obexd (9c407eef…) will not start there; from the 0.26.1127.1 install (~/fp5-xfer-1127.1/apply.sh) /var/lib/fp5-oot/coverart/obexd is the selector (feat/car-coverart 99f7289, sha e674c4c3…) that runs obexd-$VERSION_ID (obexd-0.26.1124.3 = 9c407eef…, obexd-0.26.1127.1 = 090e06f5…, forky rebuild with .so.5/.28) and falls back to stock obexd. Every new image needs its own obexd-<VERSION_ID>."
     checks:
       - kind: exists
         path: /var/lib/fp5-oot/coverart/bluetoothd
         executable: true
         sha256: "7d87d63745eab16af8a5302896782b58f6ed9f610be3ec7798e09149d6da495c"
-      - kind: exists
+      - kind: text
         path: /var/lib/fp5-oot/coverart/obexd
         executable: true
-        sha256: "9c407eef3275ae93c3014ebc0c6f14b1b80c5fbca9f50756cfbfc25302c5de44"
+        contains:
+          - "obexd-$V"
+          - "/usr/libexec/bluetooth/obexd"
+        sha256: "e674c4c370dd99b095a2a7c4dcb17a853cbd45b81b31ad36217e9c0ec54228b1"
+      - kind: exists
+        path: /var/lib/fp5-oot/coverart/obexd-${VERSION_ID}
+        executable: true
+      - kind: bytes
+        path: /var/lib/fp5-oot/coverart/obexd-${VERSION_ID}
+        contains:
+          - "AVRCP Cover Art server"
       - kind: exists
         path: /var/lib/fp5-oot/coverart/fp5-coverart-prepare
         executable: true
