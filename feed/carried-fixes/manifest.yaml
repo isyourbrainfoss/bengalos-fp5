@@ -1,0 +1,1233 @@
+# Local FP5 customisations that must be carried. Human list: docs/CARRIED-FIXES.md.
+# Narrative changelog stays in docs/AVVIK.md. Do not put secrets in this file.
+schema: 1
+
+items:
+  - id: mm-keep-ims-bearer
+    name: "ModemManager spares the IMS bearer"
+    why: "NetworkManager Simple.Disconnect(\"/\") on suspend must not tear down the IMS bearer, or incoming VoLTE during sleep falls back to CS."
+    branch: "fix/mm-keep-ims-bearer"
+    commit: "d99036b"
+    where: "fp5-modemmanager sysext usr/sbin/ModemManager (live /usr/sbin/ModemManager)"
+    upstreamable: later
+    upstreamable_reason: "The spare is local policy on Debian 1.25.95-1. Rebase it onto a newer daemon; do not drop the sysext when MM#1110 lands."
+    scope: sysext
+    profiles:
+      - feed
+      - daily
+    required: true
+    status_on_phone_20261126: missing
+    sysext: fp5-modemmanager
+    note: "Feed carry binary as of 99920de starts fc7239de (1.25.95-1 + 9317cbc4 + keep-IMS). The 15 Nov daemon e43649ed (build-id 92e75ebc) is MM#1110 only and is the broken-for-suspend binary. Do not pin e43649ed. The gate is the spare string, not the hash."
+    checks:
+      - kind: bytes
+        path: usr/sbin/ModemManager
+        contains:
+          - "sparing IMS bearer"
+
+  - id: mm-qmapmux-1110
+    name: "ModemManager includes MM#1110"
+    why: "Debian modemmanager 1.25.95-1 still use-after-frees the netlink completion on qmapmux. Upstream 9317cbc4 is not in the 1124.3 package."
+    branch: "fix/mm-keep-ims-bearer"
+    commit: "d99036b"
+    where: "fp5-modemmanager sysext usr/share/doc/fp5-modemmanager/mm-9317cbc4.patch, or the keep-IMS daemon which is built on top of that commit"
+    upstreamable: later
+    upstreamable_reason: "Drop this marker only once the official modemmanager package contains 9317cbc4. The IMS spare still stays."
+    scope: sysext
+    profiles:
+      - feed
+      - daily
+    required: true
+    status_on_phone_20261126: present
+    sysext: fp5-modemmanager
+    match: any
+    checks:
+      - kind: text
+        path: usr/share/doc/fp5-modemmanager/mm-9317cbc4.patch
+        contains:
+          - "9317cbc4"
+      - kind: bytes
+        path: usr/sbin/ModemManager
+        contains:
+          - "sparing IMS bearer"
+
+  - id: fp5-frunk-qs
+    name: "Frunk Phosh quick setting"
+    why: "Tesla frunk control from the lock screen. The plugin is not in upstream Phosh."
+    branch: "waydroid-host-stack"
+    commit: "fbd3236"
+    where: "fp5-frunk-qs sysext usr/lib/aarch64-linux-gnu/phosh/plugins/"
+    upstreamable: no
+    upstreamable_reason: "Phone-specific Tesla helper, not a Phosh bugfix."
+    scope: sysext
+    profiles:
+      - feed
+      - daily
+    required: true
+    status_on_phone_20261126: present
+    sysext: fp5-frunk-qs
+    checks:
+      - kind: extension-release
+      - kind: exists
+        path: usr/lib/aarch64-linux-gnu/phosh/plugins/libphosh-plugin-frunk-quick-setting.so
+      - kind: exists
+        path: usr/lib/aarch64-linux-gnu/phosh/plugins/frunk-quick-setting.plugin
+
+  - id: fp5-waydroid-fix
+    name: "Waydroid schema cache fix"
+    why: "The official waydroid sysext ships short gsettings caches, so base schemas such as mobi.phosh.phoc disappear."
+    branch: "feed/carry-local-sysexts"
+    commit: "99920de"
+    where: "fp5-waydroid-fix sysext usr/share/glib-2.0/schemas/gschemas.compiled"
+    upstreamable: later
+    upstreamable_reason: "The official waydroid sysext should ship the full base schema set."
+    scope: sysext
+    profiles:
+      - feed
+      - daily
+    required: true
+    status_on_phone_20261126: present
+    sysext: fp5-waydroid-fix
+    checks:
+      - kind: extension-release
+      - kind: bytes
+        path: usr/share/glib-2.0/schemas/gschemas.compiled
+        contains:
+          - "mobi.phosh.phoc"
+
+  - id: fp5-qtee
+    name: "FP5 fingerprint broker"
+    why: "QTEE fingerprint unlock is not in the official image. Daily-driver set needs the broker sysext."
+    branch: "user-home, not in git"
+    commit: "5a6dd12"
+    where: "fp5-qtee sysext (broker under usr/libexec/fp5-qtee/, extension-release.fp5-qtee_VERSION)"
+    upstreamable: later
+    upstreamable_reason: "Port of fp5-qtee; not upstream BengalOS."
+    scope: sysext
+    profiles:
+      - feed
+      - daily
+    required: true
+    status_on_phone_20261126: present
+    sysext: fp5-qtee
+    note: "Payload is the 1109 qtee sysext plus pam_fprintd. commit 5a6dd12 is fp5-qtee PR #11, recorded in build-sysexts.sh."
+    checks:
+      - kind: extension-release
+      - kind: exists
+        path: usr/libexec/fp5-qtee/fp5-qtee-broker
+
+  - id: fp5-ims-app
+    name: "IMS polkit action"
+    why: "fp5-imsd needs the net.catcrafts.IMS1 polkit action, which the official image does not ship."
+    branch: "feed/carry-local-sysexts"
+    commit: "99920de"
+    where: "fp5-ims-app sysext usr/share/polkit-1/actions/net.catcrafts.IMS1.policy"
+    upstreamable: later
+    upstreamable_reason: "Local IMS stack policy, not an upstream BengalOS unit."
+    scope: sysext
+    profiles:
+      - feed
+      - daily
+    required: true
+    status_on_phone_20261126: present
+    sysext: fp5-ims-app
+    checks:
+      - kind: extension-release
+      - kind: exists
+        path: usr/share/polkit-1/actions/net.catcrafts.IMS1.policy
+
+  - id: fp5-device
+    name: "FP5 device layer"
+    why: "Udev, presets, and device units that the generic image does not carry. A valid extension-release for this VERSION_ID is the gate."
+    branch: "feed/carry-local-sysexts"
+    commit: "99920de"
+    where: "fp5-device sysext usr/lib/extension-release.d/ and usr/lib/systemd/system-preset/09-bengalos-fp5.preset"
+    upstreamable: later
+    upstreamable_reason: "Device profile for Fairphone 5. Do not require a preset line 'disable 81voltd*' — that was the bad first 1124.3 raw."
+    scope: image
+    profiles:
+      - feed
+      - daily
+    required: true
+    status_on_phone_20261126: present
+    sysext: fp5-device
+    note: "The corrected 1124.3 raw enables 81voltd* and hexagon*. The sdm845 feed still builds device-layer-1109.tar, whose preset policy differs. This check does not require either enable or disable."
+    checks:
+      - kind: extension-release
+      - kind: exists
+        path: usr/lib/systemd/system-preset/09-bengalos-fp5.preset
+
+  - id: fp5-phoc-resume
+    name: "phoc keeps the DRM output across session pause"
+    why: "wlroots 0.20 destroys outputs when logind pauses DRM, so Phosh dies on resume and clients go blurry."
+    branch: "fix/phoc-resume-output"
+    commit: "7ed7b58"
+    where: "fp5-phoc sysext usr/bin/phoc"
+    upstreamable: yes
+    upstreamable_reason: "phoc/wlroots should reuse the output on seat resume. Not part of the sdm845 fp5-feed build."
+    scope: sysext
+    profiles:
+      - daily
+    required: true
+    status_on_phone_20261126: present
+    sysext: fp5-phoc
+    checks:
+      - kind: extension-release
+      - kind: bytes
+        path: usr/bin/phoc
+        contains:
+          - "Keeping output across session pause"
+          - "Re-modesetting existing output after session resume"
+
+  - id: fp5-phosh-invalid-scale
+    name: "Phosh ignores invalid output scale"
+    why: "After resume Phosh can send set_scale(0) and wlroots disconnects the client."
+    branch: "fix/phosh-resume-output-guard"
+    commit: "8895dc6"
+    where: "fp5-phosh sysext usr/libexec/phosh (not usr/bin/phosh)"
+    upstreamable: yes
+    upstreamable_reason: "Skipping a non-positive scale is a Phosh bugfix. Not part of the sdm845 fp5-feed build."
+    scope: sysext
+    profiles:
+      - daily
+    required: true
+    status_on_phone_20261126: present
+    sysext: fp5-phosh
+    checks:
+      - kind: extension-release
+      - kind: bytes
+        path: usr/libexec/phosh
+        contains:
+          - "Ignoring invalid scale"
+
+  - id: fp5-gnome-calls-prefer-ims
+    name: "GNOME Calls prefers the imsd origin"
+    why: "Calls otherwise dials the first origin, which is ModemManager, so outgoing calls leave VoLTE."
+    branch: "fix/calls-prefer-ims-origin"
+    commit: "974d78e"
+    where: "fp5-gnome-calls sysext usr/bin/gnome-calls or the ofono plugin libofono.so"
+    upstreamable: later
+    upstreamable_reason: "The preference is for this phone's imsd origin. Do not search for the string calls-default-origin; it is not in the binary."
+    scope: sysext
+    profiles:
+      - daily
+    required: true
+    status_on_phone_20261126: present
+    sysext: fp5-gnome-calls
+    checks:
+      - kind: extension-release
+      - kind: bytes-one-of
+        paths:
+          - usr/bin/gnome-calls
+          - usr/lib/aarch64-linux-gnu/calls/plugins/provider/ofono/libofono.so
+        contains:
+          - "calls_pick_tel_default_origin"
+        warn_contains:
+          - "calls_origin_name_is_imsd"
+
+  - id: fp5-volte-modules
+    name: "Out-of-tree modules for the volte kernel"
+    why: "The 1109 module tree matches vermagic 7.2.8-sc7280-volte20261107+ only. The 1124.3 kernel 7.2.8-sc7280-fp5+ must not fail because this sysext is absent."
+    branch: "feed/carry-local-sysexts"
+    commit: "99920de"
+    where: "fp5-volte-modules sysext usr/lib/modules/<uname>/"
+    upstreamable: no
+    upstreamable_reason: "Tied to one local kernel build. A different uname needs its own modules."
+    scope: version-conditional
+    profiles:
+      - feed
+      - daily
+    required: true
+    status_on_phone_20261126: not-applicable
+    sysext: fp5-volte-modules
+    when_kernel_uname:
+      - "7.2.8-sc7280-volte20261107+"
+    checks:
+      - kind: extension-release
+      - kind: kernel-modules
+
+  - id: fp5-imsd
+    name: "imsd 1.2.4 with mic and media-v2"
+    why: "VoLTE userspace lives in /opt, not in a sysext, so an image update does not replace it and a new image must still have it."
+    branch: "fp5-mic-on-1.2.4"
+    commit: "54f1238"
+    where: "/opt/fp5-imsd/bin/{imsd,imsd-ofonod,imsd-pcscf,imsd-dialerd,imsd-media}"
+    upstreamable: no
+    upstreamable_reason: "Local IMS daemon. Hashes are last_known only so a later 1.2.x bump does not fail the check."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    note: "Not in this git. Installed from the imsd tree."
+    checks:
+      - kind: exists
+        path: /opt/fp5-imsd/bin/imsd
+        executable: true
+        last_known_sha256_prefix: "e858ed86"
+      - kind: exists
+        path: /opt/fp5-imsd/bin/imsd-ofonod
+        executable: true
+        last_known_sha256_prefix: "d4448237"
+      - kind: exists
+        path: /opt/fp5-imsd/bin/imsd-pcscf
+        executable: true
+        last_known_sha256_prefix: "30cf604e"
+      - kind: exists
+        path: /opt/fp5-imsd/bin/imsd-dialerd
+        executable: true
+        last_known_sha256_prefix: "1a31b0f5"
+      - kind: exists
+        path: /opt/fp5-imsd/bin/imsd-media
+        executable: true
+        last_known_sha256_prefix: "a1eb00dc"
+
+  - id: ims-kernel-guard
+    name: "imsd ownership allows the fp5+ kernel uname"
+    why: "On 1124.3 the guard rejected 7.2.8-sc7280-fp5+ and fp5-ims never started. The volte uname stays allowed."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "/opt/fp5-imsd/service/ownership.py on the writable root"
+    upstreamable: no
+    upstreamable_reason: "Local guard around a local kernel package name."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: text
+        path: /opt/fp5-imsd/service/ownership.py
+        contains:
+          - "7.2.8-sc7280-volte20261107+"
+          - '^7\.2\.[0-9]+-sc7280-fp5\+$'
+        last_known_sha256_prefix: "211c8003"
+
+  - id: ims-resume-journal
+    name: "imsd supervisor resumes and journals without blocking"
+    why: "After suspend, IMS must be polled again, and a slow journal must not stall the supervisor."
+    branch: "fix/ims-resume-journal"
+    commit: "95f5be5"
+    where: "/opt/fp5-imsd/service/manager.py"
+    upstreamable: later
+    upstreamable_reason: "Behaviour belongs in the local imsd supervisor until that tree is shared."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: text
+        path: /opt/fp5-imsd/service/manager.py
+        contains:
+          - "PrepareForSleep"
+          - "log_poll"
+        last_known_sha256_prefix: "9cd3bdcb"
+
+  - id: fp5-ims-units
+    name: "fp5-ims and grant-wake units"
+    why: "IMS registration and the wake grant must be enabled after boot, with the boottime preload so CLOCK_BOOTTIME is not stepped."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "fp5-ims.service and fp5-ims-grant-wake.service (whatever path systemd uses); LD_PRELOAD in an fp5-ims drop-in"
+    upstreamable: no
+    upstreamable_reason: "Local units for the local IMS stack. Do not require /usr/lib/systemd/system/fp5-ims.service."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: unit
+        name: fp5-ims.service
+        state: enabled
+      - kind: unit
+        name: fp5-ims-grant-wake.service
+        state: enabled
+      - kind: dropin
+        unit: fp5-ims.service
+        contains:
+          - "LD_PRELOAD="
+          - "libfp5-boottime-steady.so"
+
+  - id: mask-voice-daemons
+    name: "q6voiced and 81voltd masked"
+    why: "Current phone policy keeps both masked. The image preset may still enable 81voltd; that must not fail a sysext build."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "systemd masks for q6voiced.service and 81voltd.service"
+    upstreamable: no
+    upstreamable_reason: "Lab policy on top of the image preset, stored in /etc, not in the sysext."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: unit
+        name: q6voiced.service
+        state: masked
+      - kind: unit
+        name: 81voltd.service
+        state: masked
+
+  - id: call-mic-v4
+    name: "Call mic v4 and early ADC1"
+    why: "The first call after boot had a dead uplink mic because ADC1 was off when Voice Call PCM opened."
+    branch: "fix/call-mic-ring-adc1"
+    commit: "2a8a158"
+    where: "/var/lib/fp5-oot/bin/fp5-call-mic and fp5-call-mic-early; user unit fp5-call-mic-early.service"
+    upstreamable: later
+    upstreamable_reason: "Userspace workaround until UCM part A is accepted. v2/v3 are not the current gate."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: /var/lib/fp5-oot/bin/fp5-call-mic
+        executable: true
+        last_known_sha256_prefix: "4699f645"
+      - kind: exists
+        path: /var/lib/fp5-oot/bin/fp5-call-mic-early
+        executable: true
+        last_known_sha256_prefix: "e268bcdb"
+      - kind: unit
+        name: fp5-call-mic-early.service
+        user: true
+        state: enabled
+
+  - id: callaudiod-watch
+    name: "callaudiod idle watchdog"
+    why: "callaudiod can sit forever in SelectMode and leave the card on HiFi, so the call has no audio."
+    branch: "fix/callaudiod-hang"
+    commit: "fbfb8ce"
+    where: "/var/lib/fp5-oot/bin/fp5-callaudiod-watch; user unit fp5-callaudiod-watch.service"
+    upstreamable: later
+    upstreamable_reason: "The SelectMode hang wants an upstream callaudiod fix. The watchdog is the carried piece."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: /var/lib/fp5-oot/bin/fp5-callaudiod-watch
+        executable: true
+        last_known_sha256_prefix: "bbff3826"
+      - kind: unit
+        name: fp5-callaudiod-watch.service
+        user: true
+        state: enabled
+
+  - id: hfp-modem-bridge
+    name: "HFP modem bridge for Tesla"
+    why: "PipeWire's native HFP only talks to ModemManager, which does not see imsd VoLTE calls, so the car gets no ring screen."
+    branch: "fix/hfp-dbus-policy-uid"
+    commit: "fa07443"
+    where: "dbus policy user=\"60434\"; /var/lib/fp5-oot/bin/fp5-hfp-modem-bridge, fp5_hfp_audio.py, fp5-hfp-spa-guard; user unit fp5-hfp-modem-bridge"
+    upstreamable: no
+    upstreamable_reason: "Local bridge from imsd calls to a fake modem for the car. v1/v2 and the uninstalled v4 plugin are not the gate."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: text
+        path: /etc/dbus-1/system.d/io.github.isyourbrainfoss.Fp5HfpModem.conf
+        contains:
+          - "user=\"60434\""
+        last_known_sha256_prefix: "d2fe6521"
+      - kind: exists
+        path: /var/lib/fp5-oot/bin/fp5-hfp-modem-bridge
+        executable: true
+        last_known_sha256_prefix: "bd72a682"
+      - kind: exists
+        path: /var/lib/fp5-oot/bin/fp5_hfp_audio.py
+        last_known_sha256_prefix: "fab061b1"
+      - kind: exists
+        path: /var/lib/fp5-oot/bin/fp5-hfp-spa-guard
+        executable: true
+        last_known_sha256_prefix: "6f67aa85"
+      - kind: unit
+        name: fp5-hfp-modem-bridge.service
+        user: true
+        state: enabled
+
+  - id: hfp-dbus-homed-reload
+    name: "Reload dbus policy after homed unlocks uid 60434"
+    why: "dbus starts before systemd-homed, logs Unknown username, and drops the HFP policy, so the bridge never owns its name."
+    branch: "fix/hfp-bridge-dbus-homed"
+    commit: "090423a"
+    where: "fp5-dbus-homed-reload.service and /var/lib/fp5-oot/bin/fp5-dbus-homed-reload"
+    upstreamable: no
+    upstreamable_reason: "Workaround for dbus reading a homed uid before the home is unlocked."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: unit
+        name: fp5-dbus-homed-reload.service
+        state: enabled
+      - kind: exists
+        path: /var/lib/fp5-oot/bin/fp5-dbus-homed-reload
+        executable: true
+        last_known_sha256_prefix: "a0116f97"
+
+  - id: car-hotspot
+    name: "Hotspot when the Tesla audio link is up"
+    why: "The car should get a hotspot for the drive, and the phone should not sleep while that link is up."
+    branch: "feat/car-hotspot"
+    commit: "2e40da3"
+    where: "${HOME}/.local/bin/fp5-car-hotspot and user unit fp5-car-hotspot.service"
+    upstreamable: no
+    upstreamable_reason: "Local car integration."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: "${HOME}/.local/bin/fp5-car-hotspot"
+        executable: true
+        last_known_sha256_prefix: "491e3bff"
+      - kind: unit
+        name: fp5-car-hotspot.service
+        user: true
+        state: enabled
+
+  - id: car-seek
+    name: "Steering seek for Podcasts"
+    why: "GNOME Podcasts ignores next/previous. The car buttons should seek instead."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "${HOME}/.local/bin/fp5-car-seek and user unit fp5-car-seek.service"
+    upstreamable: no
+    upstreamable_reason: "Local car button mapping."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: "${HOME}/.local/bin/fp5-car-seek"
+        executable: true
+        last_known_sha256_prefix: "db10f6b0"
+      - kind: unit
+        name: fp5-car-seek.service
+        user: true
+        state: enabled
+
+  - id: car-mpris-guard
+    name: "Car media guard v2.2"
+    why: "After a call or the car mic button the A2DP volume sticks at 0 and AVRCP stops controlling Podcasts."
+    branch: "fix/car-guard-disconnect"
+    commit: "597f0ee"
+    where: "${HOME}/.local/bin/fp5-car-mpris-guard and user unit fp5-car-mpris-guard.service"
+    upstreamable: no
+    upstreamable_reason: "Local car AVRCP workaround. Do not require the old v2.1 hash 30e09592."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: "${HOME}/.local/bin/fp5-car-mpris-guard"
+        executable: true
+        last_known_sha256_prefix: "1d1ca47e"
+      - kind: unit
+        name: fp5-car-mpris-guard.service
+        user: true
+        state: enabled
+
+  - id: quiet-hours
+    name: "Silent profile 21:00-07:00"
+    why: "The phone should go silent in the evening and back to full at 07:00 without the alarm owning that switch."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "user timers fp5-quiet-hours-on.timer and fp5-quiet-hours-off.timer"
+    upstreamable: no
+    upstreamable_reason: "Local schedule."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: unit
+        name: fp5-quiet-hours-on.timer
+        user: true
+        state: enabled
+      - kind: unit
+        name: fp5-quiet-hours-off.timer
+        user: true
+        state: enabled
+
+  - id: repeat-caller
+    name: "Repeat caller rings through silent"
+    why: "A second call from the same number within 15 minutes should be audible while the profile is silent or quiet."
+    branch: "feat/repeat-caller"
+    commit: "2210cf8"
+    where: "${HOME}/.local/bin/fp5-repeat-caller and user unit fp5-repeat-caller.service"
+    upstreamable: later
+    upstreamable_reason: "Could become a feedbackd or Calls feature. The phone number hash store is local."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: "${HOME}/.local/bin/fp5-repeat-caller"
+        executable: true
+        last_known_sha256_prefix: "3770b745"
+      - kind: unit
+        name: fp5-repeat-caller.service
+        user: true
+        state: enabled
+
+  - id: clocks-alarm-sound
+    name: "Alarm sound fallback on silent"
+    why: "feedbackd returns an event id on the silent profile without playing, so the morning alarm was mute."
+    branch: "fix/alarm-silent-fallback"
+    commit: ""
+    where: "${HOME}/.local/bin/fp5-clocks-alarm-sound and user unit fp5-clocks-alarm-sound.service"
+    upstreamable: later
+    upstreamable_reason: "The silent-profile id-without-audio behaviour could be fixed in feedbackd or Clocks."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: "${HOME}/.local/bin/fp5-clocks-alarm-sound"
+        executable: true
+        last_known_sha256_prefix: "01b120fc"
+      - kind: unit
+        name: fp5-clocks-alarm-sound.service
+        user: true
+        state: enabled
+
+  - id: timer-sound-stop
+    name: "Clocks timer stop helper"
+    why: "The Clocks timer keeps sounding; the helper stops it without killing unrelated audio."
+    branch: "fix/clocks-timer-stop"
+    commit: "3f8003f"
+    where: "${HOME}/.local/bin/fp5-timer-sound-stop and user unit fp5-timer-sound-stop.service"
+    upstreamable: later
+    upstreamable_reason: "A Clocks or feedbackd stop path would replace the helper."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: "${HOME}/.local/bin/fp5-timer-sound-stop"
+        executable: true
+        last_known_sha256_prefix: "265f302d"
+      - kind: unit
+        name: fp5-timer-sound-stop.service
+        user: true
+        state: enabled
+
+  - id: feedbackd-theme
+    name: "feedbackd theme fp5-strong"
+    why: "Timer and alarm events use the local theme so the timer sound is Argon and silent/quiet stay consistent."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "${HOME}/.config/feedbackd/themes/fp5-strong.json"
+    upstreamable: no
+    upstreamable_reason: "Personal theme."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: "${HOME}/.config/feedbackd/themes/fp5-strong.json"
+
+  - id: feedbackd-profile-sync
+    name: "feedbackd profile sync"
+    why: "Waydroid and the host must follow the same feedbackd profile, including the quiet-hours switch."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "user unit fp5-feedbackd-profile-sync.service"
+    upstreamable: no
+    upstreamable_reason: "Local glue between host feedbackd and Waydroid."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: unit
+        name: fp5-feedbackd-profile-sync.service
+        user: true
+        state: enabled
+
+  - id: ff-gain
+    name: "Force-feedback gain helper"
+    why: "Haptic strength for fingerprint and notifications is set by the local user unit."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "user unit fp5-ff-gain.service"
+    upstreamable: no
+    upstreamable_reason: "Local haptic preference."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    note: "Enabled on 2026-11-26. It was inactive at the snapshot; enabled is the gate, not running."
+    checks:
+      - kind: unit
+        name: fp5-ff-gain.service
+        user: true
+        state: enabled
+
+  - id: waydroid-home-guard
+    name: "Waydroid host scripts skip a locked home"
+    why: "Root calling systemctl --user before the homed PIN opened HOME=/ and logged apps out."
+    branch: "fix/home-guard"
+    commit: "d5bf213"
+    where: "/var/lib/waydroid-host-stack/sbin/waydroid-bt-session-restart.sh and waydroid-bt-attach-watchdog.sh; drop-in 60-session-restart.conf"
+    upstreamable: later
+    upstreamable_reason: "waydroid-host-stack should not open a user manager for a locked home. Hashes b3c47f5e and 5bd73d99 are last_known."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: text
+        path: /var/lib/waydroid-host-stack/sbin/waydroid-bt-session-restart.sh
+        executable: true
+        contains:
+          - "fp5 home-guard"
+        last_known_sha256_prefix: "b3c47f5e"
+      - kind: text
+        path: /var/lib/waydroid-host-stack/sbin/waydroid-bt-attach-watchdog.sh
+        executable: true
+        contains:
+          - "fp5 home-guard"
+        last_known_sha256_prefix: "5bd73d99"
+      - kind: exists
+        path: /etc/systemd/system/waydroid-bt-host.service.d/60-session-restart.conf
+
+  - id: waydroid-lmk
+    name: "Waydroid lmkd minfree off"
+    why: "Android low-memory killer was stopping the Tesla app. ro.lmk.use_minfree_levels=false avoids that."
+    branch: "fix/waydroid-lmk"
+    commit: "0233a6a"
+    where: "/var/lib/waydroid/waydroid.cfg"
+    upstreamable: later
+    upstreamable_reason: "Waydroid or the image prop set could carry the same lmkd strategy."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: text
+        path: /var/lib/waydroid/waydroid.cfg
+        regex: "(?m)^\\s*ro\\.lmk\\.use_minfree_levels\\s*=\\s*false\\s*$"
+
+  - id: qtee-share-unlock
+    name: "QTEE share dir and unlock user unit"
+    why: "Fingerprint session binaries are shared outside the sysext, and the user unit must be enabled to unlock."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "/var/lib/fp5-qtee-share/{fp5-fprintd,fp5-qtee-session}; user unit fp5-qtee-unlock.service"
+    upstreamable: later
+    upstreamable_reason: "Belongs with the fp5-qtee sysext once the share dir is part of that image."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: /var/lib/fp5-qtee-share/fp5-fprintd
+        executable: true
+      - kind: exists
+        path: /var/lib/fp5-qtee-share/fp5-qtee-session
+        executable: true
+      - kind: unit
+        name: fp5-qtee-unlock.service
+        user: true
+        state: enabled
+
+  - id: phosh-user-guards
+    name: "Phosh respawn and resume-output user drop-ins"
+    why: "Home drop-ins of the same name override the fp5-phosh sysext copies. They keep Phosh inside the session and wait for an output after resume."
+    branch: "fix/phosh-locked-respawn"
+    commit: "0150a44"
+    where: "${HOME}/.config/systemd/user/mobi.phosh.Shell.service.d/70-fp5-respawn.conf and 80-fp5-resume-output-guard.conf; ${HOME}/.local/bin/fp5-phosh-respawn, fp5-phosh-wait-output, fp5-phosh-output-ready"
+    upstreamable: later
+    upstreamable_reason: "The scale fix is upstreamable in Phosh. The user drop-ins are the carried session policy and win over the sysext copies."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    note: "Resume-output-guard branch fix/phosh-resume-output-guard 8895dc6 ships the sysext copies. The phone uses the home copies."
+    checks:
+      - kind: text
+        path: "${HOME}/.config/systemd/user/mobi.phosh.Shell.service.d/70-fp5-respawn.conf"
+        contains:
+          - "fp5-phosh-respawn"
+      - kind: text
+        path: "${HOME}/.config/systemd/user/mobi.phosh.Shell.service.d/80-fp5-resume-output-guard.conf"
+        contains:
+          - "fp5-phosh-wait-output"
+      - kind: exists
+        path: "${HOME}/.local/bin/fp5-phosh-respawn"
+        executable: true
+      - kind: exists
+        path: "${HOME}/.local/bin/fp5-phosh-wait-output"
+        executable: true
+      - kind: exists
+        path: "${HOME}/.local/bin/fp5-phosh-output-ready"
+        executable: true
+
+  - id: tesla-frunk-helper
+    name: "Tesla frunk helper"
+    why: "The Phosh quick setting calls this helper. The plugin itself comes from the fp5-frunk-qs sysext."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "${HOME}/.local/bin/tesla-frunk"
+    upstreamable: no
+    upstreamable_reason: "Local Tesla command wrapper."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: "${HOME}/.local/bin/tesla-frunk"
+        executable: true
+
+  - id: ticket-box
+    name: "Lock-screen membership cards"
+    why: "The ticket-box plugin shows two local PDFs before unlock. Only the file names are checked."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "${HOME}/phosh-ticket-box/Coop Mega.pdf and Rema 1000.pdf"
+    upstreamable: no
+    upstreamable_reason: "Personal documents. Never read, hash, or log the file contents."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: "${HOME}/phosh-ticket-box/Coop Mega.pdf"
+      - kind: exists
+        path: "${HOME}/phosh-ticket-box/Rema 1000.pdf"
+
+  - id: gsd-power-idle-rearm
+    name: "Rearm gnome-settings-daemon idle after resume"
+    why: "After resume the idle timer does not always run, so the 60s battery suspend never comes back."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "system unit fp5-gsd-power-idle-rearm.service"
+    upstreamable: later
+    upstreamable_reason: "gsd-power should rearm its idle watch across sleep on its own."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    note: "Enabled on 2026-11-26 and inactive at the snapshot. Enabled is the gate."
+    checks:
+      - kind: unit
+        name: fp5-gsd-power-idle-rearm.service
+        state: enabled
+
+  - id: power-sleep-gsettings
+    name: "Sleep after 60s on battery, never on AC"
+    why: "The phone should suspend a minute after the screen sleeps on battery, and not on AC."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "gsettings org.gnome.settings-daemon.plugins.power"
+    upstreamable: no
+    upstreamable_reason: "User power policy. AC timeout may be 900; only the AC type is required."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: gsettings
+        schema: org.gnome.settings-daemon.plugins.power
+        key: sleep-inactive-battery-timeout
+        equals: "60"
+      - kind: gsettings
+        schema: org.gnome.settings-daemon.plugins.power
+        key: sleep-inactive-battery-type
+        equals: "suspend"
+      - kind: gsettings
+        schema: org.gnome.settings-daemon.plugins.power
+        key: sleep-inactive-ac-type
+        equals: "nothing"
+      - kind: gsettings
+        schema: org.gnome.settings-daemon.plugins.power
+        key: sleep-inactive-ac-timeout
+        equals: "900"
+        severity: warn
+
+  - id: iio-sensor-proxy-retry
+    name: "iio-sensor-proxy start retry"
+    why: "A boot-time namespace race leaves the proxy failed, so rotation and auto-brightness stay dead."
+    branch: "main"
+    commit: "b91a7a5"
+    where: "iio-sensor-proxy.service drop-in with Restart=on-failure, RestartSec=3, StartLimitBurst=8, StartLimitIntervalSec=60"
+    upstreamable: later
+    upstreamable_reason: "The /proc namespace race is a systemd or iio-sensor-proxy start bug. The drop-in is the carried workaround."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: dropin
+        unit: iio-sensor-proxy.service
+        contains:
+          - "Restart=on-failure"
+          - "RestartSec=3"
+          - "StartLimitBurst=8"
+          - "StartLimitIntervalSec=60"
+
+  - id: iio-broadcast-has
+    name: "iio-sensor-proxy broadcasts Has* properties"
+    why: "Phosh never saw the light sensor appear unless HasAmbientLight and HasAccelerometer were broadcast."
+    branch: "fp5-iio-broadcast-has"
+    commit: "05627e9"
+    where: "iio-sensor-proxy.service drop-in 70-fp5-broadcast-has.conf"
+    upstreamable: yes
+    upstreamable_reason: "Broadcasting the Has* properties is an iio-sensor-proxy fix."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: dropin
+        unit: iio-sensor-proxy.service
+        filename: 70-fp5-broadcast-has.conf
+
+  - id: sysupdate-carry-transfers
+    name: "sysupdate transfers for modemmanager and frunk"
+    why: "Without these transfers a phone that tracks fp5-feed never fetches the carried sysexts, or treats the version as incomplete."
+    branch: "feed/carry-local-sysexts"
+    commit: "99920de"
+    where: "/etc/sysupdate.d/35-fp5-modemmanager.transfer and 36-fp5-frunk-qs.transfer"
+    upstreamable: no
+    upstreamable_reason: "Local feed layout. Install the files once; do not pre-place matching raws."
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: text
+        path: /etc/sysupdate.d/35-fp5-modemmanager.transfer
+        contains:
+          - "fp5-modemmanager_"
+      - kind: text
+        path: /etc/sysupdate.d/36-fp5-frunk-qs.transfer
+        contains:
+          - "fp5-frunk-qs_"
+
+  - id: call-mic-v3-helpers
+    name: "Call mic level snapshot helpers"
+    why: "Left on disk by call-mic v3. v4 is the gate. These files are not required."
+    branch: "fix/first-call-mic"
+    commit: "730f310"
+    where: "/var/lib/fp5-oot/bin/fp5-mic-level and fp5-call-audio-snap"
+    upstreamable: no
+    upstreamable_reason: "Superseded as a gate by call-mic v4."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: present
+    note: "Seen on the phone. Not a fail-closed check."
+
+  - id: mic-kick
+    name: "Mic kick user unit"
+    why: "Older boot-time mic helper. Not part of the v4 gate."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "user unit fp5-mic-kick.service"
+    upstreamable: no
+    upstreamable_reason: "Superseded by call-mic v4 early ADC1."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: present
+    note: "Enabled and inactive at the 2026-11-26 snapshot."
+
+  - id: hfp-v4-staging
+    name: "HFP v4 plugin staging"
+    why: "Hang-up-from-the-car changes were staged and not installed. The running bridge is the uid-policy install from 24 Nov."
+    branch: "feat/hfp-call-control"
+    commit: "b1e9246"
+    where: "${HOME}/.local/share/fp5-hfp-staging-v4/"
+    upstreamable: no
+    upstreamable_reason: "Not installed. Do not require it."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: missing
+    note: "v1 and v2 of the bridge are superseded. The v4 libspa plugin was not installed."
+
+  - id: ringback
+    name: "Local ringback tone"
+    why: "imsd early-media / 425 Hz ringback was installed and rolled back the same day because IMS never registered."
+    branch: "fix/ringback"
+    commit: "057f4db"
+    where: "was /opt/fp5-imsd/bin/imsd; restored to the previous binary"
+    upstreamable: later
+    upstreamable_reason: "Rolled back. Not a presence test."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: not-applicable
+
+  - id: waydroid-notify-follow-owner
+    name: "Waydroid notification name owner"
+    why: "follow_name_owner_changes so Android notifications survive a Phosh restart. Built and not installed."
+    branch: "fix/waydroid-notify-follow-owner"
+    commit: "402d781"
+    where: "would be inside fp5-waydroid-fix notification_manager.py"
+    upstreamable: yes
+    upstreamable_reason: "Upstream Waydroid uses follow_name_owner_changes=False. Not installed on the phone."
+    scope: sysext
+    sysext: fp5-waydroid-fix
+    profiles:
+      - daily
+    required: false
+    status_on_phone_20261126: missing
+
+  - id: ucm-part-a
+    name: "UCM ADC1 enable sequence"
+    why: "Proposed UCM change for the call mic. Not done; it needs a WirePlumber restart and was not accepted."
+    branch: "fix/call-mic-ring-adc1"
+    commit: "2a8a158"
+    where: "not installed"
+    upstreamable: later
+    upstreamable_reason: "Proposed, not installed."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: not-applicable
+
+  - id: screen-on-race
+    name: "Fingerprint screen-on race v2"
+    why: "Installed per AVVIK section 4. Not in the fail-closed set until it is confirmed as a carry requirement."
+    branch: "fix/screen-on-race"
+    commit: "89079ff"
+    where: "fp5-qtee screen-on path; rollback under /var/lib/fp5-backup/20261118-install/screen-on-race-v2/"
+    upstreamable: later
+    upstreamable_reason: "Confirm before promoting to required."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: unknown
+
+  - id: logind-power-button
+    name: "logind power-button drop-in"
+    why: "Listed in AVVIK section 4 without a path precise enough to gate on."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "logind drop-in, see AVVIK section 4"
+    upstreamable: no
+    upstreamable_reason: "Confirm the unit path before a presence test."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: unknown
+
+  - id: callaudiod-selectmode-binary
+    name: "Local callaudiod with SelectMode fix"
+    why: "Installed 22 Nov under /var/lib/fp5-oot with a user dbus override. The 26 Nov snapshot did not reconfirm that path."
+    branch: "fix/callaudiod-hang-aarch64"
+    commit: "478fb4b"
+    where: "/var/lib/fp5-oot/bin/callaudiod and the user dbus service override"
+    upstreamable: yes
+    upstreamable_reason: "The SelectMode completion belongs in callaudiod. The watchdog is the required carry; this binary is confirm-only."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: unknown
+
+  - id: qcom-modem-setup-mask
+    name: "qcom-modem-setup masked for first 1124.3 boot"
+    why: "Masked so the first boot of 1124.3 would not run modem setup. Not a standing carry requirement."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "mask of qcom-modem-setup.service"
+    upstreamable: no
+    upstreamable_reason: "One-boot precaution."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: present
+
+  - id: fp5-suspend-guard
+    name: "Suspend guard"
+    why: "Seen on the phone. AVVIK does not list it as a standing customisation that must be carried."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "local unit fp5-suspend-guard"
+    upstreamable: no
+    upstreamable_reason: "Confirm before promoting to required."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: unknown
+
+  - id: fp5-pon-capture
+    name: "PON capture"
+    why: "Seen on the phone. Diagnosis helper for suspend deaths, not a daily-driver feature."
+    branch: "fix/suspend-freeze-diag"
+    commit: "193c0e0"
+    where: "local unit fp5-pon-capture"
+    upstreamable: no
+    upstreamable_reason: "Diagnosis only."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: unknown
+
+  - id: fp5-sysext-units
+    name: "sysext unit helper"
+    why: "Seen on the phone. Not in the AVVIK standing tables as a required carry."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "local unit fp5-sysext-units"
+    upstreamable: no
+    upstreamable_reason: "Confirm before promoting to required."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: unknown
+
+  - id: fp5-uki-case-fix
+    name: "UKI filename case fix"
+    why: "Seen on the phone. It did not need to run on the 1124.3 boot (no bengalos_*.efi)."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "local unit fp5-uki-case-fix"
+    upstreamable: no
+    upstreamable_reason: "Confirm before promoting to required."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: present
+
+  - id: fp5-volte-runtime
+    name: "volte runtime helper"
+    why: "Seen on the phone. It looks for the old volte module directory and skipped on 7.2.8-sc7280-fp5+."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "local unit fp5-volte-runtime"
+    upstreamable: no
+    upstreamable_reason: "Version-specific. Not required on the fp5+ kernel."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: not-applicable
+
+  - id: q6voiced-resume-workaround
+    name: "q6voiced resume workaround"
+    why: "Enabled on the phone even though q6voiced itself is masked. Not in the standing carry list."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "local unit q6voiced-resume-workaround.service"
+    upstreamable: later
+    upstreamable_reason: "Confirm. The required policy is the q6voiced mask, not this workaround."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: present
+
+  - id: waydroid-geoclue-fix
+    name: "Waydroid geoclue fix"
+    why: "Seen on the phone. Not in the AVVIK standing tables as a required carry."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "local unit waydroid-geoclue-fix"
+    upstreamable: later
+    upstreamable_reason: "Confirm before promoting to required."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: unknown
+
+  - id: waydroid-gps-inject
+    name: "Waydroid GPS inject"
+    why: "Seen on the phone. Not in the AVVIK standing tables as a required carry."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "local unit waydroid-gps-inject"
+    upstreamable: later
+    upstreamable_reason: "Confirm before promoting to required."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: unknown
+
+  - id: fp5-android-sound-profile
+    name: "Android sound profile template"
+    why: "Seen on the phone as fp5-android-sound-profile@. Not gated."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "template unit fp5-android-sound-profile@.service"
+    upstreamable: no
+    upstreamable_reason: "Confirm before promoting to required."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: unknown
+
+  - id: fp5-ssc-rescan
+    name: "SSC sensor rescan"
+    why: "Restarts iio-sensor-proxy once the SSC light sensor shows up. Lives on the phone; the retry drop-in is the required carry."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "local unit fp5-ssc-rescan"
+    upstreamable: later
+    upstreamable_reason: "Confirm before promoting to required. The retry drop-in is already required."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: unknown
+
+  - id: fp5-sensors-registry
+    name: "FP5 sensors registry unit"
+    why: "Shipped inside the fp5-device sysext and enabled by that preset. Not a separate on-device gate."
+    branch: "feed/carry-local-sysexts"
+    commit: "99920de"
+    where: "fp5-device sysext usr/lib/systemd/system/fp5-sensors-registry.service"
+    upstreamable: later
+    upstreamable_reason: "Covered by the fp5-device sysext check."
+    scope: image
+    sysext: fp5-device
+    profiles:
+      - feed
+      - daily
+    required: false
+    status_on_phone_20261126: present
+
+  - id: fp5-pstore-ramoops
+    name: "Pstore ramoops and PM sleep debug in the FP5 kernel"
+    why: "1124.3 lost crash logs. Official sc7280 config has PSTORE=y but PSTORE_RAM, PSTORE_CONSOLE, PSTORE_PMSG and PM_DEBUG off, and the ramoops DT node was not carried. A cmdline-only pstore.backend=ramoops cannot create the backend. Any new FP5 kernel cut from linux-sc7280 plus the functional fragment must also carry this."
+    branch: "feat/carried-fixes-guard"
+    commit: ""
+    where: "kernel/config/fp5-pstore-ramoops.config and kernel/patches/0008-arm64-dts-qcom-qcm6490-fairphone-fp5-add-ramoops-reg.patch; desk UKI artifacts/fp5-pstore-20261127/ built 27 Nov 2026, not installed"
+    upstreamable: later
+    upstreamable_reason: "The ramoops reserved-memory node (0xa9000000, 2 MiB, no no-map) and the pstore/PM debug fragment can be proposed with the FP5 / sc7280 kernel. Do not drop them while waiting."
+    scope: on-device
+    profiles:
+      - daily
+    required: false
+    status_on_phone_20261126: missing
+    note: "Desk kernel fp5-pstore-20261127 built 27 Nov 2026, not installed. Promote to required once that UKI (or a later one with the same carry) is the daily kernel. Until then the source fragment and DT patch in this repo are the carry. 1124.3 still lacks them."
+    checks:
+      - kind: text
+        path: kernel/config/fp5-pstore-ramoops.config
+        contains:
+          - "CONFIG_PSTORE_RAM=y"
+          - "CONFIG_PSTORE_CONSOLE=y"
+          - "CONFIG_PSTORE_PMSG=y"
+          - "CONFIG_PM_SLEEP_DEBUG=y"
+      - kind: text
+        path: kernel/patches/0008-arm64-dts-qcom-qcm6490-fairphone-fp5-add-ramoops-reg.patch
+        contains:
+          - "ramoops@a9000000"
+          - "0xa9000000"
+          - "0x200000"
+
+  - id: pstore-plain
+    name: "pstore plain note"
+    why: "Listed in AVVIK section 4 as a pointer, not a file this check can see."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "see AVVIK section 4"
+    upstreamable: no
+    upstreamable_reason: "Not a presence test."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: unknown
+
+  - id: ucsi-suspend-defer
+    name: "UCSI suspend defer kernel patch"
+    why: "Possible fix for charger-during-s2idle resets. Not built as a UKI and not installed."
+    branch: "fix/ucsi-suspend-defer"
+    commit: "d7002f2"
+    where: "kernel patch only; no image file to test"
+    upstreamable: yes
+    upstreamable_reason: "Upstream RFC. Not installed."
+    scope: on-device
+    profiles:
+      - daily
+    required: false
+    status_on_phone_20261126: missing
+
+  - id: flutter-x11-override
+    name: "Flutter X11 flatpak override"
+    why: "Temporary GDK_BACKEND=x11 override for Flowlog, Navigation, and Spectrogram. Removed 21 Nov."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "was a user flatpak override; reset"
+    upstreamable: no
+    upstreamable_reason: "Removed."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: not-applicable
+
+  - id: des4-suspend-logging
+    name: "Temporary suspend debug logging"
+    why: "printk, console_suspend, and pm_debug_messages toggles used to catch s2idle deaths. Runtime only, not a carry."
+    branch: "user-home, not in git"
+    commit: ""
+    where: "sysfs and /proc; not durable"
+    upstreamable: no
+    upstreamable_reason: "Diagnosis only. Do not require it."
+    scope: on-device
+    required: false
+    status_on_phone_20261126: not-applicable

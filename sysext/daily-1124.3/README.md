@@ -32,3 +32,14 @@ name in the user home config overrides that file.
 Nightly apt in the build scripts uses `http://deb.phosh.mobi/nightly/`
 because the desk image failed the HTTPS certificate check. The scripts
 cap `ninja` parallelism at 5.
+
+Before this set is published or installed, run the carried-fixes guard and
+stop if it fails:
+
+```sh
+scripts/check-carried-fixes-sysexts "$SYSEXT_DIR" --version "$VERSION_ID" --kernel-uname "$UNAME" || exit 1
+```
+
+The default profile is `daily`. Pass `--kernel-uname 7.2.8-sc7280-fp5+` so
+`fp5-volte-modules` is skipped for this kernel. The ModemManager raw must
+contain the UTF-8 string `sparing IMS bearer`. See `docs/CARRIED-FIXES.md`.

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Fail-closed presence check for local FP5 customisations.
+# Inventory: docs/CARRIED-FIXES.md and feed/carried-fixes/manifest.yaml.
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+exec python3 "$ROOT/feed/carried-fixes/check_carried_fixes.py" "$@"

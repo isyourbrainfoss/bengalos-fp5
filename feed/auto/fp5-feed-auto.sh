@@ -138,7 +138,7 @@ def w(x):
         for v in x: w(v)
 w(m); print(out.get(sys.argv[2],""))' "$D/BengalOS_$V.manifest" "$1"; }
 MMV=$(pkgv modemmanager); PHV=$(pkgv phosh)
-[ "$MMV" = "$CARRY_MM_PKG" ] || fail "carry: official modemmanager is now '$MMV' (pinned $CARRY_MM_PKG): check whether it contains 9317cbc4 (then drop fp5-modemmanager) or rebuild it"
+[ "$MMV" = "$CARRY_MM_PKG" ] || fail "carry: official modemmanager is now '$MMV' (pinned $CARRY_MM_PKG): rebase mm-fp5-keep-ims-bearer (+ 9317cbc4 if missing) onto it and rebuild; never just drop fp5-modemmanager (IMS spare)"
 [ "${PHV%%+*}" = "$CARRY_PHOSH_UPSTREAM" ] || fail "carry: official phosh is now '$PHV' (pinned $CARRY_PHOSH_UPSTREAM): rebuild the Frunk plugin against it"
 say "carry gates OK (modemmanager $MMV, phosh $PHV)"
 
@@ -212,6 +212,22 @@ rm -f "$W/wd.raw"
 grep -q '^effective overlay: .*mobi.phosh.phoc present' "$W/report/waydroid-fix.log" || fail "waydroid fix: effective schema check did not run/pass"
 [ -s "$T/sysext/out/$V/fp5-waydroid-fix_$V.raw.xz" ] || fail "waydroid fix: fp5-waydroid-fix_$V.raw.xz not built"
 say "waydroid fix OK: $(grep '^== waydroid fix' "$W/report/waydroid-fix.log")"
+
+# ---- carried-fixes guard (fail closed, including --dry-run)
+# Runs on the built set in $T/sysext/out/$V, before staging and before DRYRUN_OK
+# or publish. Profile feed is the sysexts this pipeline builds (the spare-IMS
+# string, MM#1110, frunk, waydroid-fix, qtee, ims-app, device, and volte-modules
+# when $UNAME is the volte kernel). Profile daily, the default, also requires
+# phoc, phosh, and gnome-calls. See docs/CARRIED-FIXES.md.
+CF_CHECK=$(cd "$SX/../.." && pwd)/scripts/check-carried-fixes-sysexts
+[ -x "$CF_CHECK" ] || fail "carried-fixes: $CF_CHECK missing"
+say "carried-fixes guard"
+if ! "$CF_CHECK" "$T/sysext/out/$V" --profile feed --version "$V" --kernel-uname "$UNAME" \
+    | tee "$W/report/carried-fixes.log"; then
+  reason=$(grep -E '^(MISSING|UNREADABLE):' "$W/report/carried-fixes.log" | paste -sd';' - || true)
+  fail "carried-fixes: ${reason:-a required marker is missing under $T/sysext/out/$V}"
+fi
+say "carried-fixes guard OK"
 
 # ---- stage feed assets
 S=$W/feed; mkdir -p "$S"
