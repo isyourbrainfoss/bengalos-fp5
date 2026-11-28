@@ -72,14 +72,14 @@ phosh, and gnome-calls are printed as `SKIP` on that profile. Forgetting
 
 ## Counts
 
-66 items, 41 required.
+68 items, 42 required.
 
 | Scope | Items | Required |
 |---|---:|---:|
 | sysext | 10 | 9 |
 | image | 2 | 1 |
 | version-conditional | 1 | 1 |
-| on-device | 53 | 30 |
+| on-device | 55 | 31 |
 
 ## Phone on 26 Nov 2026
 
@@ -430,6 +430,19 @@ is absent from the raw set.
 - **Required:** yes
 - **Phone 2026-11-26:** present
 - **Check:** (1) `${HOME}/.local/bin/fp5-car-seek` is a regular file, executable; sha256 prefix `db10f6b0` is last_known and only warns. (2) user unit `fp5-car-seek.service` is enabled.
+
+### `fp5-coverart`
+
+- **Name:** AVRCP cover art to the car (OOT bluetoothd + obexd)
+- **Why:** The Tesla only shows album/audiobook art over AVRCP BIP. Debian bluez 5.88 has no cover-art server, so the car got no cover.
+- **Branch / commit:** `feat/car-coverart` `a0d929b`
+- **Where:** `/var/lib/fp5-oot/coverart/{bluetoothd,obexd,fp5-coverart-prepare}`; `/etc/systemd/system/bluetooth.service.d/fp5-coverart.conf`; `${HOME}/.config/systemd/user/obex.service.d/fp5-coverart.conf`
+- **Upstreamable:** later. BlueZ cover-art patches 0001/0002 on bluez 5.88-1. Upstream BIP server work is not merged.
+- **Scope:** on-device (checked by --online, and by --all-scopes)
+- **Required:** yes
+- **Phone 2026-11-26:** present
+- **Check:** (1) `bluetoothd` is executable and its sha256 is exactly `7d87d637…a495c`. (2) `obexd` exact sha256 `9c407eef…de44`. (3) `fp5-coverart-prepare` exact sha256 `11268d10…c557`. A different hash fails. (4) The bluetooth drop-in contains `ExecStart=/var/lib/fp5-oot/coverart/bluetoothd`, exact sha256 `b7b71942…9569`. (5) The user obex drop-in contains the OOT `ExecStart` and `FP5_COVERART_PREPARE`, exact sha256 `3754bac6…daafb`. (6) User `obex.service` is active, or has a `WantedBy` (read-only `systemctl --user is-active` / `show -p WantedBy`; never starts it).
+- **Note:** Everything lives in `/var`, `/etc` and the home, so an A/B usr update keeps it. The OOT daemons link against the image's glib, dbus and udev, so symbol-check them against every new usr. On 28 Nov the user `obex.service` had no `WantedBy` (D-Bus activation only). After a boot nothing starts obexd, the cover-art PSM is never registered, and the car shows no art. Check (6) fails on that.
 
 ### `car-mpris-guard`
 

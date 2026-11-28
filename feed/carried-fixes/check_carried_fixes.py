@@ -598,6 +598,53 @@ def check_bytes(check, ctx, one_of=False):
     return "missing", msg, None
 
 
+def sha_full(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+    except PermissionError:
+        return None, "unreadable"
+    except OSError as e:
+        return None, str(e)
+    return h.hexdigest(), None
+
+
+def unit_active_or_wanted(name, user, system_root):
+    """Read-only: 'active', 'wanted', 'neither', or 'unreadable'/'error:...'.
+
+    Never starts a unit. Tree mode reads .carried-fixes/units/<kind>/<name>.runtime
+    (first line 'active', 'wanted' or 'neither').
+    """
+    if system_root != Path("/"):
+        kind = "user" if user else "system"
+        p = system_root / ".carried-fixes" / "units" / kind / (name + ".runtime")
+        st = classify_stat(p)
+        if st == "unreadable":
+            return "unreadable"
+        if st != "ok":
+            return "neither"
+        try:
+            return (p.read_text(encoding="utf-8").strip().splitlines() or ["neither"])[0].strip()
+        except PermissionError:
+            return "unreadable"
+    base = ["systemctl"] + (["--user"] if user else [])
+    try:
+        r = subprocess.run(base + ["is-active", name], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True)
+        if (r.stdout or "").strip() == "active":
+            return "active"
+        r = subprocess.run(base + ["show", "-p", "WantedBy", "--value", name],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except OSError as e:
+        return f"error:{e}"
+    err = (r.stderr or "").lower()
+    if r.returncode != 0 and ("permission" in err or "access denied" in err):
+        return "unreadable"
+    return "wanted" if (r.stdout or "").strip() else "neither"
+
+
 def check_exists(check, ctx):
     if ctx.raw_note and ctx.mode == "sysext" and not str(check.get("path", "")).startswith(("/", "~", "${")):
         return "missing", ctx.raw_note, None
@@ -613,6 +660,13 @@ def check_exists(check, ctx):
         return "missing", f"not a regular file: {path}", None
     if st == "not-executable":
         return "missing", f"not executable: {path}", None
+    exact = check.get("sha256")
+    if exact:
+        digest, err = sha_full(path)
+        if err == "unreadable":
+            return "unreadable", f"unreadable: {path}", None
+        if digest != str(exact).lower():
+            return "missing", f"sha256 of {path} is {(digest or '?')[:12]}..., expected {str(exact)[:12]}...", None
     warn = None
     prefix = check.get("last_known_sha256_prefix")
     if prefix:
@@ -650,6 +704,9 @@ def check_text(check, ctx):
     if check.get("regex"):
         if re.search(check["regex"], text) is None:
             return "missing", f"{path} does not match the expected pattern", None
+    exact = check.get("sha256")
+    if exact and hashlib.sha256(data).hexdigest() != str(exact).lower():
+        return "missing", f"sha256 of {path} is not {str(exact)[:12]}...", None
     warn = None
     prefix = check.get("last_known_sha256_prefix")
     if prefix:
@@ -692,8 +749,15 @@ def check_unit(check, ctx):
     name = check["name"]
     user = bool(check.get("user"))
     want = check.get("state", "enabled")
-    state = unit_state(name, user, ctx.system_root)
     where = ("user" if user else "system") + " unit " + name
+    if want == "active-or-wanted":
+        st = unit_active_or_wanted(name, user, ctx.system_root)
+        if st == "unreadable" or st.startswith("error:"):
+            return "unreadable", f"{where} ({st[6:] if st.startswith('error:') else 'permission'})"
+        if st in ("active", "wanted"):
+            return "ok", ""
+        return "missing", f"{where} is not active and has no WantedBy (D-Bus activation only; nothing starts it after boot)"
+    state = unit_state(name, user, ctx.system_root)
     if state == "unreadable" or state.startswith("error:"):
         detail = state[6:] if state.startswith("error:") else "permission"
         return "unreadable", f"{where} ({detail})"

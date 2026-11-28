@@ -165,7 +165,7 @@ printf 'calls_pick_tel_default_origin\n' > "$D/usr/bin/gnome-calls"
 out=$("$CHECK" --tree "$D" --version 0.26.1124.3 --kernel-uname '7.2.8-sc7280-fp5+' --profile daily)
 echo "$out" | grep -q 'MISSING:' && fail "daily fixture failed: $out"
 echo "$out" | grep -q 'SKIP: fp5-volte-modules' || fail "daily fixture did not skip volte"
-echo "$out" | grep -q 'SUMMARY: required=41 passed=10 missing=0 skipped=31' || fail "daily summary: $out"
+echo "$out" | grep -q 'SUMMARY: required=42 passed=10 missing=0 skipped=32' || fail "daily summary: $out"
 echo "$out" | grep -q 'WARN: fp5-gnome-calls-prefer-ims' || fail "expected warn for imsd origin name: $out"
 say "daily fixture passes with volte skipped"
 
@@ -275,5 +275,50 @@ if setup_fsck; then
 else
   echo "SKIP: fsck.erofs not available; real raws were not extracted"
 fi
+
+# --- exact sha256 and active-or-wanted (fp5-coverart style) ---
+R="$TMP/cov"; mkdir -p "$R/var/lib/x" "$R/.carried-fixes/units/user"
+printf 'good\n' > "$R/var/lib/x/bin"; chmod +x "$R/var/lib/x/bin"
+GOOD=$(printf 'good\n' | sha256sum | awk '{print $1}')
+cat > "$TMP/cov.yaml" << EOF
+schema: 1
+items:
+  - id: cov-test
+    name: "cov"
+    why: "test"
+    where: "test"
+    upstreamable: no
+    scope: on-device
+    required: true
+    status_on_phone_20261126: present
+    checks:
+      - kind: exists
+        path: /var/lib/x/bin
+        executable: true
+        sha256: "$GOOD"
+      - kind: unit
+        name: obex.service
+        user: true
+        state: active-or-wanted
+EOF
+printf 'neither\n' > "$R/.carried-fixes/units/user/obex.service.runtime"
+set +e
+out=$("$CHECK" --manifest "$TMP/cov.yaml" --tree "$R" --all-scopes --root "$R")
+rc=$?
+set -e
+[ "$rc" = 1 ] || fail "D-Bus-only obex passed (rc $rc): $out"
+echo "$out" | grep -q 'no WantedBy' || fail "active-or-wanted message missing: $out"
+for st in active wanted; do
+  printf '%s\n' "$st" > "$R/.carried-fixes/units/user/obex.service.runtime"
+  out=$("$CHECK" --manifest "$TMP/cov.yaml" --tree "$R" --all-scopes --root "$R") || fail "obex $st failed: $out"
+done
+printf 'bad\n' > "$R/var/lib/x/bin"
+set +e
+out=$("$CHECK" --manifest "$TMP/cov.yaml" --tree "$R" --all-scopes --root "$R")
+rc=$?
+set -e
+[ "$rc" = 1 ] || fail "wrong sha256 passed: $out"
+echo "$out" | grep -q 'expected' || fail "sha mismatch not reported: $out"
+say "exact sha256 fails on a changed binary; obex must be active or wanted"
 
 echo "ALL TESTS PASSED"
