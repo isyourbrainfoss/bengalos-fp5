@@ -103,6 +103,11 @@ gh release view $TAG --repo $REPO --json assets -q '.assets[] | "\(.name) \(.siz
 FEEDVERS=$(sed -n 's/.* BengalOS_\(.*\)\.efi\.xz$/\1/p' "$FD/SHA256SUMS" | sort -V | tr '\n' ' ' | sed 's/ $//')
 while read -r _ n; do [ -z "$n" ] && continue; grep -q "^$n " "$FD/assets" || fail "feed inconsistent: $n in SHA256SUMS but not a release asset"; done < "$FD/SHA256SUMS"
 say "feed versions: ${FEEDVERS:-none}"
+# Once the feed index lists a sc7280 usr image, this sdm845 script must not
+# publish another old-lineage version. Staging for that feed is feed/sc7280/.
+if grep -Eq '[[:space:]]BengalOS_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.usr\.raw\.xz$' "$FD/SHA256SUMS"; then
+  fail "feed has switched to sc7280 lineage; use feed/sc7280/ (this script publishes the old sdm845 lineage only)"
+fi
 wdfix_for() { [ "$(printf '%s\n%s\n' "$1" "$WDFIX_FROM" | sort -V | head -1)" = "$WDFIX_FROM" ]; }
 carry_for() { [ "$(printf '%s\n%s\n' "$1" "$CARRY_FROM" | sort -V | head -1)" = "$CARRY_FROM" ]; }
 want() { echo "BengalOS_$1.efi.xz"; for n in "${NAMES[@]}"; do echo "${n}_$1.raw.xz"; done; if wdfix_for "$1"; then echo "fp5-waydroid-fix_$1.raw.xz"; fi
