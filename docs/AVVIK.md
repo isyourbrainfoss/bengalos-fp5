@@ -61,7 +61,7 @@ Kjent åpent: lyd til bilen blir dempet etter anrop fra bilen (avdempet manuelt 
 
 | Avvik | Hvor | Av / tilbake |
 |---|---|---|
-| **Kjerne med krasjlogging (pstore/ramoops + PM-dvaledebug) bygget 27.11 16:12, IKKE installert** (Kristians ja 15:18 Europe/Oslo til å bygge på desk) | Desk `/home/kb/repos/grok_build/fp5/kernel-pstore-20261127/artifacts/fp5-pstore-20261127/`. UKI `fp5-pstore-20261127.efi` sha `cd235696726860e7f475ae2d747a59d40f95de937f857ca5b7eac4485d51b770`. Kjernenavn fortsatt `7.2.8-sc7280-fp5+`, merket `#fp5pstore.20261127`. | Ikke installert. Standard oppstartsvalg er fortsatt 0.26.1124.3. Se oppføringen 27.11 16:12. |
+| **BengalOS 0.26.1127.1 med krasjloggingskjerne publisert i fp5-feed 28.11 10:45, IKKE installert ennå** (Kristian t1115u/t1116u: ny kjerne via vanlig oppdatering) | Kjerne `7.2.8-sc7280-fp5+` pakke `7.2.8-fp5.2` = 1124.3-kjernen + pstore/ramoops (2 MiB @0xa9000000) + PM-dvaledebug. Kjørelinje + `pstore.backend=ramoops panic=10 mem_sleep_default=s2idle` (ikke `oops=panic`). Gren `feat/fp5-1127.1-pstore`. Telefonpakke `/home/fp5/fp5-xfer-1127.1/`. | Venter på «nå» for `sh ~/fp5-xfer-1127.1/install.sh`. Etterpå: 1124.3 blir reserve i A/B. Se oppføringen 28.11 10:45. |
 | Medlemskort på låseskjermen (ticket-box): Coop Mega (QR) og Rema 1000 (EAN-13), 25.11 17:12 | `~/phosh-ticket-box/Coop Mega.pdf`, `~/phosh-ticket-box/Rema 1000.pdf`. Pluginet var allerede på (`mobi.phosh.shell.plugins lock-screen` inkluderer `ticket-box`; mappe `phosh-ticket-box`). | `sh ~/.local/state/fp5-ticket-box/backup-20261125T171158/rollback.sh` |
 | Fingeravtrykk via QTEE (fp5-qtee), delt økt, vibrasjon ved treff | `/var/lib/fp5-qtee-share/`, drop-ins for fp5-qtee@ og fp5-fprintd | `/var/lib/fp5-backup/20261116-fprintd-share/rollback.sh --apply`, `/var/lib/fp5-backup/20261117-fp-haptic-direct/rollback.sh` |
 | screen-on-race v2 | fp5-qtee fix/screen-on-race 89079ff | `run0 sh /var/lib/fp5-backup/20261118-install/screen-on-race-v2/rollback.sh` |
@@ -550,3 +550,29 @@ UKI-hovedprofilen har 1124.3-kjørelinjen pluss `pstore.backend=ramoops panic=10
 
 **Vaktliste:** Tapt pstore i 1124.3 er ført som `fp5-pstore-ramoops` på grenen `feat/carried-fixes-guard` (pushet, ikke merget), med config-fragment og DT-patch, så nye kjerner skal ta det med.
 
+
+## 2026-11-28 10:45 — BengalOS 0.26.1127.1 (sc7280 + krasjlogging) publisert i fp5-feed, ikke installert ennå (Kristian t1115u/t1116u)
+
+**Hvorfor:** Telefonen dør i dvale uten spor. 1124.3-kjernen mangler pstore/ramoops (se 27.11 16:12). Kristian ville ha den nye kjernen via vanlig oppdatering i stedet for kabel og menyvalg («det er greit å installere direkte … fiks så alt er på pass»).
+
+**Linje:** Bygget på samme linje som telefonen kjører (desk-mkosi `device-sc7280-fp5`, kjerne `7.2.8-sc7280-fp5+`), ikke den gamle feed-linja (offisiell sdm845-usr + volte20261107-kjerne). Den gamle ville tatt bort phoc/phosh/calls-fiksene og oppstrømskjernen. Oppstrøms `linux-sc7280` `bengalos/latest` står fortsatt på `0a23f438`. Oppskrifter: bengalos-recipes `main` `9fbf9ea` (27.11; offisiell 1127.1-manifest har ingen commit) + samme lokale overlegg som 1124.3.
+
+**Hva (desk, Grok Build + review):**
+- Kjerne `7.2.8-fp5.2`: 1124.3-kilden + `fp5-pstore-ramoops.config` + DT-patch 0008. Config-diff mot 1124.3 er bare `PSTORE_RAM/CONSOLE/PMSG`, `PM_DEBUG`, `PM_SLEEP_DEBUG`, `REED_SOLOMON` m→y (+ENC8), `EFI_VARS_PSTORE_DEFAULT_DISABLE`. ramoops `max-reason=2` lagrer også oops. `uname -r` er uendret, så fp5-ims-vakten godtar den.
+- Kjørelinje: 1124.3-linja + `pstore.backend=ramoops panic=10 mem_sleep_default=s2idle`. **Ikke** `oops=panic`: en ufarlig oops i en driver skal ikke starte telefonen på nytt midt i en samtale. `s2idle` var allerede standard.
+- Image 0.26.1127.1 (usr xz 1,29 GiB) + ti sysexts. ModemManager i usr er fortsatt Debian 1.25.95-1. `fp5-modemmanager` har samme keep-IMS-daemon som nå (fc7239de…, «sparing IMS bearer», 9317cbc4). phoc bygget på nytt fra `51808950` med DRM-resume-patchen. gnome-calls bygget på nytt for ny libebook (prefer-IMS-patchen uendret). phosh/frunk/qtee/ims-app/device/waydroid-fix pakket for 1127.1. Ingen `fp5-volte-modules`.
+- `/usr/lib/sysupdate.d` i imaget henter nå alt fra fp5-feed (usr/verity/sig, UKI, 31–39, waydroid), uten 30-volte.
+
+**MM-sperren i morgenkjøringen (07:52):** Den stoppet fordi feedens 1120.1 hadde den gamle daemonen, og carry nå har keep-IMS-daemonen. Det er ventet og riktig, ikke en mangel. Løst med en gjennomgått liste `feed/auto/baseline/carry-reviewed.sha256` (bare ModemManager fc7239de… og patch-dokumentet). Alt annet som avviker, stopper fortsatt.
+
+**Sjekker (alle grønne):** carried-fixes `daily` på sysexts + UKI: 42 påkrevd, 11 OK, 0 mangler, 31 hoppet over (30 sjekkes på telefonen etter omstart, `fp5-volte-modules` gjelder ikke denne kjernen). `fp5-pstore-ramoops-image` OK også mot usr-treet. Test-suitene OK. Størrelser under 2 GiB. Hemmelighetssjekk: ett treff, en offentlig RSA-testnøkkel i Debians `python3-pycryptodome` (md5 lik pakken, fantes også i 1124.3). Lagt i en gjennomgått liste `feed/sc7280/secret-baseline.txt` med eksakt antall. Lab-mønstre kan ikke unntas. Dry-run `DRYRUN_OK`.
+
+**Publisert:** 14 filer for 0.26.1127.1 på https://github.com/isyourbrainfoss/bengalos-fp5/releases/tag/fp5-feed. Hver fil er lastet ned og sjekket mot sha256, og `SHA256SUMS` ble lastet opp sist (34 linjer, gamle oppføringer beholdt).
+
+**Gammel lørdagskjøring:** `official-20261114/auto/fp5-feed-auto.sh` stopper nå med `CHECK_FAILED` når feeden har en `BengalOS_*.usr.raw.xz`. Backup `fp5-feed-auto.sh.bak-20261128`. Ellers kunne den publisere gammel linje. Neste lørdag må kjøres med `feed/sc7280/stage-release.sh` (dry-run i `fp5-official-tools`-containeren, deretter publisering).
+
+**Git:** `feat/fp5-1127.1-pstore` (0ad4efe) i isyourbrainfoss/bengalos-fp5, pushet, ikke merget. Rapport på desk: `internal-install/upstream-sc7280/REPORT-1127.1.md`.
+
+**Telefon (ikke gjort ennå, venter på «nå»):** Pakken ligger i `/home/fp5/fp5-xfer-1127.1/`. `preflight.sh` (uten root) ga `PREFLIGHT_OK`. `install.sh` kjører run0 én gang. Den tar backup av `/etc/sysupdate.d` til `/var/lib/fp5-backup/<tid>-update-1127.1/` (med `rollback.sh`) og legger inn feed-overføringer for usr/verity/sig, 37–39 og waydroid. Den maskerer `30-fp5-volte-modules`, sjekker at nyeste versjon er 0.26.1127.1 og kjører `systemd-sysupdate update`. Ingen omstart, ingen `systemd-sysext refresh`, ingen tjenester restartes. 0.26.1124.3 blir stående som reserve. Sporet og UKI-en for 1120.1 blir overskrevet eller fjernet. Ny UKI får boot counting.
+
+**Tilbake:** Før omstart: `run0 sh /var/lib/fp5-backup/<tid>-update-1127.1/rollback.sh` legger tilbake `/etc/sysupdate.d`. Da er 1124.3 fortsatt standard, så lenge den nye UKI-en ikke er startet. Etter omstart: velg 1124.3 i systemd-boot, eller la boot counting falle tilbake etter tre mislykkede oppstarter.
